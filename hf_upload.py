@@ -1,0 +1,626 @@
+"""
+HuggingFace Hub upload module.
+
+Handles repo creation, model card generation, and GGUF/LoRA/merged file upload
+with progress reporting and dry-run mode.
+
+Can be used standalone or called from pipeline.py / the web UI.
+
+Token is sourced from HF_TOKEN env var — never hardcoded.
+"""
+
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+LogFn = Callable[[str, str], None]
+
+
+def _default_log(msg: str, level: str = "info"):
+    prefix = {"error": "ERROR", "warn": "WARN", "success": "OK", "stage": ">>>"}.get(level, "   ")
+    print(f"[{prefix}] {msg}")
+
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+@dataclass
+class HFUploadConfig:
+    """All parameters needed for a HuggingFace upload."""
+    repo_id: str = ""
+    private: bool = True
+    license: str = "apache-2.0"
+
+    # What to upload
+    upload_gguf: bool = True
+    upload_lora: bool = False
+    upload_merged: bool = False
+
+    # Model metadata (for the model card)
+    base_model: str = ""
+    dataset_name: str = ""
+    model_description: str = ""
+
+    # Training details (for the model card)
+    lora_r: int = 32
+    lora_alpha: int = 64
+    lora_dropout: float = 0.05
+    num_epochs: int = 3
+    learning_rate: float = 2e-4
+    max_seq_length: int = 8192
+    batch_size: int = 2
+    gradient_accumulation: int = 4
+    optimizer: str = "adamw_8bit"
+    lr_scheduler: str = "cosine"
+
+
+# ── File discovery ───────────────────────────────────────────────────────────
+
+def discover_upload_files(
+    output_dir: str,
+    upload_gguf: bool = True,
+    upload_lora: bool = False,
+    upload_merged: bool = False,
+) -> list[tuple[Path, str]]:
+    """Find files to upload from the output directory.
+
+    Returns a list of (local_path, repo_path) tuples.
+    """
+    out = Path(output_dir)
+    files = []
+
+    if upload_lora:
+        lora_dir = out / "lora_adapters"
+        if lora_dir.exists():
+            for f in sorted(lora_dir.iterdir()):
+                if f.is_file():
+                    files.append((f, f"lora/{f.name}"))
+
+    if upload_merged:
+        merged_dir = out / "merged_model"
+        if merged_dir.exists():
+            for f in sorted(merged_dir.iterdir()):
+                if f.is_file():
+                    files.append((f, f"merged/{f.name}"))
+
+    if upload_gguf:
+        gguf_files = []
+        mq_dir = out / "magicquant"
+        if mq_dir.exists():
+            gguf_files = sorted(mq_dir.glob("*.gguf"))
+        if not gguf_files:
+            bf16 = out / "model-bf16.gguf"
+            if bf16.exists():
+                gguf_files = [bf16]
+        for f in gguf_files:
+            files.append((f, f.name))
+
+    return files
+
+
+# ── Model card generation ────────────────────────────────────────────────────
+
+def generate_model_card(
+    cfg: HFUploadConfig,
+    files_to_upload: list[tuple[Path, str]],
+) -> str:
+    """Generate a complete model card with YAML front matter.
+
+    Includes: description, base model credit, quantization method,
+    training details, caveats, limitations, and usage instructions.
+    """
+    repo_name = cfg.repo_id.split("/")[-1] if "/" in cfg.repo_id else cfg.repo_id
+    base_model = cfg.base_model or "unknown"
+    base_model_short = base_model.split("/")[-1] if "/" in base_model else base_model
+    dataset_name = cfg.dataset_name or "custom dataset"
+
+    # Build the GGUF file table
+    gguf_rows = ""
+    has_gguf = False
+    for local_path, repo_path in files_to_upload:
+        if repo_path.endswith(".gguf"):
+            has_gguf = True
+            size_gb = local_path.stat().st_size / 1e9
+            name = repo_path
+            # Infer quant tier from filename
+            quant_hint = ""
+            name_lower = name.lower()
+            if "q4" in name_lower:
+                quant_hint = "Q4 hybrid"
+            elif "q5" in name_lower:
+                quant_hint = "Q5 hybrid"
+            elif "q6" in name_lower:
+                quant_hint = "Q6 hybrid"
+            elif "bf16" in name_lower:
+                quant_hint = "BF16 (unquantized)"
+            elif "f16" in name_lower:
+                quant_hint = "F16 (unquantized)"
+            gguf_rows += f"| [{name}](./{name}) | {size_gb:.1f} GB | {quant_hint} |\n"
+
+    # Non-GGUF files table
+    other_rows = ""
+    for local_path, repo_path in files_to_upload:
+        if not repo_path.endswith(".gguf"):
+            size_mb = local_path.stat().st_size / 1e6
+            other_rows += f"| {repo_path} | {size_mb:.0f} MB |\n"
+
+    # Description
+    description = cfg.model_description
+    if not description:
+        description = (
+            f"Fine-tuned GGUF quantization of [{base_model_short}](https://huggingface.co/{base_model}), "
+            f"trained on {dataset_name} with QLoRA and quantized using MagicQuant hybrid evolutionary search."
+        )
+
+    # Build effective batch size
+    effective_batch = cfg.batch_size * cfg.gradient_accumulation
+
+    # YAML front matter — built manually because ModelCardData.to_yaml()
+    # doesn't support all the fields we need.
+    tags = ["gguf", "quantized", "fine-tuned", "magicquant", "qlora"]
+    tags_yaml = "\n".join(f"  - {t}" for t in tags)
+
+    yaml_block = f"""---
+license: {cfg.license}
+library_name: llama.cpp
+base_model: {base_model}
+pipeline_tag: text-generation
+language:
+  - en
+tags:
+{tags_yaml}
+---"""
+
+    # Files section
+    files_section = ""
+    if has_gguf:
+        files_section += f"""
+## GGUF Files
+
+| File | Size | Quant |
+|------|------|-------|
+{gguf_rows}"""
+
+    if other_rows:
+        files_section += f"""
+## Other Files
+
+| File | Size |
+|------|------|
+{other_rows}"""
+
+    card = f"""{yaml_block}
+
+# {repo_name}
+
+{description}
+
+## Base Model
+
+This is a fine-tuned and quantized derivative of [{base_model_short}](https://huggingface.co/{base_model}).
+All credit for the base model architecture and weights goes to the original authors.
+The base model's license applies to this derivative.
+
+## Quantization Method
+
+Quantized using **MagicQuant** hybrid evolutionary per-tensor quantization:
+
+- Tensors are classified into sensitivity groups (Embeddings, Head, Query, Key, Output, FFN Up/Down, MoE Experts, Router)
+- An evolutionary search finds the optimal quantization type per group, balancing size vs. perplexity
+- **Q4/Q5/Q6 tier targets** are produced with different size-quality tradeoffs
+- Small-row tensors and sensitivity-critical layers (embeddings, output head, router) are kept at F32/F16/BF16
+- This is NOT a uniform quantization -- each tensor group gets its own optimal type
+
+## Training Details
+
+| Parameter | Value |
+|-----------|-------|
+| Method | QLoRA with completion-only loss masking |
+| LoRA rank (r) | {cfg.lora_r} |
+| LoRA alpha | {cfg.lora_alpha} |
+| LoRA dropout | {cfg.lora_dropout} |
+| Epochs | {cfg.num_epochs} |
+| Learning rate | {cfg.learning_rate} |
+| LR scheduler | {cfg.lr_scheduler} |
+| Batch size | {cfg.batch_size} (effective {effective_batch} with gradient accumulation) |
+| Optimizer | {cfg.optimizer} |
+| Max sequence length | {cfg.max_seq_length} |
+| Precision | BF16 |
+| Dataset | {dataset_name} |
+| Hardware | AMD Ryzen AI Max+ 395 (Strix Halo), 128 GB unified memory (GTT), ROCm |
+| Training pipeline | Custom fast QLoRA with shard-by-shard BnB 4-bit quantization |
+
+**Completion-only loss**: Only assistant response turns contribute to the training loss.
+System and user turns are masked, so the model learns to generate responses rather
+than memorizing prompts.
+{files_section}
+
+## Usage
+
+### LM Studio
+
+1. Download the GGUF file of your preferred quantization tier
+2. Place it in your LM Studio models directory
+3. Load the model in LM Studio -- it will auto-detect the chat template
+4. Recommended context length: {cfg.max_seq_length} tokens
+
+### llama.cpp
+
+```bash
+# Interactive chat
+llama-cli -m {repo_name}-Q5.gguf -c {cfg.max_seq_length} --chat-template chatml -cnv
+
+# Single prompt
+llama-cli -m {repo_name}-Q5.gguf -c {cfg.max_seq_length} -p "Your prompt here"
+
+# Server mode
+llama-server -m {repo_name}-Q5.gguf -c {cfg.max_seq_length} --port 8080
+```
+
+### Python (llama-cpp-python)
+
+```python
+from llama_cpp import Llama
+
+llm = Llama(model_path="./{repo_name}-Q5.gguf", n_ctx={cfg.max_seq_length})
+output = llm.create_chat_completion(
+    messages=[
+        {{"role": "user", "content": "Hello, how are you?"}}
+    ]
+)
+print(output["choices"][0]["message"]["content"])
+```
+
+## Caveats
+
+- This is a **personal fine-tune**, not an official release from the base model authors
+- The base model's license ({cfg.license}) applies to all derivative files
+- Quality depends on the training data and may not generalize to all tasks
+- Quantization reduces precision -- verify outputs for your specific use case
+- The hybrid quantization assigns different precision to different tensor groups,
+  which means quality characteristics may differ from uniform quantizations
+
+## Limitations
+
+- Context length is limited to {cfg.max_seq_length} tokens (as trained)
+- Performance on tasks not represented in the training data may be degraded
+- Quantized models may exhibit subtle differences from the full-precision fine-tune
+- This model inherits any limitations and biases present in the base model
+
+---
+*Generated with the MagicQuant Pipeline*
+"""
+    return card
+
+
+# ── Dry-run mode ─────────────────────────────────────────────────────────────
+
+@dataclass
+class DryRunReport:
+    """Result of a dry-run upload check."""
+    token_valid: bool = False
+    token_username: str = ""
+    repo_accessible: bool = False
+    repo_exists: bool = False
+    repo_id: str = ""
+    files: list[tuple[str, str, float]] = field(default_factory=list)  # (local, repo_path, size_gb)
+    total_size_gb: float = 0.0
+    model_card_preview: str = ""
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.token_valid and self.repo_accessible and len(self.files) > 0 and not self.errors
+
+
+def dry_run(
+    cfg: HFUploadConfig,
+    output_dir: str,
+    log: LogFn = _default_log,
+    token: Optional[str] = None,
+) -> DryRunReport:
+    """Validate credentials and repo access, report what would be uploaded.
+
+    Does NOT upload anything.
+
+    Args:
+        cfg: Upload configuration
+        output_dir: Directory containing artifacts to upload
+        log: Logging callback
+        token: HF token override (defaults to HF_TOKEN env var)
+
+    Returns:
+        DryRunReport with validation results and file list
+    """
+    report = DryRunReport(repo_id=cfg.repo_id)
+
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        report.errors.append("huggingface_hub is not installed (pip install huggingface_hub)")
+        log("huggingface_hub not installed", "error")
+        return report
+
+    # 1. Validate token
+    log("Dry run: validating HF credentials", "stage")
+    hf_token = token or os.environ.get("HF_TOKEN")
+    if not hf_token:
+        report.errors.append("HF_TOKEN environment variable is not set")
+        log("HF_TOKEN not set", "error")
+        return report
+
+    api = HfApi(token=hf_token)
+    try:
+        user_info = api.whoami()
+        report.token_valid = True
+        report.token_username = user_info.get("name", user_info.get("fullname", "unknown"))
+        log(f"  Authenticated as: {report.token_username}")
+    except Exception as e:
+        report.errors.append(f"Token validation failed: {e}")
+        log(f"Token validation failed: {e}", "error")
+        return report
+
+    # 2. Check repo access
+    if not cfg.repo_id:
+        report.errors.append("No repo_id configured")
+        log("No repo_id configured", "error")
+        return report
+
+    log(f"  Checking repo: {cfg.repo_id}")
+    try:
+        api.repo_info(repo_id=cfg.repo_id, repo_type="model")
+        report.repo_exists = True
+        report.repo_accessible = True
+        log(f"  Repo exists and is accessible")
+    except Exception:
+        # Repo doesn't exist yet -- check if we can create it
+        report.repo_exists = False
+        # Verify the namespace matches the authenticated user or their orgs
+        namespace = cfg.repo_id.split("/")[0] if "/" in cfg.repo_id else report.token_username
+        try:
+            orgs = [o.get("name", "") for o in user_info.get("orgs", [])]
+        except (AttributeError, TypeError):
+            orgs = []
+
+        if namespace == report.token_username or namespace in orgs:
+            report.repo_accessible = True
+            log(f"  Repo does not exist -- will be created on upload")
+        else:
+            report.repo_accessible = False
+            report.errors.append(
+                f"Cannot create repo under namespace '{namespace}' "
+                f"(authenticated as '{report.token_username}', orgs: {orgs})"
+            )
+            log(f"  No access to namespace '{namespace}'", "error")
+
+    # 3. Discover files
+    log("  Scanning for uploadable files...")
+    file_tuples = discover_upload_files(
+        output_dir,
+        upload_gguf=cfg.upload_gguf,
+        upload_lora=cfg.upload_lora,
+        upload_merged=cfg.upload_merged,
+    )
+
+    if not file_tuples:
+        report.warnings.append("No files found to upload in the output directory")
+        log("  No files found to upload", "warn")
+    else:
+        total = 0.0
+        for local_path, repo_path in file_tuples:
+            size_gb = local_path.stat().st_size / 1e9
+            total += size_gb
+            report.files.append((str(local_path), repo_path, size_gb))
+            log(f"    {repo_path} ({size_gb:.2f} GB)")
+        report.total_size_gb = total
+        log(f"  Total upload size: {total:.2f} GB")
+
+    # 4. Generate model card preview
+    report.model_card_preview = generate_model_card(cfg, file_tuples)
+
+    # Summary
+    log("", "info")
+    log("Dry run summary:", "stage")
+    log(f"  Token valid:      {report.token_valid}")
+    log(f"  User:             {report.token_username}")
+    log(f"  Repo:             {report.repo_id}")
+    log(f"  Repo exists:      {report.repo_exists}")
+    log(f"  Repo accessible:  {report.repo_accessible}")
+    log(f"  Files to upload:  {len(report.files)}")
+    log(f"  Total size:       {report.total_size_gb:.2f} GB")
+    if report.errors:
+        for e in report.errors:
+            log(f"  ERROR: {e}", "error")
+    if report.warnings:
+        for w in report.warnings:
+            log(f"  WARNING: {w}", "warn")
+    if report.ok:
+        log("Dry run PASSED -- ready to upload", "success")
+    else:
+        log("Dry run FAILED -- see errors above", "error")
+
+    return report
+
+
+# ── Upload with progress ─────────────────────────────────────────────────────
+
+def upload(
+    cfg: HFUploadConfig,
+    output_dir: str,
+    log: LogFn = _default_log,
+    token: Optional[str] = None,
+) -> bool:
+    """Upload artifacts to HuggingFace Hub with progress reporting.
+
+    Args:
+        cfg: Upload configuration
+        output_dir: Directory containing artifacts to upload
+        log: Logging callback (msg, level)
+        token: HF token override (defaults to HF_TOKEN env var)
+
+    Returns:
+        True if all uploads succeeded
+    """
+    try:
+        from huggingface_hub import HfApi, ModelCard
+    except ImportError:
+        log("huggingface_hub not installed (pip install huggingface_hub)", "error")
+        return False
+
+    hf_token = token or os.environ.get("HF_TOKEN")
+    if not hf_token:
+        log("HF_TOKEN environment variable is not set", "error")
+        return False
+
+    if not cfg.repo_id:
+        log("No repo_id configured for upload", "error")
+        return False
+
+    api = HfApi(token=hf_token)
+
+    # Validate credentials
+    try:
+        user_info = api.whoami()
+        username = user_info.get("name", "unknown")
+        log(f"Authenticated as: {username}")
+    except Exception as e:
+        log(f"Authentication failed: {e}", "error")
+        return False
+
+    # Create/verify repo
+    log(f"Creating/verifying repo: {cfg.repo_id}", "stage")
+    try:
+        api.create_repo(
+            repo_id=cfg.repo_id,
+            repo_type="model",
+            private=cfg.private,
+            exist_ok=True,
+        )
+        log(f"  Repo ready: https://huggingface.co/{cfg.repo_id}")
+    except Exception as e:
+        log(f"Failed to create/access repo: {e}", "error")
+        return False
+
+    # Discover files
+    files_to_upload = discover_upload_files(
+        output_dir,
+        upload_gguf=cfg.upload_gguf,
+        upload_lora=cfg.upload_lora,
+        upload_merged=cfg.upload_merged,
+    )
+
+    if not files_to_upload:
+        log("No files found to upload", "warn")
+        return False
+
+    total_size = sum(f.stat().st_size for f, _ in files_to_upload) / 1e9
+    log(f"Found {len(files_to_upload)} files ({total_size:.2f} GB total)")
+
+    # Generate and upload model card
+    log("Generating model card", "stage")
+    card_content = generate_model_card(cfg, files_to_upload)
+    try:
+        card = ModelCard(card_content)
+        card.push_to_hub(cfg.repo_id, token=hf_token)
+        log("  Model card uploaded", "success")
+    except Exception as e:
+        log(f"  Model card upload failed (continuing with files): {e}", "warn")
+
+    # Upload files with progress
+    log(f"Uploading {len(files_to_upload)} files", "stage")
+    for i, (local_path, repo_path) in enumerate(files_to_upload, 1):
+        size_gb = local_path.stat().st_size / 1e9
+        log(f"  [{i}/{len(files_to_upload)}] {repo_path} ({size_gb:.2f} GB)")
+
+        try:
+            api.upload_file(
+                path_or_fileobj=str(local_path),
+                path_in_repo=repo_path,
+                repo_id=cfg.repo_id,
+                repo_type="model",
+                commit_message=f"Upload {repo_path}",
+            )
+            pct = int(100 * i / len(files_to_upload))
+            log(f"    Uploaded ({pct}% complete)", "success")
+        except Exception as e:
+            log(f"    Failed to upload {repo_path}: {e}", "error")
+            return False
+
+    log(f"All files uploaded to https://huggingface.co/{cfg.repo_id}", "success")
+    return True
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+def main():
+    """CLI entry point for standalone upload / dry-run."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Upload model artifacts to HuggingFace Hub",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Dry run (validate without uploading)
+  python hf_upload.py --repo user/model-name --output-dir ./output --dry-run
+
+  # Upload GGUF files
+  python hf_upload.py --repo user/model-name --output-dir ./output
+
+  # Upload everything (GGUF + LoRA + merged)
+  python hf_upload.py --repo user/model-name --output-dir ./output --lora --merged
+
+  # Show generated model card
+  python hf_upload.py --repo user/model-name --output-dir ./output --dry-run --show-card
+""",
+    )
+    parser.add_argument("--repo", required=True, help="HuggingFace repo ID (user/model-name)")
+    parser.add_argument("--output-dir", required=True, help="Pipeline output directory")
+    parser.add_argument("--base-model", default="", help="Base model ID for model card")
+    parser.add_argument("--dataset", default="", help="Dataset name for model card")
+    parser.add_argument("--license", default="apache-2.0", help="License identifier")
+    parser.add_argument("--private", action="store_true", help="Create as private repo")
+    parser.add_argument("--public", action="store_true", help="Create as public repo")
+    parser.add_argument("--lora", action="store_true", help="Upload LoRA adapters")
+    parser.add_argument("--merged", action="store_true", help="Upload merged model")
+    parser.add_argument("--no-gguf", action="store_true", help="Skip GGUF upload")
+    parser.add_argument("--dry-run", action="store_true", help="Validate without uploading")
+    parser.add_argument("--show-card", action="store_true", help="Print the generated model card")
+    parser.add_argument("--lora-r", type=int, default=32, help="LoRA rank (for model card)")
+    parser.add_argument("--lora-alpha", type=int, default=64, help="LoRA alpha (for model card)")
+    parser.add_argument("--epochs", type=int, default=3, help="Training epochs (for model card)")
+    parser.add_argument("--seq-length", type=int, default=8192, help="Max sequence length (for model card)")
+    args = parser.parse_args()
+
+    cfg = HFUploadConfig(
+        repo_id=args.repo,
+        private=not args.public if args.public else (args.private if args.private else True),
+        license=args.license,
+        upload_gguf=not args.no_gguf,
+        upload_lora=args.lora,
+        upload_merged=args.merged,
+        base_model=args.base_model,
+        dataset_name=args.dataset,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        num_epochs=args.epochs,
+        max_seq_length=args.seq_length,
+    )
+
+    if args.dry_run:
+        report = dry_run(cfg, args.output_dir)
+        if args.show_card and report.model_card_preview:
+            print("\n" + "=" * 60)
+            print("MODEL CARD PREVIEW")
+            print("=" * 60)
+            print(report.model_card_preview)
+        sys.exit(0 if report.ok else 1)
+    else:
+        ok = upload(cfg, args.output_dir)
+        sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
