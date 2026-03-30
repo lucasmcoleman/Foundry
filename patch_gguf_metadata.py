@@ -189,7 +189,7 @@ def main():
         print()
 
     # Also patch the copies in the output dir
-    mq_dir = Path("/server/programming/unsloth/output-zeroclaw-qwen40b/magicquant")
+    mq_dir = Path("/server/programming/pipeline/output-zeroclaw-qwen40b/magicquant")
     mq_files = list(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
     if mq_files:
         print(f"Also patching {len(mq_files)} files in {mq_dir}\n")
