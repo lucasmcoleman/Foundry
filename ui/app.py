@@ -299,21 +299,25 @@ else:
     except Exception:
         print(f"Loading model: {{_model_id}}")
 
-import torch
+import sys, torch
+sys.path.insert(0, "{Path(__file__).parent.parent}")
+from fast_train_zeroclaw import fast_load_quantized_model, detect_response_template, find_latest_checkpoint
 from datasets import load_dataset
-from unsloth import FastLanguageModel
 from trl import SFTTrainer, SFTConfig
+from peft import LoraConfig, prepare_model_for_kbit_training
 
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="{tc.model_name}",
-    max_seq_length={tc.max_seq_length},
-    load_in_4bit={tc.load_in_4bit},
-)
-model = FastLanguageModel.get_peft_model(model,
+DEVICE = torch.device("cuda:0")
+model, tokenizer = fast_load_quantized_model("{tc.model_name}")
+
+model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+lora_config = LoraConfig(
     r={tc.lora_r}, lora_alpha={tc.lora_alpha}, lora_dropout={tc.lora_dropout},
     target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-    use_rslora={tc.use_rslora}, use_gradient_checkpointing="unsloth",
+    use_rslora={tc.use_rslora}, task_type="CAUSAL_LM",
 )
+from peft import get_peft_model
+model = get_peft_model(model, lora_config)
+model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={{"use_reentrant": False}})
 
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in model.parameters())
@@ -327,17 +331,19 @@ def fmt(ex):
     return ex
 dataset = dataset.map(fmt)
 
-# Resolve the actual tokenizer — some models (e.g. VL models) return a Processor
-# which wraps the tokenizer. SFTTrainer needs the real tokenizer for completion masking.
-_tok = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
-_use_completion_only = hasattr(_tok, "encode")
-if _use_completion_only:
-    print("Completion-only loss: enabled (masking non-assistant tokens)")
-else:
-    print("Completion-only loss: disabled (processor lacks encode method)")
+from trl import DataCollatorForCompletionOnlyLM
+response_template = detect_response_template(tokenizer)
+print(f"Response template: {{repr(response_template)}}")
+response_ids = tokenizer.encode(response_template, add_special_tokens=False)
+collator = DataCollatorForCompletionOnlyLM(response_template=response_ids, tokenizer=tokenizer)
+
+resume_ckpt = find_latest_checkpoint("{tc.output_dir}")
+if resume_ckpt:
+    print(f"Resuming from checkpoint: {{resume_ckpt}}")
 
 trainer = SFTTrainer(
-    model=model, processing_class=_tok, train_dataset=dataset,
+    model=model, tokenizer=tokenizer, train_dataset=dataset,
+    data_collator=collator,
     args=SFTConfig(
         output_dir="{tc.output_dir}",
         num_train_epochs={tc.num_train_epochs},
@@ -351,12 +357,11 @@ trainer = SFTTrainer(
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={{"use_reentrant": False}},
         report_to="none",
-        max_length={tc.max_seq_length},
+        max_seq_length={tc.max_seq_length},
         dataset_text_field="text",
-        completion_only_loss=_use_completion_only,
     ),
 )
-stats = trainer.train()
+stats = trainer.train(resume_from_checkpoint=resume_ckpt)
 print(f"Final loss: {{stats.training_loss:.4f}}")
 
 lora_dir = "{tc.output_dir}/lora_adapters"
@@ -470,47 +475,27 @@ else:
     tokenizer.save_pretrained("{out}/merged_model")
 '''
         script = env_setup + cache_check + f'''
-from unsloth import FastLanguageModel
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="{model_source}", max_seq_length=4096, load_in_4bit=False,
+import sys
+sys.path.insert(0, "{Path(__file__).parent.parent}")
+from fast_export import streaming_merge
+streaming_merge(
+    model_id="{model_source}",
+    lora_dir="{out}/lora_adapters" if {has_lora} else None,
+    merged_dir="{out}/merged_model",
 )
-print("Saving safetensors...")
-{save_line}
 print("PIPELINE_STAGE_COMPLETE=export")
 '''
     else:
-        await state.log(f"Exporting {load_desc} to {ec.gguf_type.upper()} GGUF", "stage")
+        await state.log(f"Exporting {load_desc} to safetensors (for GGUF conversion)", "stage")
         script = env_setup + cache_check + f'''
-import shutil
-from pathlib import Path
-from unsloth import FastLanguageModel
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="{model_source}", max_seq_length=4096, load_in_4bit=False,
+import sys
+sys.path.insert(0, "{Path(__file__).parent.parent}")
+from fast_export import streaming_merge
+streaming_merge(
+    model_id="{model_source}",
+    lora_dir="{out}/lora_adapters" if {has_lora} else None,
+    merged_dir="{out}/merged_model",
 )
-
-if {ec.also_save_merged}:
-    from peft import PeftModel as _PM
-    if isinstance(model, _PM):
-        print("Also saving merged safetensors...")
-        model.save_pretrained_merged("{out}/merged_model", tokenizer, save_method="merged_16bit")
-    else:
-        print("Base model (no LoRA) — saving safetensors directly...")
-        model.save_pretrained("{out}/merged_model")
-        tokenizer.save_pretrained("{out}/merged_model")
-
-print("Converting to {ec.gguf_type.upper()} GGUF...")
-model.save_pretrained_gguf("{out}", tokenizer, quantization_method="{ec.gguf_type}")
-
-dst = Path("{out}/model-bf16.gguf")
-for d in [Path("{out}"), Path("{out}_gguf")]:
-    if d.exists():
-        for f in d.glob("*.gguf"):
-            if f != dst:
-                shutil.move(str(f), str(dst))
-                break
-if dst.exists():
-    size = dst.stat().st_size / 1e9
-    print(f"GGUF: {{dst}} ({{size:.1f}} GB)")
 print("PIPELINE_STAGE_COMPLETE=export")
 '''
     rc = await run_script(script, out)
