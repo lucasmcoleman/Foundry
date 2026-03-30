@@ -1,0 +1,24 @@
+# Virtual environment
+unsloth-env/
+unsloth_compiled_cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Output directories (model artifacts)
+output/
+output_gguf/
+output-zeroclaw/
+output-zeroclaw-qwen40b/
+
+# Embedded MagicQuant (has its own repo at ../MagicQuant/)
+MagicQuant/
+
+# Claude Code local settings
+.claude/
+
+# Logs
+*.log
+ui/ui.log

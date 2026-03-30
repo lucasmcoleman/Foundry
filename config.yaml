@@ -1,0 +1,64 @@
+# Unsloth QLoRA Fine-Tuning Configuration
+#
+# This config mirrors the hyperparameters from Medina-Qwen3.5-27B-OpenClaw.
+# Adjust model_name, dataset_path, and output_dir for your use case.
+#
+# Usage:
+#   source unsloth-env/bin/activate
+#   python train.py --config config.yaml
+
+# --- Model ---
+model_name: "unsloth/Qwen3-8B"       # Change to your target model
+max_seq_length: 4096
+load_in_4bit: true
+
+# --- LoRA ---
+lora_r: 32
+lora_alpha: 64
+lora_dropout: 0.05
+use_rslora: true
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+# --- Training ---
+num_train_epochs: 3
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8         # effective batch size = 2 * 8 = 16
+learning_rate: 0.0002                  # 2e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+optim: adamw_8bit
+weight_decay: 0.01
+max_grad_norm: 1.0
+fp16: false
+bf16: true
+logging_steps: 1
+save_strategy: epoch
+seed: 42
+gradient_checkpointing: true
+
+# --- Dataset ---
+# Supported formats:
+#   - Local .jsonl / .json file
+#   - HuggingFace dataset name (e.g., "username/dataset-name")
+#
+# For chat/instruction data, each example should have a "messages" field:
+#   [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, ...]
+# The chat template from the tokenizer will be applied automatically.
+#
+# For pre-formatted text, each example should have a "text" field.
+dataset_path: null                     # SET THIS to your dataset
+dataset_split: train
+dataset_text_field: text
+
+# --- Output ---
+output_dir: ./output
+hub_model_id: null                     # Set to "username/model-name" to push to HF
+save_merged: false                     # Save full merged model (large)
+save_gguf: false                       # Export GGUF quantizations

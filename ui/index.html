@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Unsloth Pipeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg-0: #08080a; --bg-1: #0e0e12; --bg-2: #151519; --bg-3: #1c1c22; --bg-4: #24242c;
+  --border: #2a2a35; --border-bright: #3a3a48;
+  --text-0: #e8e8ed; --text-1: #b0b0bc; --text-2: #707080; --text-3: #50505e;
+  --amber: #f59e0b; --amber-dim: #92600b; --amber-glow: rgba(245,158,11,0.12);
+  --green: #22c55e; --green-dim: #166534; --red: #ef4444; --red-dim: #7f1d1d;
+  --blue: #3b82f6; --purple: #a855f7; --cyan: #06b6d4;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --font-sans: 'Space Grotesk', system-ui, sans-serif;
+  --radius: 6px;
+}
+
+html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-family: var(--font-mono); font-size: 13px; line-height: 1.5; overflow: hidden; }
+
+.app { display: grid; grid-template-columns: 280px 1fr; grid-template-rows: 56px 1fr 240px; grid-template-areas: "header header" "sidebar main" "sidebar logs"; height: 100vh; gap: 1px; background: var(--border); }
+
+.header { grid-area: header; background: var(--bg-1); display: flex; align-items: center; justify-content: space-between; padding: 0 24px; border-bottom: 1px solid var(--border); }
+.header-left { display: flex; align-items: center; gap: 14px; }
+.logo { font-family: var(--font-sans); font-weight: 700; font-size: 18px; letter-spacing: -0.5px; }
+.logo span { color: var(--amber); }
+.header-tag { font-size: 10px; font-weight: 500; padding: 3px 8px; border-radius: 3px; background: var(--amber-glow); color: var(--amber); border: 1px solid var(--amber-dim); letter-spacing: 0.5px; text-transform: uppercase; }
+.header-right { display: flex; align-items: center; gap: 12px; }
+.gpu-badge { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-2); padding: 4px 10px; border-radius: 4px; background: var(--bg-3); border: 1px solid var(--border); }
+.gpu-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+.btn { font-family: var(--font-mono); font-size: 12px; font-weight: 600; padding: 8px 20px; border: 1px solid var(--border-bright); border-radius: var(--radius); background: var(--bg-3); color: var(--text-0); cursor: pointer; transition: all 0.15s; letter-spacing: 0.3px; }
+.btn:hover { background: var(--bg-4); border-color: var(--text-2); }
+.btn-primary { background: var(--amber); color: var(--bg-0); border-color: var(--amber); }
+.btn-primary:hover { background: #d97706; border-color: #d97706; }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.sidebar { grid-area: sidebar; background: var(--bg-1); padding: 20px 0; overflow-y: auto; display: flex; flex-direction: column; }
+.sidebar-title { font-size: 10px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-3); padding: 0 20px; margin-bottom: 16px; }
+.stage-list { flex: 1; position: relative; padding: 0 20px; }
+.stage-list::before { content: ''; position: absolute; left: 39px; top: 20px; bottom: 20px; width: 1px; background: var(--border); }
+
+.stage-item { position: relative; padding: 12px 16px 12px 36px; margin-bottom: 4px; border-radius: var(--radius); cursor: pointer; transition: all 0.15s; border: 1px solid transparent; }
+.stage-item:hover { background: var(--bg-2); }
+.stage-item.active { background: var(--bg-3); border-color: var(--border-bright); }
+.stage-indicator { position: absolute; left: 8px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--border-bright); background: var(--bg-1); display: flex; align-items: center; justify-content: center; z-index: 1; transition: all 0.3s; }
+.stage-item[data-status="running"] .stage-indicator { border-color: var(--amber); background: var(--amber-glow); box-shadow: 0 0 12px var(--amber-glow); animation: ind-pulse 1.5s infinite; }
+@keyframes ind-pulse { 0%,100%{box-shadow:0 0 8px var(--amber-glow)} 50%{box-shadow:0 0 20px rgba(245,158,11,0.25)} }
+.stage-item[data-status="complete"] .stage-indicator { border-color: var(--green); background: var(--green-dim); }
+.stage-item[data-status="complete"] .stage-indicator::after { content: '\2713'; font-size: 10px; color: var(--green); }
+.stage-item[data-status="failed"] .stage-indicator { border-color: var(--red); background: var(--red-dim); }
+.stage-item[data-status="failed"] .stage-indicator::after { content: '\2717'; font-size: 10px; color: var(--red); }
+.stage-item[data-status="skipped"] .stage-indicator { border-color: var(--text-3); opacity: 0.4; }
+.stage-item[data-status="skipped"] { opacity: 0.4; }
+.stage-name { font-weight: 600; font-size: 13px; margin-bottom: 2px; }
+.stage-desc { font-size: 11px; color: var(--text-2); }
+.stage-toggle { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); }
+
+.toggle { position: relative; width: 32px; height: 18px; cursor: pointer; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-track { position: absolute; inset: 0; background: var(--bg-0); border-radius: 9px; border: 1px solid var(--border); transition: all 0.2s; }
+.toggle input:checked + .toggle-track { background: var(--amber-dim); border-color: var(--amber); }
+.toggle-thumb { position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: var(--text-2); transition: all 0.2s; pointer-events: none; }
+.toggle input:checked ~ .toggle-thumb { left: 17px; background: var(--amber); }
+
+.main { grid-area: main; background: var(--bg-0); overflow-y: auto; padding: 24px 32px; }
+.section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+.section-title { font-family: var(--font-sans); font-size: 20px; font-weight: 700; letter-spacing: -0.5px; }
+.section-badge { font-size: 10px; padding: 3px 8px; border-radius: 3px; letter-spacing: 0.5px; text-transform: uppercase; font-weight: 600; }
+.badge-required { background: rgba(245,158,11,0.1); color: var(--amber); border: 1px solid var(--amber-dim); }
+.badge-optional { background: var(--bg-3); color: var(--text-2); border: 1px solid var(--border); }
+
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 28px; }
+.form-grid.single-col { grid-template-columns: 1fr; }
+.form-group { display: flex; flex-direction: column; gap: 6px; }
+.form-group.span-2 { grid-column: span 2; }
+.form-label { font-size: 11px; font-weight: 500; color: var(--text-2); letter-spacing: 0.3px; position: relative; }
+.form-label[data-tip] { cursor: help; border-bottom: 1px dotted var(--text-3); display: inline-block; }
+.form-label[data-tip]:hover::after { content: attr(data-tip); position: absolute; left: 0; top: calc(100% + 6px); background: var(--bg-4); color: var(--text-1); font-size: 11px; font-weight: 400; padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border-bright); white-space: normal; width: max-content; max-width: 280px; z-index: 100; line-height: 1.4; box-shadow: 0 4px 12px rgba(0,0,0,0.4); animation: tip-in 0.12s ease; }
+@keyframes tip-in { from { opacity:0; transform:translateY(-4px) } to { opacity:1; transform:translateY(0) } }
+.form-input { font-family: var(--font-mono); font-size: 13px; padding: 8px 12px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-0); outline: none; transition: border-color 0.15s; }
+.form-input:focus { border-color: var(--amber-dim); }
+.form-input::placeholder { color: var(--text-3); }
+.form-hint { font-size: 10px; color: var(--text-3); }
+.form-divider { grid-column: span 2; height: 1px; background: var(--border); margin: 8px 0; }
+.form-section-label { grid-column: span 2; font-size: 11px; font-weight: 600; color: var(--text-2); letter-spacing: 1px; text-transform: uppercase; padding-top: 4px; }
+.checkbox-row { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.checkbox-row input[type="checkbox"] { accent-color: var(--amber); width: 14px; height: 14px; }
+
+.stage-master-toggle { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 24px; }
+.stage-master-toggle .smt-left { display: flex; align-items: center; gap: 12px; }
+.stage-master-toggle .smt-label { font-size: 13px; font-weight: 600; color: var(--text-0); }
+.stage-master-toggle .smt-hint { font-size: 11px; color: var(--text-2); }
+.stage-master-toggle .smt-status { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 3px; letter-spacing: 0.5px; text-transform: uppercase; }
+.stage-master-toggle .smt-status.on { color: var(--green); background: rgba(34,197,94,0.1); border: 1px solid var(--green-dim); }
+.stage-master-toggle .smt-status.off { color: var(--text-3); background: var(--bg-3); border: 1px solid var(--border); }
+.stage-master-toggle .toggle { width: 44px; height: 24px; }
+.stage-master-toggle .toggle-thumb { width: 16px; height: 16px; top: 4px; left: 4px; }
+.stage-master-toggle .toggle input:checked ~ .toggle-thumb { left: 24px; }
+.stage-content-disabled { opacity: 0.35; pointer-events: none; user-select: none; }
+
+.dep-banner { padding: 12px 16px; border-radius: var(--radius); font-size: 12px; margin-bottom: 16px; display: flex; align-items: flex-start; gap: 10px; line-height: 1.5; }
+.dep-banner .dep-icon { flex-shrink: 0; font-size: 14px; margin-top: 1px; }
+.dep-banner-warn { background: rgba(245,158,11,0.08); border: 1px solid var(--amber-dim); color: var(--amber); }
+.dep-banner-info { background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.3); color: var(--blue); }
+
+.progress-container { margin-top: 20px; padding: 16px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); display: none; }
+.progress-container.visible { display: block; }
+.progress-header { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 12px; }
+.progress-stage { color: var(--amber); font-weight: 600; }
+.progress-pct { color: var(--text-2); }
+.progress-bar { height: 4px; background: var(--bg-0); border-radius: 2px; overflow: hidden; }
+.progress-fill { height: 100%; background: linear-gradient(90deg, var(--amber), #fbbf24); border-radius: 2px; transition: width 0.3s; width: 0%; position: relative; }
+.progress-fill::after { content: ''; position: absolute; right: 0; top: -2px; bottom: -2px; width: 20px; background: linear-gradient(90deg,transparent,rgba(251,191,36,0.4)); filter: blur(4px); }
+
+.tag-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.tag { font-size: 11px; padding: 3px 10px; background: var(--bg-3); border: 1px solid var(--border); border-radius: 3px; color: var(--text-1); cursor: pointer; transition: all 0.15s; }
+.tag.selected { background: var(--amber-glow); border-color: var(--amber-dim); color: var(--amber); }
+.tag:hover { border-color: var(--border-bright); }
+
+.logs { grid-area: logs; background: var(--bg-1); display: flex; flex-direction: column; border-top: 1px solid var(--border); }
+.logs-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.logs-title { font-size: 10px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-3); }
+.logs-actions { display: flex; gap: 8px; }
+.logs-actions button { font-family: var(--font-mono); font-size: 10px; padding: 2px 8px; background: transparent; border: 1px solid var(--border); border-radius: 3px; color: var(--text-2); cursor: pointer; }
+.logs-actions button:hover { background: var(--bg-3); color: var(--text-1); }
+.logs-body { flex: 1; overflow-y: auto; padding: 8px 16px; font-size: 12px; line-height: 1.6; }
+.log-line { white-space: pre-wrap; word-break: break-all; opacity: 0; animation: log-appear 0.15s forwards; }
+@keyframes log-appear { to { opacity: 1; } }
+.log-line .ts { color: var(--text-3); margin-right: 8px; user-select: none; }
+.log-line.level-info { color: var(--text-1); }
+.log-line.level-stage { color: var(--amber); font-weight: 600; }
+.log-line.level-success { color: var(--green); font-weight: 600; }
+.log-line.level-error { color: var(--red); }
+.log-line.level-warn { color: #f97316; }
+.log-line.level-metric { color: var(--cyan); }
+
+.settings-wrap { position: relative; }
+.settings-btn { font-family: var(--font-mono); font-size: 12px; padding: 6px 10px; background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-2); cursor: pointer; transition: all 0.15s; display: flex; align-items: center; gap: 6px; }
+.settings-btn:hover { background: var(--bg-4); color: var(--text-0); border-color: var(--border-bright); }
+.settings-btn .gear { font-size: 14px; }
+.settings-pop { display: none; position: absolute; top: calc(100% + 8px); right: 0; background: var(--bg-2); border: 1px solid var(--border-bright); border-radius: var(--radius); padding: 16px; width: 320px; z-index: 200; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+.settings-pop.open { display: block; animation: tip-in 0.12s ease; }
+.settings-pop-title { font-size: 11px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: var(--text-3); margin-bottom: 12px; }
+.settings-pop .form-group { margin-bottom: 10px; }
+.settings-pop .form-group:last-child { margin-bottom: 0; }
+.settings-saved { font-size: 11px; color: var(--green); opacity: 0; transition: opacity 0.2s; }
+.settings-saved.show { opacity: 1; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-bright); }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="header">
+    <div class="header-left">
+      <div class="logo"><span>&#x1F9A5;</span> Unsloth Pipeline</div>
+      <div class="header-tag">QLoRA</div>
+    </div>
+    <div class="header-right">
+      <div class="gpu-badge"><div class="dot"></div><span id="gpu-name">Radeon 8060S &middot; 112GB GTT</span></div>
+      <div class="settings-wrap">
+        <button class="settings-btn" onclick="toggleSettings()"><span class="gear">&#9881;</span> Settings</button>
+        <div class="settings-pop" id="settings-pop">
+          <div class="settings-pop-title">Settings</div>
+          <div class="form-group">
+            <label class="form-label" data-tip="Your HuggingFace username. Used for auto-suggesting repository IDs.">HuggingFace Username</label>
+            <input class="form-input" id="cfg-hf-username" placeholder="e.g. lmcoleman" style="width:100%" oninput="saveConfigDebounced()">
+          </div>
+          <span class="settings-saved" id="settings-saved">Saved</span>
+        </div>
+      </div>
+      <button class="btn btn-primary" id="btn-run" onclick="runPipeline()">Run Pipeline</button>
+    </div>
+  </header>
+
+  <aside class="sidebar">
+    <div class="sidebar-title">Pipeline Stages</div>
+    <div class="stage-list">
+      <div class="stage-item active" data-stage="training" data-status="pending" onclick="selectStage('training')">
+        <div class="stage-indicator"></div>
+        <div class="stage-name">Training</div>
+        <div class="stage-desc">QLoRA fine-tuning (completion-only)</div>
+        <div class="stage-toggle" onclick="event.stopPropagation()">
+          <label class="toggle"><input type="checkbox" checked onchange="toggleStage('training',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+      </div>
+      <div class="stage-item" data-stage="export" data-status="pending" onclick="selectStage('export')">
+        <div class="stage-indicator"></div>
+        <div class="stage-name">Export</div>
+        <div class="stage-desc">Merge LoRA + convert to GGUF</div>
+        <div class="stage-toggle" onclick="event.stopPropagation()">
+          <label class="toggle"><input type="checkbox" checked onchange="toggleStage('export',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+      </div>
+      <div class="stage-item" data-stage="magicquant" data-status="pending" onclick="selectStage('magicquant')">
+        <div class="stage-indicator"></div>
+        <div class="stage-name">MagicQuant</div>
+        <div class="stage-desc">Evolutionary hybrid quantization</div>
+        <div class="stage-toggle" onclick="event.stopPropagation()">
+          <label class="toggle"><input type="checkbox" onchange="toggleStage('magicquant',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+      </div>
+      <div class="stage-item" data-stage="upload" data-status="pending" onclick="selectStage('upload')">
+        <div class="stage-indicator"></div>
+        <div class="stage-name">Upload</div>
+        <div class="stage-desc">Push to HuggingFace Hub</div>
+        <div class="stage-toggle" onclick="event.stopPropagation()">
+          <label class="toggle"><input type="checkbox" onchange="toggleStage('upload',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main" id="main-content"></main>
+
+  <div class="logs">
+    <div class="logs-header">
+      <div class="logs-title">Output</div>
+      <div class="logs-actions">
+        <button onclick="clearLogs()">Clear</button>
+        <button onclick="toggleAutoScroll()">Auto-scroll: <span id="autoscroll-label">On</span></button>
+      </div>
+    </div>
+    <div class="logs-body" id="logs-body"></div>
+  </div>
+</div>
+
+<script>
+const S = {
+  selectedStage: 'training',
+  enabledStages: new Set(['training', 'export']),
+  running: false,
+  autoScroll: true,
+  ws: null,
+  config: {
+    training: {
+      model_name: 'Tesslate/OmniCoder-9B', dataset_path: 'zeroclaw_training_data.jsonl',
+      max_seq_length: 4096, load_in_4bit: true,
+      lora_r: 32, lora_alpha: 64, lora_dropout: 0.05, use_rslora: true,
+      num_train_epochs: 3, per_device_train_batch_size: 2, gradient_accumulation_steps: 4,
+      learning_rate: 0.0002, lr_scheduler_type: 'cosine', warmup_ratio: 0.05, optim: 'adamw_8bit',
+      output_dir: './output',
+    },
+    export: { gguf_type: 'bf16', also_save_merged: false, source_model: '' },
+    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '' },
+    upload: { repo_id: '', private: true, license: 'apache-2.0', upload_gguf: true, upload_lora: false, upload_merged: false },
+  },
+  mqTiers: ['Q3','Q4','Q5','Q6'],
+  hfUsername: '',
+};
+
+// Persistent config
+let _saveTimer = null;
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    const cfg = await r.json();
+    S.hfUsername = cfg.hf_username || '';
+    const el = document.getElementById('cfg-hf-username');
+    if (el) el.value = S.hfUsername;
+  } catch(e) {}
+}
+async function saveConfig() {
+  const el = document.getElementById('cfg-hf-username');
+  S.hfUsername = (el?.value || '').trim();
+  try {
+    await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({hf_username: S.hfUsername})});
+    const saved = document.getElementById('settings-saved');
+    if (saved) { saved.classList.add('show'); setTimeout(() => saved.classList.remove('show'), 1500); }
+  } catch(e) {}
+}
+function saveConfigDebounced() { clearTimeout(_saveTimer); _saveTimer = setTimeout(saveConfig, 600); }
+function toggleSettings() {
+  const pop = document.getElementById('settings-pop');
+  pop.classList.toggle('open');
+  if (pop.classList.contains('open')) {
+    document.addEventListener('click', closeSettingsOutside);
+  }
+}
+function closeSettingsOutside(e) {
+  const wrap = document.querySelector('.settings-wrap');
+  if (!wrap.contains(e.target)) {
+    document.getElementById('settings-pop').classList.remove('open');
+    document.removeEventListener('click', closeSettingsOutside);
+  }
+}
+loadConfig();
+
+// WebSocket
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  S.ws = new WebSocket(`${proto}//${location.host}/ws`);
+  S.ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'log') appendLog(m.text, m.level);
+    else if (m.type === 'stage_update') { document.querySelector(`[data-stage="${m.stage}"]`).dataset.status = m.status; const p=document.querySelector('.progress-container'); if(p&&m.status==='running'){p.classList.add('visible'); const l=p.querySelector('.progress-stage'); if(l) l.textContent=m.stage.charAt(0).toUpperCase()+m.stage.slice(1);} }
+    else if (m.type === 'progress') { const f=document.querySelector('.progress-fill'),l=document.querySelector('.progress-pct'); if(f)f.style.width=m.percent+'%'; if(l)l.textContent=m.percent+'%'; }
+    else if (m.type === 'pipeline_done') { S.running=false; const b=document.getElementById('btn-run'); b.disabled=false; b.textContent='Run Pipeline'; }
+  };
+  S.ws.onclose = () => setTimeout(connectWS, 2000);
+}
+connectWS();
+
+function selectStage(name) {
+  S.selectedStage = name;
+  document.querySelectorAll('.stage-item').forEach(el => el.classList.toggle('active', el.dataset.stage===name));
+  renderStageContent();
+}
+
+function toggleStage(name, on) {
+  on ? S.enabledStages.add(name) : S.enabledStages.delete(name);
+  // Always re-render: toggling one stage can affect dependency banners on other stages
+  renderStageContent();
+}
+
+function renderStageContent() {
+  const r = {training: renderTraining, export: renderExport, magicquant: renderMagicQuant, upload: renderUpload};
+  document.getElementById('main-content').innerHTML = (r[S.selectedStage] || (()=>''))();
+  document.querySelectorAll('[data-key]').forEach(input => {
+    input.addEventListener('change', () => {
+      const [sec, key] = input.dataset.key.split('.');
+      S.config[sec][key] = input.type==='checkbox' ? input.checked : input.type==='number' ? parseFloat(input.value) : input.value;
+    });
+  });
+}
+
+function L(label, tip) { return `<label class="form-label" data-tip="${tip}">${label}</label>`; }
+
+function masterToggle(stage, label) {
+  const on = S.enabledStages.has(stage);
+  return `<div class="stage-master-toggle">
+    <div class="smt-left">
+      <label class="toggle"><input type="checkbox" ${on?'checked':''} onchange="masterToggleStage('${stage}',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+      <div><div class="smt-label">${label}</div><div class="smt-hint">${on?'This stage will run when the pipeline executes':'This stage will be skipped'}</div></div>
+    </div>
+    <div class="smt-status ${on?'on':'off'}">${on?'Enabled':'Disabled'}</div>
+  </div>`;
+}
+
+function depBanner(type, html) {
+  const icon = type === 'warn' ? '\u26a0' : '\u2139';
+  return `<div class="dep-banner dep-banner-${type}"><span class="dep-icon">${icon}</span><div>${html}</div></div>`;
+}
+
+function suggestRepoId() {
+  const trainingOn = S.enabledStages.has('training');
+  const exportOn = S.enabledStages.has('export');
+  const hasMQ = S.enabledStages.has('magicquant');
+  // Derive model name from the first enabled stage that has one
+  let modelName = '';
+  if (trainingOn) {
+    modelName = S.config.training.model_name;
+  } else if (exportOn && S.config.export.source_model) {
+    modelName = S.config.export.source_model;
+  } else if (hasMQ && S.config.magicquant.source_model) {
+    modelName = S.config.magicquant.source_model;
+  } else {
+    modelName = S.config.training.model_name;
+  }
+  // Strip path/org prefix and any file extension
+  let short = modelName.includes('/') ? modelName.split('/').pop() : modelName;
+  short = short.replace(/\.(gguf|bin|safetensors)$/i, '');
+  const suffix = hasMQ ? '-MagicQuant-GGUF' : exportOn ? '-GGUF' : '-LoRA';
+  const prefix = S.hfUsername ? S.hfUsername + '/' : '';
+  return prefix + short + suffix;
+}
+
+function masterToggleStage(stage, on) {
+  toggleStage(stage, on);
+  // Sync the sidebar toggle
+  const sidebarToggle = document.querySelector(`.stage-item[data-stage="${stage}"] .stage-toggle input`);
+  if (sidebarToggle) sidebarToggle.checked = on;
+  renderStageContent();
+}
+
+function renderTraining() {
+  const c = S.config.training;
+  const on = S.enabledStages.has('training');
+  return `
+  <div class="section-header"><div class="section-title">Training Configuration</div><div class="section-badge badge-optional">Optional</div></div>
+  ${masterToggle('training', 'Training Stage')}
+  <div class="${on?'':'stage-content-disabled'}">
+  <div class="form-grid">
+    <div class="form-section-label">Model</div>
+    <div class="form-group span-2">${L('Model Name / HuggingFace ID','HuggingFace model repo (e.g. unsloth/Qwen3-8B) or local path to a model directory')}<input class="form-input" data-key="training.model_name" value="${c.model_name}"></div>
+    <div class="form-group span-2">${L('Dataset Path','Path to a JSONL file where each line has a &quot;messages&quot; array in chat format. Validated before training starts.')}<input class="form-input" data-key="training.dataset_path" value="${c.dataset_path}"></div>
+    <div class="form-group">${L('Max Sequence Length','Maximum number of tokens per training example. Longer sequences use more VRAM. 4096 is a good default.')}<input class="form-input" type="number" data-key="training.max_seq_length" value="${c.max_seq_length}"></div>
+    <div class="form-group">${L('Output Directory','Where to save LoRA adapters, checkpoints, and all pipeline artifacts')}<input class="form-input" data-key="training.output_dir" value="${c.output_dir}"></div>
+    <div class="form-group span-2"><label class="checkbox-row"><input type="checkbox" data-key="training.load_in_4bit" ${c.load_in_4bit?'checked':''}><span class="form-label" data-tip="Load base model weights in 4-bit NormalFloat quantization. Drastically reduces VRAM usage with minimal quality loss." style="margin:0">Load in 4-bit (QLoRA)</span></label></div>
+    <div class="form-divider"></div><div class="form-section-label">LoRA</div>
+    <div class="form-group">${L('Rank (r)','Dimension of the low-rank update matrices. Higher = more capacity but more VRAM. 16-64 typical.')}<input class="form-input" type="number" data-key="training.lora_r" value="${c.lora_r}"></div>
+    <div class="form-group">${L('Alpha','Scaling factor for LoRA updates. Controls how much the adapter affects the base model. Often set to 2x the rank.')}<input class="form-input" type="number" data-key="training.lora_alpha" value="${c.lora_alpha}"></div>
+    <div class="form-group">${L('Dropout','Probability of dropping LoRA activations during training. Helps prevent overfitting. 0 = none, 0.05-0.1 typical.')}<input class="form-input" type="number" step="0.01" data-key="training.lora_dropout" value="${c.lora_dropout}"></div>
+    <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="training.use_rslora" ${c.use_rslora?'checked':''}><span class="form-label" data-tip="Rank-Stabilized LoRA: scales alpha by 1/sqrt(r) instead of 1/r. Recommended for rank >= 32 to prevent training instability." style="margin:0">rsLoRA scaling</span></label></div>
+    <div class="form-divider"></div><div class="form-section-label">Training</div>
+    <div class="form-group">${L('Epochs','Number of full passes through the dataset. 1-3 is typical for fine-tuning. More epochs risk overfitting on small datasets.')}<input class="form-input" type="number" data-key="training.num_train_epochs" value="${c.num_train_epochs}"></div>
+    <div class="form-group">${L('Batch Size','Samples processed per GPU per step. Limited by VRAM. Effective batch = this x gradient accumulation.')}<input class="form-input" type="number" data-key="training.per_device_train_batch_size" value="${c.per_device_train_batch_size}"></div>
+    <div class="form-group">${L('Gradient Accumulation','Accumulate gradients over N steps before updating weights. Simulates larger batch size without more VRAM.')}<input class="form-input" type="number" data-key="training.gradient_accumulation_steps" value="${c.gradient_accumulation_steps}"><div class="form-hint">Effective batch = ${c.per_device_train_batch_size*c.gradient_accumulation_steps}</div></div>
+    <div class="form-group">${L('Learning Rate','Step size for weight updates. 2e-4 is the standard for LoRA SFT. Too high = unstable, too low = slow convergence.')}<input class="form-input" type="number" step="0.00001" data-key="training.learning_rate" value="${c.learning_rate}"></div>
+    <div class="form-group">${L('LR Scheduler','How the learning rate changes during training. Cosine anneals smoothly to 0. Linear decays steadily.')}<input class="form-input" data-key="training.lr_scheduler_type" value="${c.lr_scheduler_type}"></div>
+    <div class="form-group">${L('Warmup Ratio','Fraction of training spent linearly increasing LR from 0. Prevents early instability. 0.03-0.1 typical.')}<input class="form-input" type="number" step="0.01" data-key="training.warmup_ratio" value="${c.warmup_ratio}"></div>
+    <div class="form-group">${L('Optimizer','Weight update algorithm. adamw_8bit uses 8-bit Adam to save VRAM with negligible quality difference.')}<input class="form-input" data-key="training.optim" value="${c.optim}"></div>
+  </div>
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:11px;color:var(--text-2);">Completion-only loss enabled — only assistant responses are trained on. System prompts and user messages are masked.</div>
+  <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Training</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
+  </div>`;
+}
+
+function renderExport() {
+  const c = S.config.export;
+  const on = S.enabledStages.has('export');
+  const trainingOn = S.enabledStages.has('training');
+  const needsSource = !trainingOn;
+  return `
+  <div class="section-header"><div class="section-title">Export to GGUF</div><div class="section-badge badge-optional">Optional</div></div>
+  ${masterToggle('export', 'Export Stage')}
+  <div class="${on?'':'stage-content-disabled'}">
+  ${needsSource ? depBanner('warn', 'Training is disabled. Provide a source model below — a HuggingFace ID or local path to a model or LoRA adapter directory.') : ''}
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-1);margin-bottom:20px;">${needsSource ? 'Loads the source model and converts directly to GGUF.' : 'Merges LoRA adapters into the base model and converts directly to GGUF in a single step — no intermediate safetensors written to disk (unless opted in below).'}</div>
+  <div class="form-grid">
+    ${needsSource ? `<div class="form-group span-2">${L('Source Model','HuggingFace model ID (e.g. unsloth/Qwen3-8B) or local path to a model directory or LoRA adapter directory. Required when Training is disabled.')}<input class="form-input" data-key="export.source_model" value="${c.source_model}" placeholder="${S.config.training.model_name}" style="border-color:${c.source_model?'var(--border)':'var(--amber-dim)'}"></div>` : ''}
+    <div class="form-group">${L('GGUF Type','Output precision for the GGUF file. bf16 retains full quality and is the required input for MagicQuant. f16 and q8_0 are smaller but lossy.')}<input class="form-input" data-key="export.gguf_type" value="${c.gguf_type}"></div>
+    <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="export.also_save_merged" ${c.also_save_merged?'checked':''}><span class="form-label" data-tip="Save a copy of the merged model in HuggingFace safetensors format. Useful if you want to upload the full-precision model or use it with other tools." style="margin:0">Also save merged HF safetensors</span></label></div>
+  </div>
+  <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Export</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
+  </div>`;
+}
+
+function renderMagicQuant() {
+  const c = S.config.magicquant;
+  const sel = new Set(c.tiers);
+  const on = S.enabledStages.has('magicquant');
+  const exportOn = S.enabledStages.has('export');
+  const needsSource = !exportOn;
+  return `
+  <div class="section-header"><div class="section-title">MagicQuant</div><div class="section-badge badge-optional">Optional</div></div>
+  ${masterToggle('magicquant', 'MagicQuant Stage')}
+  <div class="${on?'':'stage-content-disabled'}">
+  ${needsSource ? depBanner('warn', 'Export is disabled. Provide a local path to a GGUF file or merged safetensors directory below. If a previous pipeline run produced artifacts in the output directory, those will be used automatically.<br><br>To use a HuggingFace model ID, re-enable Export and set it as the source model there instead.') : ''}
+  <div class="form-grid">
+    ${needsSource ? `<div class="form-group span-2">${L('Source Model','Path to a GGUF file or merged safetensors directory. If left empty, will look for existing artifacts in the output directory.')}<input class="form-input" data-key="magicquant.source_model" value="${c.source_model}" placeholder="auto-detect from output directory"></div>` : ''}
+    <div class="form-group">${L('Base Quantization','Default quantization scheme applied to FFN/robust layers. MXFP4_MOE is optimal for MoE models. Q4_K_M is a good general-purpose choice.')}<input class="form-input" data-key="magicquant.target_base_quant" value="${c.target_base_quant}"></div>
+    <div class="form-group">${L('llama.cpp Path','Path to your llama.cpp installation. Used for real perplexity probing. Leave empty to auto-detect or auto-install.')}<input class="form-input" data-key="magicquant.llamacpp_path" value="${c.llamacpp_path}" placeholder="auto-detect / auto-install"></div>
+    <div class="form-group">${L('Population Size','Number of candidate configurations per generation. More = broader search but slower. 50-200 typical.')}<input class="form-input" type="number" data-key="magicquant.population_size" value="${c.population_size}"></div>
+    <div class="form-group">${L('Generations','Number of evolutionary iterations. More = better optimization but diminishing returns after ~30-50.')}<input class="form-input" type="number" data-key="magicquant.generations" value="${c.generations}"></div>
+    <div class="form-group span-2">
+      ${L('Output Tiers','Quality tiers to generate. Each tier targets a different size/quality tradeoff. Q6 is closest to original, Q3 is smallest.')}
+      <div class="tag-list">${S.mqTiers.map(t=>`<div class="tag ${sel.has(t)?'selected':''}" data-tier="${t}" onclick="toggleTier('${t}')">${t}</div>`).join('')}</div>
+      <div class="form-hint">Q6 = highest quality, Q3 = smallest size</div>
+    </div>
+  </div>
+  <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">MagicQuant</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
+  </div>`;
+}
+
+function renderUpload() {
+  const c = S.config.upload;
+  const on = S.enabledStages.has('upload');
+  const suggested = suggestRepoId();
+  const trainingOn = S.enabledStages.has('training');
+  const exportOn = S.enabledStages.has('export');
+  const mqOn = S.enabledStages.has('magicquant');
+  // Warn about what artifacts will be available
+  let uploadHints = [];
+  if (!trainingOn) uploadHints.push('No LoRA adapters (training disabled)');
+  if (!exportOn && !mqOn) uploadHints.push('No GGUF files (export &amp; MagicQuant disabled)');
+  return `
+  <div class="section-header"><div class="section-title">HuggingFace Upload</div><div class="section-badge badge-optional">Optional</div></div>
+  ${masterToggle('upload', 'Upload Stage')}
+  <div class="${on?'':'stage-content-disabled'}">
+  ${uploadHints.length ? depBanner('info', uploadHints.join('<br>') + '<br>Make sure the output directory contains artifacts from a previous run, or enable the upstream stages.') : ''}
+  <div class="form-grid">
+    <div class="form-group span-2">${L('Repository ID','HuggingFace repo in the format username/model-name. Will be created if it doesn&apos;t exist.')}<input class="form-input" data-key="upload.repo_id" value="${c.repo_id}" placeholder="${S.hfUsername ? suggested : 'your-username/' + suggested}">
+    ${!c.repo_id ? `<div class="form-hint">Suggested name: <span style="color:var(--amber);cursor:pointer" onclick="document.querySelector('[data-key=\\'upload.repo_id\\']').value='${suggested}';S.config.upload.repo_id='${suggested}';renderStageContent()">${suggested}</span> (click to use)</div>` : ''}</div>
+    <div class="form-group">${L('License','SPDX license identifier for the model card. Common: apache-2.0, mit, llama3, cc-by-nc-4.0')}<input class="form-input" data-key="upload.license" value="${c.license}"></div>
+    <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.private" ${c.private?'checked':''}><span class="form-label" data-tip="Private repos are only visible to you and collaborators you explicitly add." style="margin:0">Private repository</span></label></div>
+    <div class="form-divider"></div><div class="form-section-label">What to upload</div>
+    <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_gguf" ${c.upload_gguf?'checked':''}><span class="form-label" style="margin:0">GGUF files</span></label></div>
+    <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_lora" ${c.upload_lora?'checked':''}><span class="form-label" style="margin:0">LoRA adapters</span></label></div>
+    <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_merged" ${c.upload_merged?'checked':''}><span class="form-label" style="margin:0">Merged model (large)</span></label></div>
+  </div>
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-2);margin-top:16px;">Requires <code style="color:var(--amber)">HF_TOKEN</code> environment variable with write access.</div>
+  <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Upload</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
+  </div>`;
+}
+
+function toggleTier(t) {
+  const tiers = S.config.magicquant.tiers;
+  const i = tiers.indexOf(t);
+  if(i>=0) tiers.splice(i,1); else tiers.push(t);
+  document.querySelector(`[data-tier="${t}"]`)?.classList.toggle('selected');
+}
+
+function appendLog(text, level='info') {
+  const body = document.getElementById('logs-body');
+  const line = document.createElement('div');
+  line.className = `log-line level-${level}`;
+  const ts = new Date().toLocaleTimeString('en-US',{hour12:false});
+  const div = document.createElement('div'); div.textContent = text;
+  line.innerHTML = `<span class="ts">${ts}</span>${div.innerHTML}`;
+  body.appendChild(line);
+  while(body.children.length>2000) body.removeChild(body.firstChild);
+  if(S.autoScroll) body.scrollTop = body.scrollHeight;
+}
+function clearLogs() { document.getElementById('logs-body').innerHTML=''; }
+function toggleAutoScroll() { S.autoScroll=!S.autoScroll; document.getElementById('autoscroll-label').textContent=S.autoScroll?'On':'Off'; }
+
+async function runPipeline() {
+  if(S.running) return;
+  const enabled = Array.from(S.enabledStages);
+  if(enabled.length === 0) { appendLog('Enable at least one stage.','error'); return; }
+  S.running = true;
+  const btn = document.getElementById('btn-run');
+  btn.disabled = true; btn.textContent = 'Running...';
+  clearLogs();
+  appendLog(`Pipeline: ${enabled.join(' \u2192 ')}`,'stage');
+  const payload = {
+    training: S.config.training,
+    export: S.config.export,
+    magicquant: S.config.magicquant,
+    upload: S.config.upload,
+    enabled_stages: enabled,
+  };
+  try {
+    const r = await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d = await r.json();
+    if(d.error){appendLog(d.error,'error');S.running=false;btn.disabled=false;btn.textContent='Run Pipeline';}
+  } catch(e){appendLog(`Request failed: ${e.message}`,'error');S.running=false;btn.disabled=false;btn.textContent='Run Pipeline';}
+}
+
+renderStageContent();
+</script>
+</body>
+</html>
