@@ -632,7 +632,11 @@ print("PIPELINE_STAGE_COMPLETE=magicquant")
 
 
 async def do_upload(cfg: RunRequest) -> bool:
-    """Upload pipeline artifacts (GGUF, LoRA, merged) to HuggingFace Hub."""
+    """Upload pipeline artifacts (GGUF, LoRA, merged) to HuggingFace Hub.
+
+    Delegates to hf_upload module for model card generation, progress reporting,
+    and file upload.
+    """
     out = cfg.training.output_dir
     uc = cfg.upload
     await state.set_stage("upload", StageStatus.RUNNING)
@@ -644,93 +648,39 @@ async def do_upload(cfg: RunRequest) -> bool:
         await state.set_stage("upload", StageStatus.FAILED)
         return False
 
-    base_model = cfg.training.model_name
-    lora_r = cfg.training.lora_r
-    lora_alpha = cfg.training.lora_alpha
+    tc = cfg.training
 
     script = f'''
-import os, sys
-from pathlib import Path
-from huggingface_hub import HfApi, ModelCard, ModelCardData
+import sys
+sys.path.insert(0, ".")
+from hf_upload import HFUploadConfig, upload
 
-api = HfApi()
-repo_id = "{uc.repo_id}"
-out = "{out}"
-
-print(f"Creating repo: {{repo_id}}")
-api.create_repo(repo_id=repo_id, repo_type="model", private={uc.private}, exist_ok=True)
-
-files = []
-
-if {uc.upload_lora}:
-    lora_dir = Path(out) / "lora_adapters"
-    if lora_dir.exists():
-        for f in lora_dir.iterdir():
-            if f.is_file(): files.append((str(f), f"lora/{{f.name}}"))
-
-if {uc.upload_merged}:
-    merged_dir = Path(out) / "merged_model"
-    if merged_dir.exists():
-        for f in merged_dir.iterdir():
-            if f.is_file(): files.append((str(f), f"merged/{{f.name}}"))
-
-if {uc.upload_gguf}:
-    gguf_files = []
-    mq_dir = Path(out) / "magicquant"
-    if mq_dir.exists():
-        gguf_files = list(mq_dir.glob("*.gguf"))
-    if not gguf_files:
-        bf16 = Path(out) / "model-bf16.gguf"
-        if bf16.exists(): gguf_files = [bf16]
-    for f in gguf_files:
-        files.append((str(f), f.name))
-
-if not files:
-    print("Error: no files to upload")
-    sys.exit(1)
-
-print(f"Uploading {{len(files)}} files...")
-
-gguf_table = ""
-for local, name in files:
-    if name.endswith(".gguf"):
-        size = os.path.getsize(local) / 1e9
-        gguf_table += f"| {{name}} | {{size:.1f}} GB |\\n"
-
-card_data = ModelCardData(
-    license="{uc.license}", library_name="llama.cpp",
-    base_model="{base_model}", pipeline_tag="text-generation",
-    tags=["gguf", "quantized", "magicquant"],
+cfg = HFUploadConfig(
+    repo_id="{uc.repo_id}",
+    private={uc.private},
+    license="{uc.license}",
+    upload_gguf={uc.upload_gguf},
+    upload_lora={uc.upload_lora},
+    upload_merged={uc.upload_merged},
+    base_model="{tc.model_name}",
+    dataset_name="{tc.dataset_path}",
+    lora_r={tc.lora_r},
+    lora_alpha={tc.lora_alpha},
+    lora_dropout={tc.lora_dropout},
+    num_epochs={tc.num_train_epochs},
+    learning_rate={tc.learning_rate},
+    max_seq_length={tc.max_seq_length},
+    batch_size={tc.per_device_train_batch_size},
+    gradient_accumulation={tc.gradient_accumulation_steps},
+    optimizer="{tc.optim}",
+    lr_scheduler="{tc.lr_scheduler_type}",
 )
-card_md = f"""---
-{{card_data.to_yaml()}}
----
 
-# {{repo_id.split("/")[-1]}}
-
-Fine-tuned from [{base_model}](https://huggingface.co/{base_model}).
-
-| File | Size |
-|------|------|
-{{gguf_table}}
-
-*Generated with the MagicQuant Pipeline (QLoRA r={lora_r}, alpha={lora_alpha}, completion-only loss)*
-"""
-try:
-    ModelCard(card_md).push_to_hub(repo_id)
-    print("Model card uploaded")
-except Exception as e:
-    print(f"Warning: model card failed: {{e}}")
-
-for i, (local, name) in enumerate(files, 1):
-    size = os.path.getsize(local) / 1e9
-    print(f"[{{i}}/{{len(files)}}] {{name}} ({{size:.1f}} GB)...")
-    api.upload_file(path_or_fileobj=local, path_in_repo=name,
-                    repo_id=repo_id, repo_type="model", commit_message=f"Add {{name}}")
-    print(f"  Done")
-
-print(f"https://huggingface.co/{{repo_id}}")
-print("PIPELINE_STAGE_COMPLETE=upload")
+ok = upload(cfg, "{out}")
+if ok:
+    print("PIPELINE_STAGE_COMPLETE=upload")
+else:
+    sys.exit(1)
 '''
     rc = await run_script(script, out)
     ok = rc == 0

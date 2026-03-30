@@ -1,4 +1,4 @@
-# Unsloth QLoRA Fine-Tuning Configuration
+# QLoRA Fine-Tuning Configuration
 #
 # This config mirrors the hyperparameters from Medina-Qwen3.5-27B-OpenClaw.
 # Adjust model_name, dataset_path, and output_dir for your use case.

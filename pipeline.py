@@ -556,128 +556,78 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -
 # ── Stage: Upload ────────────────────────────────────────────────────────────
 
 def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
-    """Upload artifacts to HuggingFace Hub."""
-    log("Uploading to HuggingFace Hub", "stage")
+    """Upload artifacts to HuggingFace Hub.
+
+    Delegates to hf_upload module for model card generation, progress
+    reporting, and file upload. Supports dry-run mode via stage_upload_dry_run().
+    """
+    from hf_upload import HFUploadConfig, upload
 
     uc = config.upload
     if not uc or not uc.repo_id:
         log("No repo_id configured for upload", "error")
         return False
 
-    try:
-        from huggingface_hub import HfApi, ModelCard, ModelCardData
-    except ImportError:
-        log("huggingface_hub not installed", "error")
-        return False
-
-    api = HfApi()
-
-    log(f"Creating/verifying repo: {uc.repo_id}")
-    try:
-        api.create_repo(repo_id=uc.repo_id, repo_type="model", private=uc.private, exist_ok=True)
-    except Exception as e:
-        log(f"Failed to create repo: {e}", "error")
-        return False
-
-    files_to_upload = []
-
-    if uc.upload_lora and artifacts.lora_dir.exists():
-        for f in artifacts.lora_dir.iterdir():
-            if f.is_file():
-                files_to_upload.append((f, f"lora/{f.name}"))
-
-    if uc.upload_merged and artifacts.merged_dir.exists():
-        for f in artifacts.merged_dir.iterdir():
-            if f.is_file():
-                files_to_upload.append((f, f"merged/{f.name}"))
-
-    if uc.upload_gguf:
-        gguf_files = []
-        if artifacts.magicquant_dir.exists():
-            gguf_files = list(artifacts.magicquant_dir.glob("*.gguf"))
-        if not gguf_files and artifacts.bf16_gguf.exists():
-            gguf_files = [artifacts.bf16_gguf]
-        for f in gguf_files:
-            files_to_upload.append((f, f.name))
-
-    if not files_to_upload:
-        log("No files to upload", "warn")
-        return False
-
-    log(f"Uploading {len(files_to_upload)} files")
-
-    # Model card
-    base_model = uc.base_model or config.training.model_name
     tc = config.training
-
-    gguf_rows = ""
-    for local, name in files_to_upload:
-        if name.endswith(".gguf"):
-            size = local.stat().st_size / 1e9
-            gguf_rows += f"| {name} | {size:.1f} GB |\n"
-
-    card_data = ModelCardData(
+    hf_cfg = HFUploadConfig(
+        repo_id=uc.repo_id,
+        private=uc.private,
         license=uc.license,
-        library_name="llama.cpp",
-        base_model=base_model,
-        pipeline_tag="text-generation",
-        tags=["gguf", "quantized", "qlora", "magicquant"],
+        upload_gguf=uc.upload_gguf,
+        upload_lora=uc.upload_lora,
+        upload_merged=uc.upload_merged,
+        base_model=uc.base_model or tc.model_name,
+        dataset_name=tc.dataset_path,
+        lora_r=tc.lora_r,
+        lora_alpha=tc.lora_alpha,
+        lora_dropout=tc.lora_dropout,
+        num_epochs=tc.num_train_epochs,
+        learning_rate=tc.learning_rate,
+        max_seq_length=tc.max_seq_length,
+        batch_size=tc.per_device_train_batch_size,
+        gradient_accumulation=tc.gradient_accumulation_steps,
+        optimizer=tc.optim,
+        lr_scheduler=tc.lr_scheduler_type,
     )
 
-    card_content = f"""---
-{card_data.to_yaml()}
----
+    return upload(hf_cfg, config.output_dir, log=log)
 
-# {uc.repo_id.split('/')[-1]}
 
-Fine-tuned and quantized from [{base_model}](https://huggingface.co/{base_model}).
+def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogFn):
+    """Dry-run upload: validate credentials and report what would be uploaded.
 
-## Pipeline
+    Returns a DryRunReport (from hf_upload module).
+    """
+    from hf_upload import HFUploadConfig, dry_run
 
-- **Training**: QLoRA (r={tc.lora_r}, alpha={tc.lora_alpha}, completion-only loss)
-- **Quantization**: MagicQuant hybrid evolutionary search
+    uc = config.upload
+    if not uc or not uc.repo_id:
+        log("No repo_id configured for upload", "error")
+        return None
 
-## Files
+    tc = config.training
+    hf_cfg = HFUploadConfig(
+        repo_id=uc.repo_id,
+        private=uc.private,
+        license=uc.license,
+        upload_gguf=uc.upload_gguf,
+        upload_lora=uc.upload_lora,
+        upload_merged=uc.upload_merged,
+        base_model=uc.base_model or tc.model_name,
+        dataset_name=tc.dataset_path,
+        lora_r=tc.lora_r,
+        lora_alpha=tc.lora_alpha,
+        lora_dropout=tc.lora_dropout,
+        num_epochs=tc.num_train_epochs,
+        learning_rate=tc.learning_rate,
+        max_seq_length=tc.max_seq_length,
+        batch_size=tc.per_device_train_batch_size,
+        gradient_accumulation=tc.gradient_accumulation_steps,
+        optimizer=tc.optim,
+        lr_scheduler=tc.lr_scheduler_type,
+    )
 
-| File | Size |
-|------|------|
-{gguf_rows}
-
-## Usage
-
-```bash
-llama-cli -m <filename>.gguf -p "Your prompt here"
-```
-
----
-*Generated with the MagicQuant Pipeline*
-"""
-
-    try:
-        card = ModelCard(card_content)
-        card.push_to_hub(uc.repo_id)
-        log("Model card uploaded")
-    except Exception as e:
-        log(f"Model card upload failed: {e}", "warn")
-
-    for i, (local_path, repo_path) in enumerate(files_to_upload, 1):
-        size_gb = local_path.stat().st_size / 1e9
-        log(f"[{i}/{len(files_to_upload)}] {repo_path} ({size_gb:.1f} GB)...")
-        try:
-            api.upload_file(
-                path_or_fileobj=str(local_path),
-                path_in_repo=repo_path,
-                repo_id=uc.repo_id,
-                repo_type="model",
-                commit_message=f"Add {repo_path}",
-            )
-            log(f"  Uploaded {repo_path}", "success")
-        except Exception as e:
-            log(f"Failed to upload {repo_path}: {e}", "error")
-            return False
-
-    log(f"All files uploaded to https://huggingface.co/{uc.repo_id}", "success")
-    return True
+    return dry_run(hf_cfg, config.output_dir, log=log)
 
 
 # ── Pipeline runner ──────────────────────────────────────────────────────────
@@ -727,7 +677,7 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log) -> dict[str,
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Unsloth Pipeline")
+    parser = argparse.ArgumentParser(description="Training + Quantization Pipeline")
     parser.add_argument("--config", type=str, help="YAML config file")
     parser.add_argument("--output-dir", type=str, default="./output")
     parser.add_argument("--model", type=str)
@@ -736,6 +686,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-magicquant", action="store_true")
     parser.add_argument("--upload-to", type=str, help="HF repo ID")
     parser.add_argument("--llamacpp-path", type=str)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Validate upload credentials and show what would be uploaded (no actual upload)")
     args = parser.parse_args()
 
     cfg = PipelineConfig(output_dir=args.output_dir)
@@ -761,10 +713,22 @@ if __name__ == "__main__":
     if args.llamacpp_path and cfg.magicquant:
         cfg.magicquant.llamacpp_path = args.llamacpp_path
 
+    # Dry-run mode: validate upload without running the full pipeline
+    if args.dry_run:
+        if not cfg.upload:
+            if args.upload_to:
+                cfg.upload = UploadConfig(repo_id=args.upload_to)
+            else:
+                print("ERROR: --dry-run requires --upload-to <repo_id>")
+                sys.exit(1)
+        artifacts = Artifacts(cfg.output_dir)
+        report = stage_upload_dry_run(cfg, artifacts, _default_log)
+        sys.exit(0 if report and report.ok else 1)
+
     results = run_pipeline(cfg)
 
     print("\n" + "=" * 50)
     print("Pipeline Results:")
     for stage, ok in results.items():
-        sym = "✓" if ok else ("—" if ok is None else "✗")
+        sym = "+" if ok else ("-" if ok is None else "X")
         print(f"  {sym} {stage}")
