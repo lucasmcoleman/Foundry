@@ -26,7 +26,7 @@ from typing import Callable, Optional
 @dataclass
 class TrainingConfig:
     model_name: str = "Tesslate/OmniCoder-9B"
-    dataset_path: str = "zeroclaw_training_data.jsonl"
+    dataset_path: str = "data/zeroclaw_training_data.jsonl"
     max_seq_length: int = 8192
     load_in_4bit: bool = True  # Unused by fast loader (always 4-bit), kept for config compat
     lora_r: int = 32
@@ -321,7 +321,7 @@ from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 # ── Fast model loading (shard-by-shard with inline BnB quantization) ──
 # Import and call the fast loader directly instead of Unsloth.
 import sys
-sys.path.insert(0, "{Path.cwd()}")
+sys.path.insert(0, str(Path("{Path.cwd()}") / "core"))
 from fast_train_zeroclaw import fast_load_quantized_model, detect_response_template, find_latest_checkpoint
 
 DEVICE = torch.device("cuda:0")
@@ -453,7 +453,7 @@ os.environ["HSA_ENABLE_SDMA"] = "0"
 os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
-sys.path.insert(0, "{Path.cwd()}")
+sys.path.insert(0, str(Path("{Path.cwd()}") / "core"))
 from fast_export import streaming_merge
 
 streaming_merge(

@@ -81,7 +81,7 @@ state = PipelineState()
 
 class TrainingCfg(BaseModel):
     model_name: str = "Tesslate/OmniCoder-9B"
-    dataset_path: str = "zeroclaw_training_data.jsonl"
+    dataset_path: str = "data/zeroclaw_training_data.jsonl"
     max_seq_length: int = 4096
     load_in_4bit: bool = True
     lora_r: int = 32
@@ -300,7 +300,7 @@ else:
         print(f"Loading model: {{_model_id}}")
 
 import sys, torch
-sys.path.insert(0, "{Path(__file__).parent.parent}")
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 from fast_train_zeroclaw import fast_load_quantized_model, detect_response_template, find_latest_checkpoint
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
@@ -476,7 +476,7 @@ else:
 '''
         script = env_setup + cache_check + f'''
 import sys
-sys.path.insert(0, "{Path(__file__).parent.parent}")
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 from fast_export import streaming_merge
 streaming_merge(
     model_id="{model_source}",
@@ -489,7 +489,7 @@ print("PIPELINE_STAGE_COMPLETE=export")
         await state.log(f"Exporting {load_desc} to safetensors (for GGUF conversion)", "stage")
         script = env_setup + cache_check + f'''
 import sys
-sys.path.insert(0, "{Path(__file__).parent.parent}")
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 from fast_export import streaming_merge
 streaming_merge(
     model_id="{model_source}",
@@ -652,7 +652,7 @@ async def do_upload(cfg: RunRequest) -> bool:
 
     script = f'''
 import sys
-sys.path.insert(0, ".")
+sys.path.insert(0, "core")
 from hf_upload import HFUploadConfig, upload
 
 cfg = HFUploadConfig(

@@ -4,8 +4,8 @@
 # Adjust model_name, dataset_path, and output_dir for your use case.
 #
 # Usage:
-#   source unsloth-env/bin/activate
-#   python train.py --config config.yaml
+#   source activate.sh
+#   python core/pipeline.py --config configs/default.yaml
 
 # --- Model ---
 model_name: "unsloth/Qwen3-8B"       # Change to your target model

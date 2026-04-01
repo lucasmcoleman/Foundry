@@ -8,6 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Activate venv
 source "$SCRIPT_DIR/unsloth-env/bin/activate"
 
+# Add core modules to Python path
+export PYTHONPATH="$SCRIPT_DIR/core:${PYTHONPATH:-}"
+
 # AMD ROCm optimizations for Strix Halo (gfx1151)
 export HSA_ENABLE_SDMA=0
 export PYTORCH_HIP_ALLOC_CONF="backend:native,expandable_segments:True"

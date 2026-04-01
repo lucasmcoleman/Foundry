@@ -40,8 +40,8 @@ import torch
 from pathlib import Path
 
 MODEL_ID = "DavidAU/Qwen3.5-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking"
-DATASET_PATH = "zeroclaw_training_data.jsonl"
-OUTPUT_DIR = "./output-zeroclaw-qwen40b"
+DATASET_PATH = "data/zeroclaw_training_data.jsonl"
+OUTPUT_DIR = "./output"
 HF_REPO = "lmcoleman/Qwen3.5-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-Zeroclaw-GGUF"
 
 # LoRA config
