@@ -2,7 +2,8 @@
 """Run MagicQuant + Upload stages using the pipeline's built-in functions."""
 
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 from pipeline import (
     PipelineConfig, TrainingConfig, MagicQuantConfig, UploadConfig, Artifacts,

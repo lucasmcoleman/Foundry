@@ -79,7 +79,7 @@ activate_env() {
     export PYTORCH_HIP_ALLOC_CONF="backend:native,expandable_segments:True"
     export UNSLOTH_SKIP_TORCHVISION_CHECK=1
     export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-    export PYTHONPATH="${MAGICQUANT_DIR}:${PYTHONPATH:-}"
+    export PYTHONPATH="${PIPELINE_DIR}/core:${MAGICQUANT_DIR}:${PYTHONPATH:-}"
     cd "${PIPELINE_DIR}"
 }
 
@@ -301,7 +301,7 @@ fi
 echo ""
 echo "Test 5: HuggingFace Upload Dry-Run"
 activate_env
-OUTPUT=$(python hf_upload.py \
+OUTPUT=$(python core/hf_upload.py \
     --repo test/test \
     --output-dir ./output \
     --base-model huihui-ai/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated \
@@ -415,7 +415,7 @@ fi
 
 echo ""
 echo "Test 8: Training Data"
-TRAIN_DATA="${PIPELINE_DIR}/zeroclaw_training_data.jsonl"
+TRAIN_DATA="${PIPELINE_DIR}/data/zeroclaw_training_data.jsonl"
 if [ -f "$TRAIN_DATA" ]; then
     LINE_COUNT=$(wc -l < "$TRAIN_DATA")
     pass "Training data exists: ${LINE_COUNT} lines"

@@ -8,13 +8,13 @@
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Custom training (`fast_train_zeroclaw.py`) | Working | Shard-by-shard BnB 4-bit loading, completion-only loss, checkpoint resume |
-| Export (`fast_export.py`) | Working | Streaming LoRA merge on GPU, ~6 GB peak |
-| Pipeline orchestrator (`pipeline.py`) | Updated | Now uses fast loaders instead of Unsloth |
+| Custom training (`core/fast_train_zeroclaw.py`) | Working | Shard-by-shard BnB 4-bit loading, completion-only loss, checkpoint resume |
+| Export (`core/fast_export.py`) | Working | Streaming LoRA merge on GPU, ~6 GB peak |
+| Pipeline orchestrator (`core/pipeline.py`) | Updated | Now uses fast loaders instead of Unsloth |
 | Web UI (`ui/app.py`, `ui/index.html`) | Working | FastAPI + WebSocket, form persistence, error banners, stop button |
-| HF upload (`hf_upload.py`) | New | Dry-run mode, model card generation, progress reporting |
+| HF upload (`core/hf_upload.py`) | New | Dry-run mode, model card generation, progress reporting |
 | MagicQuant integration | Working | Calls MagicQuant from pipeline with tier selection |
-| Legacy scripts (`train.py`, `train_zeroclaw.py`) | Deprecated | Still use Unsloth, kept for reference |
+| Legacy scripts (`legacy/train.py`, `legacy/train_zeroclaw.py`) | Deprecated | Still use Unsloth, kept for reference |
 
 ### MagicQuant (`/server/programming/MagicQuant/`)
 
@@ -104,21 +104,21 @@ source activate.sh
 
 ### Full pipeline (train + export + MagicQuant + upload)
 ```bash
-python pipeline.py \
+python core/pipeline.py \
   --model "huihui-ai/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated" \
-  --dataset zeroclaw_training_data.jsonl \
+  --dataset data/zeroclaw_training_data.jsonl \
   --output-dir ./output \
   --upload-to "youruser/your-model"
 ```
 
 ### Training only
 ```bash
-python fast_train_zeroclaw.py
+python core/fast_train_zeroclaw.py
 ```
 
 ### Export only (merge LoRA + save safetensors)
 ```bash
-python fast_export.py
+python core/fast_export.py
 ```
 
 ### MagicQuant only
@@ -129,7 +129,7 @@ magicquant generate /path/to/merged/model --tiers Q4,Q5,Q6
 
 ### HF upload dry-run
 ```bash
-python hf_upload.py \
+python core/hf_upload.py \
   --repo youruser/model-name \
   --output-dir ./output \
   --base-model "huihui-ai/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated" \
@@ -143,14 +143,14 @@ source activate.sh   # starts UI on :7865
 python -m ui.app
 ```
 
-## Running test_pipeline.sh
+## Running tests
 
 ```bash
 cd /server/programming/pipeline
-chmod +x test_pipeline.sh
-./test_pipeline.sh                # all tests
-./test_pipeline.sh --skip-gpu     # skip GPU training test
-./test_pipeline.sh --skip-lmstudio  # skip LMStudio load tests
+chmod +x tests/test_pipeline.sh
+tests/test_pipeline.sh                    # all tests
+tests/test_pipeline.sh --skip-gpu         # skip GPU training test
+tests/test_pipeline.sh --skip-lmstudio    # skip LMStudio load tests
 ```
 
 The test script runs 21 checks across all pipeline components and exits non-zero if any test fails.

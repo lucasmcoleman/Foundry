@@ -35,15 +35,15 @@ os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
 os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
-# Add the pipeline root to path so we can import the fast loaders.
+# Add the pipeline core to path so we can import the fast loaders.
 PIPELINE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PIPELINE_ROOT)
+sys.path.insert(0, os.path.join(PIPELINE_ROOT, "core"))
 
 import torch
 
 # Test configuration — use the 9B model for manageable test times.
 TEST_MODEL_ID = "huihui-ai/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated"
-DATASET_PATH = os.path.join(PIPELINE_ROOT, "zeroclaw_training_data.jsonl")
+DATASET_PATH = os.path.join(PIPELINE_ROOT, "data", "zeroclaw_training_data.jsonl")
 
 # Use a temp directory for test output so we don't pollute the workspace.
 TEST_OUTPUT_DIR = tempfile.mkdtemp(prefix="pipeline_test_")
