@@ -189,6 +189,7 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
           <span class="settings-saved" id="settings-saved">Saved</span>
         </div>
       </div>
+      <button class="btn" id="btn-auth" onclick="changeApiKey()" style="display:none" title="API key authentication active. Click to change or clear.">&#128274; Auth</button>
       <button class="btn btn-danger" id="btn-stop" onclick="stopPipeline()" style="display:none">Stop</button>
       <button class="btn btn-primary" id="btn-run" onclick="runPipeline()">Run Pipeline</button>
     </div>
@@ -253,6 +254,85 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 </div>
 
 <script>
+// ── API Key Authentication ───────────────────────────────────────────────
+const AUTH_LS_KEY = 'pipeline_api_key';
+
+/** Get the stored API key (empty string means no auth). */
+function getApiKey() {
+  try { return localStorage.getItem(AUTH_LS_KEY) || ''; } catch(e) { return ''; }
+}
+
+/** Save API key to localStorage. */
+function setApiKey(key) {
+  try { localStorage.setItem(AUTH_LS_KEY, key); } catch(e) { /* silent */ }
+}
+
+/** Clear stored API key. */
+function clearApiKey() {
+  try { localStorage.removeItem(AUTH_LS_KEY); } catch(e) { /* silent */ }
+}
+
+/**
+ * Prompt the user for an API key and store it.
+ * Returns the key, or empty string if the user cancels.
+ */
+function promptForApiKey() {
+  const key = prompt('This server requires an API key.\nEnter your PIPELINE_API_KEY:');
+  if (key) { setApiKey(key.trim()); return key.trim(); }
+  return '';
+}
+
+/**
+ * Show or hide the Auth button in the header based on whether auth is active.
+ */
+function updateAuthButton() {
+  const btn = document.getElementById('btn-auth');
+  if (!btn) return;
+  const key = getApiKey();
+  btn.style.display = key ? 'inline-block' : 'none';
+}
+
+/**
+ * Let the user change or clear the stored API key.
+ * Reloads the page after change so the WebSocket reconnects with the new key.
+ */
+function changeApiKey() {
+  const action = prompt('API key is set.\nEnter a new key, or type "clear" to remove it:');
+  if (action === null) return;  // cancelled
+  if (action.trim().toLowerCase() === 'clear') {
+    clearApiKey();
+    location.reload();
+  } else if (action.trim()) {
+    setApiKey(action.trim());
+    location.reload();
+  }
+}
+
+/**
+ * Authenticated fetch wrapper. Adds Authorization header when an API key is set.
+ * On 401 responses, prompts for the key and retries once.
+ */
+async function authFetch(url, opts = {}) {
+  const key = getApiKey();
+  if (key) {
+    opts.headers = opts.headers || {};
+    if (opts.headers instanceof Headers) {
+      opts.headers.set('Authorization', `Bearer ${key}`);
+    } else {
+      opts.headers['Authorization'] = `Bearer ${key}`;
+    }
+  }
+  const r = await fetch(url, opts);
+  if (r.status === 401) {
+    const newKey = promptForApiKey();
+    if (!newKey) return r;  // user cancelled
+    opts.headers = opts.headers || {};
+    opts.headers['Authorization'] = `Bearer ${newKey}`;
+    return fetch(url, opts);
+  }
+  return r;
+}
+
 // ── Application State ──────────────────────────────────────────────────────
 /** @type {{ selectedStage: string, enabledStages: Set<string>, running: boolean, autoScroll: boolean, ws: WebSocket|null, config: Object, mqTiers: string[], hfUsername: string }} */
 const S = {
@@ -337,7 +417,7 @@ let _saveTimer = null;
  */
 async function loadConfig() {
   try {
-    const r = await fetch('/api/config');
+    const r = await authFetch('/api/config');
     const cfg = await r.json();
     S.hfUsername = cfg.hf_username || '';
     const el = document.getElementById('cfg-hf-username');
@@ -353,7 +433,7 @@ async function saveConfig() {
   const el = document.getElementById('cfg-hf-username');
   S.hfUsername = (el?.value || '').trim();
   try {
-    await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({hf_username: S.hfUsername})});
+    await authFetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({hf_username: S.hfUsername})});
     const saved = document.getElementById('settings-saved');
     if (saved) { saved.classList.add('show'); setTimeout(() => saved.classList.remove('show'), 1500); }
   } catch(e) { /* silent */ }
@@ -410,7 +490,9 @@ function dismissStatus() {
  */
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  S.ws = new WebSocket(`${proto}//${location.host}/ws`);
+  const wsKey = getApiKey();
+  const wsUrl = wsKey ? `${proto}//${location.host}/ws?token=${encodeURIComponent(wsKey)}` : `${proto}//${location.host}/ws`;
+  S.ws = new WebSocket(wsUrl);
   S.ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.type === 'log') {
@@ -774,7 +856,7 @@ async function runPipeline() {
     enabled_stages: enabled,
   };
   try {
-    const r = await fetch('/api/run', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+    const r = await authFetch('/api/run', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     const d = await r.json();
     if (d.error) {
       appendLog(d.error, 'error');
@@ -793,7 +875,7 @@ async function runPipeline() {
  */
 async function stopPipeline() {
   try {
-    const r = await fetch('/api/stop', {method: 'POST'});
+    const r = await authFetch('/api/stop', {method: 'POST'});
     const d = await r.json();
     if (d.error) appendLog(d.error, 'warn');
     else appendLog('Stop requested...', 'warn');
@@ -803,10 +885,29 @@ async function stopPipeline() {
 }
 
 // ── Initialize ─────────────────────────────────────────────────────────────
-restoreFormState();
-loadConfig();
-connectWS();
-renderStageContent();
+
+/**
+ * Check /health to see if auth is enabled, and prompt for the API key
+ * if needed (and one is not already stored).
+ */
+async function initAuth() {
+  try {
+    const r = await fetch('/health');
+    const h = await r.json();
+    if (h.auth_enabled && !getApiKey()) {
+      promptForApiKey();
+    }
+  } catch(e) { /* server may not be ready */ }
+  updateAuthButton();
+}
+
+(async () => {
+  restoreFormState();
+  await initAuth();
+  loadConfig();
+  connectWS();
+  renderStageContent();
+})();
 </script>
 </body>
 </html>

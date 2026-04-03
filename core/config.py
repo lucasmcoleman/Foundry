@@ -63,6 +63,7 @@ class PipelineSettings(BaseSettings):
 
     # -- UI --
     ui_port: int = 7865
+    api_key: str = ""  # Set PIPELINE_API_KEY env var to enable auth
 
     # -- ROCm --
     device: str = "cuda:0"

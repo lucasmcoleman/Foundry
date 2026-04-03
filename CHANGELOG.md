@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0] - 2026-04-03 — API Key Authentication
+
+### Added
+- **API key authentication** for the FastAPI UI via `PIPELINE_API_KEY` environment variable
+  - Bearer token auth on all REST endpoints (Authorization header)
+  - Token query parameter auth on the WebSocket endpoint (`/ws?token=...`)
+  - `/health` endpoint exempt from auth (returns `auth_enabled` flag)
+  - Backward compatible: when `PIPELINE_API_KEY` is not set, everything works without auth
+- `api_key` field added to `PipelineSettings` in `core/config.py`
+- Frontend `authFetch()` wrapper that injects the Bearer token into all API calls
+- Frontend auth flow: checks `/health` on load, prompts for the key if auth is enabled, stores key in localStorage
+- Auth status button in the header to change or clear the stored API key
+
 ## [0.1.0] - 2026-04-03 — Production Hardening
 
 ### Bug Fixes

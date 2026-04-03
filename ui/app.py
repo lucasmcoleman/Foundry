@@ -19,7 +19,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Header, Query
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
@@ -31,6 +31,15 @@ from services import (
     MagicQuantService,
     UploadService,
 )
+
+API_KEY = os.environ.get("PIPELINE_API_KEY", "")
+
+async def verify_api_key(authorization: str = Header(default="")):
+    """Check Bearer token in the Authorization header. No-op when API_KEY is unset."""
+    if not API_KEY:
+        return
+    if authorization != f"Bearer {API_KEY}":
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 app = FastAPI(title="Pipeline UI")
 
@@ -672,13 +681,19 @@ def save_config(cfg: dict):
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint -- no authentication required."""
+    return {"status": "ok", "auth_enabled": bool(API_KEY)}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    """Serve the single-page frontend HTML."""
+    """Serve the single-page frontend HTML. No auth required -- the JS frontend handles auth."""
     return FileResponse(Path(__file__).parent / "index.html")
 
 
-@app.get("/api/state")
+@app.get("/api/state", dependencies=[Depends(verify_api_key)])
 async def get_state():
     """Return the current pipeline state: stage statuses, running flag, and progress."""
     return {
@@ -689,13 +704,13 @@ async def get_state():
     }
 
 
-@app.get("/api/config")
+@app.get("/api/config", dependencies=[Depends(verify_api_key)])
 async def get_config():
     """Return the persisted UI configuration (e.g. HuggingFace username)."""
     return load_config()
 
 
-@app.post("/api/config")
+@app.post("/api/config", dependencies=[Depends(verify_api_key)])
 async def set_config(body: dict):
     """Merge and persist UI configuration values. Returns the updated config."""
     cfg = load_config()
@@ -704,7 +719,7 @@ async def set_config(body: dict):
     return cfg
 
 
-@app.post("/api/run")
+@app.post("/api/run", dependencies=[Depends(verify_api_key)])
 async def start_pipeline(cfg: RunRequest):
     """
     Launch the pipeline in a background task.
@@ -722,7 +737,7 @@ async def start_pipeline(cfg: RunRequest):
     return {"status": "started"}
 
 
-@app.post("/api/stop")
+@app.post("/api/stop", dependencies=[Depends(verify_api_key)])
 async def stop_pipeline():
     """Request a graceful pipeline stop. Kills active subprocess and sets running flag to False."""
     if not state.running:
@@ -739,14 +754,19 @@ async def stop_pipeline():
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket_endpoint(ws: WebSocket, token: str = Query(default="")):
     """
     WebSocket endpoint for real-time log streaming.
 
     Clients connect here to receive log lines, stage updates, and progress
     events as JSON messages. The connection stays open until the client
     disconnects.
+
+    Authentication is via the ``token`` query parameter (e.g. ``/ws?token=...``).
     """
+    if API_KEY and token != API_KEY:
+        await ws.close(code=4001, reason="Invalid API key")
+        return
     await ws.accept()
     state.ws_clients.append(ws)
     try:
