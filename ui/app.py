@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Pipeline UI — FastAPI backend.
+Foundry UI — FastAPI backend.
 
 Orchestrates a 4-stage LLM fine-tuning pipeline:
   Training → Export GGUF → MagicQuant → Upload
 
 Uses WebSocket for real-time log streaming to the browser.
-Port defaults to 7865 (configurable via PIPELINE_UI_PORT env var).
+Port defaults to 7865 (configurable via FOUNDRY_UI_PORT env var).
 """
 
 import asyncio
@@ -24,7 +24,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
-from config import settings as pipeline_settings
+from config import settings as foundry_settings
 from services import (
     TrainingService,
     ExportService,
@@ -32,7 +32,7 @@ from services import (
     UploadService,
 )
 
-API_KEY = os.environ.get("PIPELINE_API_KEY", "")
+API_KEY = os.environ.get("FOUNDRY_API_KEY", "")
 
 async def verify_api_key(authorization: str = Header(default="")):
     """Check Bearer token in the Authorization header. No-op when API_KEY is unset."""
@@ -41,14 +41,14 @@ async def verify_api_key(authorization: str = Header(default="")):
     if authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-app = FastAPI(title="Pipeline UI")
+app = FastAPI(title="Foundry")
 
-PIPELINE_DIR = Path(__file__).resolve().parent.parent
+FOUNDRY_DIR = Path(__file__).resolve().parent.parent
 
 
 def _resolve_venv_python() -> str:
     """Locate the venv Python interpreter at runtime."""
-    candidate = PIPELINE_DIR / ".venv" / "bin" / "python"
+    candidate = FOUNDRY_DIR / ".venv" / "bin" / "python"
     if candidate.exists():
         return str(candidate)
     return sys.executable
@@ -162,7 +162,7 @@ async def run_script(script: str, output_dir: str) -> int:
     # Resolve relative paths against the project root, not uvicorn's CWD
     out_path = Path(output_dir)
     if not out_path.is_absolute():
-        out_path = PIPELINE_DIR / out_path
+        out_path = FOUNDRY_DIR / out_path
     script_path = out_path / f"_stage_{int(time.time())}.py"
     script_path.parent.mkdir(parents=True, exist_ok=True)
     script_path.write_text(script)
@@ -184,7 +184,7 @@ async def run_script(script: str, output_dir: str) -> int:
             VENV_PYTHON, "-u", str(script_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env=env, cwd=str(PIPELINE_DIR),
+            env=env, cwd=str(FOUNDRY_DIR),
             limit=1024 * 1024,  # 1MB line buffer — tqdm \r bars can be huge
             start_new_session=True,
         )
@@ -233,7 +233,7 @@ async def run_script(script: str, output_dir: str) -> int:
 
 # ── Dataset validation (Improvement #3) ──────────────────────────────────────
 
-PIPELINE_ROOT = Path(__file__).resolve().parent.parent
+FOUNDRY_ROOT = Path(__file__).resolve().parent.parent
 
 
 async def validate_dataset(path: str) -> bool:
@@ -241,7 +241,7 @@ async def validate_dataset(path: str) -> bool:
     await state.log("Validating dataset...", "stage")
     p = Path(path)
     if not p.is_absolute():
-        p = PIPELINE_ROOT / p
+        p = FOUNDRY_ROOT / p
     if not p.exists():
         await state.log(f"Dataset not found: {path}", "error")
         return False
@@ -300,7 +300,7 @@ async def validate_dataset(path: str) -> bool:
 def _resolve_out(output_dir: str) -> Path:
     """Resolve output_dir the same way run_script does."""
     p = Path(output_dir)
-    return p if p.is_absolute() else PIPELINE_DIR / p
+    return p if p.is_absolute() else FOUNDRY_DIR / p
 
 
 async def do_training(cfg: RunRequest) -> bool:
@@ -324,7 +324,7 @@ async def do_training(cfg: RunRequest) -> bool:
     await state.set_progress(0)
     await state.log("Starting QLoRA training (completion-only loss)", "stage")
 
-    svc = TrainingService(PIPELINE_ROOT, VENV_PYTHON)
+    svc = TrainingService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
         model_name=tc.model_name,
         dataset_path=tc.dataset_path,
@@ -416,7 +416,7 @@ async def do_export(cfg: RunRequest) -> bool:
         desc = f"Exporting {load_desc} to safetensors (for GGUF conversion)"
     await state.log(desc, "stage")
 
-    svc = ExportService(PIPELINE_ROOT, VENV_PYTHON)
+    svc = ExportService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
         base_model_id=base_model_id,
         lora_source=lora_source,
@@ -453,8 +453,8 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     await state.set_progress(0)
 
     # Pull latest MagicQuant before running
-    mq_symlink = PIPELINE_ROOT / "MagicQuant" / "magicquant"
-    mq_repo = Path(os.path.realpath(mq_symlink)).parent if mq_symlink.is_symlink() else PIPELINE_ROOT / "MagicQuant"
+    mq_symlink = FOUNDRY_ROOT / "MagicQuant" / "magicquant"
+    mq_repo = Path(os.path.realpath(mq_symlink)).parent if mq_symlink.is_symlink() else FOUNDRY_ROOT / "MagicQuant"
     if (mq_repo / ".git").exists():
         import subprocess
         result = subprocess.run(
@@ -473,10 +473,10 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     hint = mc.llamacpp_path or ""
     mq_source_override = mc.source_model if (mc.source_model and not export_enabled) else ""
 
-    svc = MagicQuantService(PIPELINE_ROOT, VENV_PYTHON)
+    svc = MagicQuantService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
         llamacpp_hint=hint,
-        pipeline_root_str=str(PIPELINE_ROOT),
+        pipeline_root_str=str(FOUNDRY_ROOT),
         mq_source_override=mq_source_override,
         out_abs_str=str(out_abs),
         generations=mc.generations,
@@ -513,7 +513,7 @@ async def do_upload(cfg: RunRequest) -> bool:
     tc = cfg.training
     out_abs = _resolve_out(out)
 
-    svc = UploadService(PIPELINE_ROOT, VENV_PYTHON)
+    svc = UploadService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
         repo_id=uc.repo_id,
         private=uc.private,
@@ -779,5 +779,5 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(default="")):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PIPELINE_UI_PORT", pipeline_settings.ui_port))
+    port = int(os.environ.get("FOUNDRY_UI_PORT", foundry_settings.ui_port))
     uvicorn.run(app, host="0.0.0.0", port=port)

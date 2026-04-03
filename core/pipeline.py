@@ -1,5 +1,5 @@
 """
-Unified pipeline: Training → Export → MagicQuant → HF Upload.
+Foundry pipeline: Training → Export → MagicQuant → HF Upload.
 
 Uses custom fast loaders to avoid single-threaded safetensors chunking
 that stalls on AMD APU unified memory (128 GB GTT).

@@ -3,12 +3,12 @@
 ## [0.2.0] - 2026-04-03 — API Key Authentication
 
 ### Added
-- **API key authentication** for the FastAPI UI via `PIPELINE_API_KEY` environment variable
+- **API key authentication** for the FastAPI UI via `FOUNDRY_API_KEY` environment variable
   - Bearer token auth on all REST endpoints (Authorization header)
   - Token query parameter auth on the WebSocket endpoint (`/ws?token=...`)
   - `/health` endpoint exempt from auth (returns `auth_enabled` flag)
-  - Backward compatible: when `PIPELINE_API_KEY` is not set, everything works without auth
-- `api_key` field added to `PipelineSettings` in `core/config.py`
+  - Backward compatible: when `FOUNDRY_API_KEY` is not set, everything works without auth
+- `api_key` field added to `FoundrySettings` in `core/config.py`
 - Frontend `authFetch()` wrapper that injects the Bearer token into all API calls
 - Frontend auth flow: checks `/health` on load, prompts for the key if auth is enabled, stores key in localStorage
 - Auth status button in the header to change or clear the stored API key
@@ -22,7 +22,7 @@
 - Fixed hardcoded `VENV_PYTHON` path in `ui/app.py` — now uses runtime detection
 
 ### Added
-- `core/config.py` — Pydantic-settings `PipelineSettings` for configuration via environment variables (`PIPELINE_` prefix) and `.env` files
+- `core/config.py` — Pydantic-settings `FoundrySettings` for configuration via environment variables (`FOUNDRY_` prefix) and `.env` files
 - `core/logging_config.py` — Structured logging via structlog with WebSocket callback support
 - `core/services.py` — Service layer classes (TrainingService, ExportService, MagicQuantService, UploadService) extracted from FastAPI route handlers
 - `core/__version__.py` — Package version tracking
@@ -32,7 +32,7 @@
 - `docker-compose.yml` with named volumes for model output and HF cache
 - Makefile with install, test, lint, format, build, docker-build, docker-up, clean targets
 - README.md with quickstart, configuration reference, architecture overview, and Docker instructions
-- `PIPELINE_MAP.md` — Detailed architecture documentation
+- `FOUNDRY_MAP.md` — Detailed architecture documentation
 - `OPEN_QUESTIONS.md` — Items requiring manual resolution
 
 ### Changed

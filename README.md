@@ -1,10 +1,10 @@
-# Pipeline
+# Foundry
 
 ML fine-tuning and hybrid quantization pipeline for AMD ROCm. Provides a 4-stage workflow — QLoRA training, LoRA merge, MagicQuant hybrid quantization, and HuggingFace Hub upload — with a FastAPI web UI for orchestration.
 
 Designed for AMD APU unified memory systems (Strix Halo, gfx1151) where CPU and GPU share system RAM via GTT. Uses custom streaming loaders that process models shard-by-shard to avoid the memory bottlenecks of standard HuggingFace `from_pretrained()`.
 
-See [PIPELINE_MAP.md](PIPELINE_MAP.md) for detailed architecture documentation.
+See [FOUNDRY_MAP.md](FOUNDRY_MAP.md) for detailed architecture documentation.
 
 ## Prerequisites
 
@@ -32,9 +32,9 @@ Create a `.env` file or set environment variables:
 HF_TOKEN=hf_...
 
 # Optional overrides
-PIPELINE_MODEL_NAME=Tesslate/OmniCoder-9B
-PIPELINE_DATASET_PATH=data/zeroclaw_training_data.jsonl
-PIPELINE_OUTPUT_DIR=./output
+FOUNDRY_MODEL_NAME=Tesslate/OmniCoder-9B
+FOUNDRY_DATASET_PATH=data/zeroclaw_training_data.jsonl
+FOUNDRY_OUTPUT_DIR=./output
 ```
 
 ### Run the full pipeline (CLI)
@@ -85,27 +85,27 @@ docker compose up -d
 
 ## Configuration Reference
 
-All settings can be configured via environment variables with `PIPELINE_` prefix or a `.env` file.
+All settings can be configured via environment variables with `FOUNDRY_` prefix or a `.env` file.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PIPELINE_MODEL_NAME` | `Tesslate/OmniCoder-9B` | HuggingFace model ID or local path |
-| `PIPELINE_DATASET_PATH` | `data/zeroclaw_training_data.jsonl` | Training data (JSONL) |
-| `PIPELINE_OUTPUT_DIR` | `./output` | Output directory for all artifacts |
-| `PIPELINE_MAX_SEQ_LENGTH` | `8192` | Maximum sequence length |
-| `PIPELINE_LORA_R` | `32` | LoRA rank |
-| `PIPELINE_LORA_ALPHA` | `64` | LoRA alpha |
-| `PIPELINE_NUM_TRAIN_EPOCHS` | `3` | Training epochs |
-| `PIPELINE_LEARNING_RATE` | `2e-4` | Learning rate |
-| `PIPELINE_PER_DEVICE_TRAIN_BATCH_SIZE` | `2` | Batch size per GPU |
-| `PIPELINE_GRADIENT_ACCUMULATION_STEPS` | `4` | Gradient accumulation steps |
-| `PIPELINE_TARGET_BASE_QUANT` | `MXFP4_MOE` | MagicQuant base quantization |
-| `PIPELINE_MQ_GENERATIONS` | `50` | Evolutionary search generations |
-| `PIPELINE_MQ_TIERS` | `["Q4","Q5","Q6"]` | Quantization tiers to generate |
-| `PIPELINE_HF_REPO_ID` | (empty) | HuggingFace repo for upload |
-| `PIPELINE_HF_PRIVATE` | `true` | Create private HF repo |
-| `PIPELINE_UI_PORT` | `7865` | Web UI port |
-| `PIPELINE_DEVICE` | `cuda:0` | GPU device |
+| `FOUNDRY_MODEL_NAME` | `Tesslate/OmniCoder-9B` | HuggingFace model ID or local path |
+| `FOUNDRY_DATASET_PATH` | `data/zeroclaw_training_data.jsonl` | Training data (JSONL) |
+| `FOUNDRY_OUTPUT_DIR` | `./output` | Output directory for all artifacts |
+| `FOUNDRY_MAX_SEQ_LENGTH` | `8192` | Maximum sequence length |
+| `FOUNDRY_LORA_R` | `32` | LoRA rank |
+| `FOUNDRY_LORA_ALPHA` | `64` | LoRA alpha |
+| `FOUNDRY_NUM_TRAIN_EPOCHS` | `3` | Training epochs |
+| `FOUNDRY_LEARNING_RATE` | `2e-4` | Learning rate |
+| `FOUNDRY_PER_DEVICE_TRAIN_BATCH_SIZE` | `2` | Batch size per GPU |
+| `FOUNDRY_GRADIENT_ACCUMULATION_STEPS` | `4` | Gradient accumulation steps |
+| `FOUNDRY_TARGET_BASE_QUANT` | `MXFP4_MOE` | MagicQuant base quantization |
+| `FOUNDRY_MQ_GENERATIONS` | `50` | Evolutionary search generations |
+| `FOUNDRY_MQ_TIERS` | `["Q4","Q5","Q6"]` | Quantization tiers to generate |
+| `FOUNDRY_HF_REPO_ID` | (empty) | HuggingFace repo for upload |
+| `FOUNDRY_HF_PRIVATE` | `true` | Create private HF repo |
+| `FOUNDRY_UI_PORT` | `7865` | Web UI port |
+| `FOUNDRY_DEVICE` | `cuda:0` | GPU device |
 | `HF_TOKEN` | (env/file) | HuggingFace token |
 
 ## Pipeline Stages
