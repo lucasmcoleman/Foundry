@@ -645,9 +645,13 @@ function depBanner(type, html) {
  * @returns {string} Suggested repo ID (e.g. "user/ModelName-MagicQuant-GGUF")
  */
 function suggestRepoId() {
-  const trainingOn = S.enabledStages.has('training');
-  const exportOn = S.enabledStages.has('export');
-  const hasMQ = S.enabledStages.has('magicquant');
+  const stages = S.enabledStages;
+  const trainingOn = stages.has('training');
+  const exportOn = stages.has('export');
+  const hasHeretic = stages.has('heretic');
+  const hasMQ = stages.has('magicquant');
+
+  // Resolve the base model name from the first available source
   let modelName = '';
   if (trainingOn) {
     modelName = S.config.training.model_name;
@@ -660,10 +664,30 @@ function suggestRepoId() {
   }
   let short = modelName.includes('/') ? modelName.split('/').pop() : modelName;
   short = short.replace(/\.(gguf|bin|safetensors)$/i, '');
-  const hasHeretic = S.enabledStages.has('heretic');
-  const suffix = hasMQ ? '-MagicQuant-GGUF' : hasHeretic ? '-heretic' : exportOn ? '-GGUF' : '-LoRA';
+
+  // Infer a training-data tag from the dataset filename
+  let dataTag = '';
+  if (trainingOn) {
+    const ds = S.config.training.dataset_path || '';
+    const dsFile = ds.includes('/') ? ds.split('/').pop() : ds;
+    const dsBase = dsFile.replace(/\.(jsonl|json|csv|parquet|arrow)$/i, '')
+                         .replace(/_training_data$|_data$/i, '');
+    // Use it if it's meaningful (not just "train" or "data")
+    if (dsBase && dsBase.length > 2 && !/^(train|data|dataset)$/i.test(dsBase)) {
+      dataTag = '-' + dsBase.charAt(0).toUpperCase() + dsBase.slice(1);
+    }
+  }
+
+  // Build suffix from active post-training stages
+  const parts = [];
+  if (hasHeretic) parts.push('Uncensored');
+  if (hasMQ) parts.push('GGUF');
+  else if (exportOn) parts.push('GGUF');
+  else parts.push('LoRA');
+
+  const suffix = parts.length ? '-' + parts.join('-') : '';
   const prefix = S.hfUsername ? S.hfUsername + '/' : '';
-  return prefix + short + suffix;
+  return prefix + short + dataTag + suffix;
 }
 
 /**
