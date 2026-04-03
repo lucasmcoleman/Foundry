@@ -6,7 +6,7 @@ Items that could not be automatically resolved during the production hardening p
 
 1. **UI authentication**: The FastAPI UI serves on `0.0.0.0:7865` with no authentication. For production deployment, this needs an auth layer (API key, OAuth, or at minimum IP allowlisting). Currently assumed to be used on trusted local networks only.
 
-2. **MagicQuant integration method**: The pipeline currently imports MagicQuant via a symlink (`pipeline/MagicQuant/magicquant → /server/programming/MagicQuant/magicquant`) and via an installed package in the venv. The correct long-term solution is to declare `magicquant` as a dependency in `pyproject.toml` and install it (either from PyPI, git, or local path). The symlink approach works but is fragile. The `pyproject.toml` declares `magicquant>=0.1.0` but this requires the package to be `pip install`-able.
+2. **MagicQuant integration method**: Foundry currently imports MagicQuant via a symlink and via an installed package in the venv. The correct long-term solution is to declare `magicquant` as a dependency in `pyproject.toml` and install it (either from PyPI, git, or local path). The symlink approach works but is fragile. The `pyproject.toml` declares `magicquant>=0.1.0` but this requires the package to be `pip install`-able.
 
 3. **GPU memory management**: The pipeline does not have explicit GPU memory checking before starting stages. If another process (e.g., LM Studio) is using GPU memory, training will OOM without a clear error. A pre-flight GPU memory check would improve UX.
 

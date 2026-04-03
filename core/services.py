@@ -1,12 +1,12 @@
 """
-Service layer for pipeline stages.
+Service layer for Foundry pipeline stages.
 
 Extracts business logic from ui/app.py route handlers into testable,
 reusable service classes. Each service accepts a config and a progress
 callback, handles subprocess execution, and returns success/failure.
 
 Usage from the UI:
-    svc = TrainingService(pipeline_root, venv_python)
+    svc = TrainingService(project_root, venv_python)
     ok = await svc.run(cfg, run_script_fn)
 """
 

@@ -1,9 +1,9 @@
 """
-Centralized pipeline configuration using pydantic-settings.
+Centralized Foundry configuration using pydantic-settings.
 
 All settings can be overridden via:
   1. Constructor keyword arguments
-  2. Environment variables with PIPELINE_ prefix (e.g. PIPELINE_OUTPUT_DIR)
+  2. Environment variables with FOUNDRY_ prefix (e.g. FOUNDRY_OUTPUT_DIR)
   3. A .env file in the project root
 
 Usage:
@@ -19,11 +19,11 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class PipelineSettings(BaseSettings):
-    """Pipeline-wide configuration loaded from env vars and .env file."""
+class FoundrySettings(BaseSettings):
+    """Foundry-wide configuration loaded from env vars and .env file."""
 
     model_config = SettingsConfigDict(
-        env_prefix="PIPELINE_",
+        env_prefix="FOUNDRY_",
         env_file=".env",
         env_file_encoding="utf-8",
     )
@@ -63,7 +63,7 @@ class PipelineSettings(BaseSettings):
 
     # -- UI --
     ui_port: int = 7865
-    api_key: str = ""  # Set PIPELINE_API_KEY env var to enable auth
+    api_key: str = ""  # Set FOUNDRY_API_KEY env var to enable auth
 
     # -- ROCm --
     device: str = "cuda:0"
@@ -76,4 +76,4 @@ class PipelineSettings(BaseSettings):
 
 # Module-level singleton for convenience imports.
 # Importing `settings` triggers env var / .env resolution once.
-settings = PipelineSettings()
+settings = FoundrySettings()

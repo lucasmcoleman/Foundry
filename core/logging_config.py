@@ -1,5 +1,5 @@
 """
-Structured logging for the pipeline.
+Structured logging for Foundry.
 
 Provides a get_logger() that returns a structlog-compatible logger with
 consistent schema. Supports both console output and the WebSocket callback

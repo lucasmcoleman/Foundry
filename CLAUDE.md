@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-LLM fine-tuning and hybrid quantization pipeline for AMD ROCm (Strix Halo APU, gfx1151). Three core components:
+Foundry: LLM fine-tuning and hybrid quantization pipeline for AMD ROCm (Strix Halo APU, gfx1151). Three core components:
 - **Custom fast QLoRA training** with shard-by-shard BnB quantization and completion-only loss masking (replaces Unsloth)
 - **MagicQuant** evolutionary per-tensor hybrid quantization
 - **FastAPI Web UI** for pipeline orchestration
@@ -61,7 +61,7 @@ python scripts/patch_gguf_metadata.py
 This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RAM. Key implications:
 
 - **Unsloth/transformers model loading is extremely slow** on this hardware. The default `from_pretrained` path loads tensors one at a time through Python's GIL. For 40B+ models this takes hours.
-- **The pipeline now uses custom fast loaders instead of Unsloth**: `core/fast_train_zeroclaw.py` loads safetensors shard-by-shard with inline BnB 4-bit quantization (~2 min vs hours). `core/fast_export.py` does streaming LoRA merge at ~6 GB peak memory. Both `core/pipeline.py` stage_training() and stage_export() call these fast loaders.
+- **Foundry uses custom fast loaders instead of Unsloth**: `core/fast_train_zeroclaw.py` loads safetensors shard-by-shard with inline BnB 4-bit quantization (~2 min vs hours). `core/fast_export.py` does streaming LoRA merge at ~6 GB peak memory. Both `core/pipeline.py` stage_training() and stage_export() call these fast loaders.
 - **BitsAndBytes 0.49.2 works on ROCm** — GPU quantization kernels are functional (0.011s/tensor).
 - **BnB requires blocksize=128** on AMD (not the NVIDIA default of 64).
 - **LM Studio models consume GPU memory from the same pool** — unload them before training.
@@ -85,7 +85,7 @@ Classifies tensors into sensitivity groups (E=Embeddings, H=Head, Q=Query, K=Key
 - `legacy/train.py`, `legacy/train_zeroclaw.py`: LEGACY scripts that use Unsloth. Kept for reference/NVIDIA use.
 
 ### Web UI (ui/)
-FastAPI + WebSocket live log streaming. Pydantic config models. Port 7865 (configurable via PIPELINE_UI_PORT).
+FastAPI + WebSocket live log streaming. Pydantic config models. Port 7865 (configurable via FOUNDRY_UI_PORT).
 
 ## Dataset Format
 

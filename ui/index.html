@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MagicQuant Pipeline</title>
+<title>Foundry</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -173,7 +173,7 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 <div class="app">
   <header class="header">
     <div class="header-left">
-      <div class="logo"><span>&#x2728;</span> MagicQuant Pipeline</div>
+      <div class="logo"><span>&#x2728;</span> Foundry</div>
       <div class="header-tag">QLoRA + GGUF</div>
     </div>
     <div class="header-right">
@@ -255,7 +255,7 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 
 <script>
 // ── API Key Authentication ───────────────────────────────────────────────
-const AUTH_LS_KEY = 'pipeline_api_key';
+const AUTH_LS_KEY = 'foundry_api_key';
 
 /** Get the stored API key (empty string means no auth). */
 function getApiKey() {
@@ -277,7 +277,7 @@ function clearApiKey() {
  * Returns the key, or empty string if the user cancels.
  */
 function promptForApiKey() {
-  const key = prompt('This server requires an API key.\nEnter your PIPELINE_API_KEY:');
+  const key = prompt('This server requires an API key.\nEnter your FOUNDRY_API_KEY:');
   if (key) { setApiKey(key.trim()); return key.trim(); }
   return '';
 }
@@ -359,7 +359,7 @@ const S = {
 };
 
 // ── localStorage Form Persistence ──────────────────────────────────────────
-const LS_KEY = 'pipeline_form_state';
+const LS_KEY = 'foundry_form_state';
 
 /**
  * Save the current form config and enabled stages to localStorage.
@@ -781,7 +781,7 @@ function renderUpload() {
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_merged" ${c.upload_merged?'checked':''}><span class="form-label" style="margin:0">Merged model (large)</span></label></div>
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_dataset" ${c.upload_dataset?'checked':''}><span class="form-label" style="margin:0">Training dataset (separate repo)</span></label></div>
   </div>
-  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-2);margin-top:16px;">Requires <code style="color:var(--amber)">HF_TOKEN</code> environment variable with write access. Set it in your shell before starting the pipeline server.</div>
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-2);margin-top:16px;">Requires <code style="color:var(--amber)">HF_TOKEN</code> environment variable with write access. Set it in your shell before starting the Foundry server.</div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Upload</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
   </div>`;
 }
@@ -841,7 +841,7 @@ async function runPipeline() {
   dismissStatus();
   const enabled = Array.from(S.enabledStages);
   if (enabled.length === 0) {
-    showStatus('Enable at least one pipeline stage before running.', 'error');
+    showStatus('Enable at least one stage before running.', 'error');
     appendLog('Enable at least one stage.', 'error');
     return;
   }
@@ -865,7 +865,7 @@ async function runPipeline() {
     }
   } catch (e) {
     appendLog(`Request failed: ${e.message}`, 'error');
-    showStatus(`Failed to start pipeline: ${e.message}`, 'error');
+    showStatus(`Failed to start: ${e.message}`, 'error');
     setPipelineRunning(false);
   }
 }

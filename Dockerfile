@@ -1,9 +1,9 @@
-# Pipeline Dockerfile — multi-stage build for ML fine-tuning pipeline
+# Foundry Dockerfile — multi-stage build for ML fine-tuning pipeline
 # Supports ROCm and CUDA via build args.
 #
 # Usage:
-#   docker build -t pipeline:latest .
-#   docker build --build-arg BASE_IMAGE=rocm/pytorch:latest -t pipeline:rocm .
+#   docker build -t foundry:latest .
+#   docker build --build-arg BASE_IMAGE=rocm/pytorch:latest -t foundry:rocm .
 
 ARG BASE_IMAGE=python:3.12-slim
 
@@ -30,21 +30,21 @@ FROM ${BASE_IMAGE} AS runtime
 ARG UID=1000
 ARG GID=1000
 
-RUN groupadd -g ${GID} pipeline && \
-    useradd -u ${UID} -g ${GID} -m pipeline
+RUN groupadd -g ${GID} foundry && \
+    useradd -u ${UID} -g ${GID} -m foundry
 
 WORKDIR /app
 
-# Install the pipeline package
+# Install the Foundry package
 COPY --from=builder /build/dist/*.whl /tmp/
 RUN pip install --no-cache-dir /tmp/*.whl && rm -f /tmp/*.whl
 
 # Copy non-package files needed at runtime
-COPY --chown=pipeline:pipeline ui/index.html /app/ui/
-COPY --chown=pipeline:pipeline data/ /app/data/
+COPY --chown=foundry:foundry ui/index.html /app/ui/
+COPY --chown=foundry:foundry data/ /app/data/
 
 # Create output volume mount point
-RUN mkdir -p /app/output && chown pipeline:pipeline /app/output
+RUN mkdir -p /app/output && chown foundry:foundry /app/output
 VOLUME ["/app/output"]
 
 # ROCm environment variables
@@ -52,9 +52,9 @@ ENV HSA_ENABLE_SDMA=0
 ENV PYTORCH_HIP_ALLOC_CONF="backend:native,expandable_segments:True"
 ENV TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
-ENV PIPELINE_UI_PORT=7865
+ENV FOUNDRY_UI_PORT=7865
 
-USER pipeline
+USER foundry
 
 EXPOSE 7865
 

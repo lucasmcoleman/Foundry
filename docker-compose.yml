@@ -1,22 +1,22 @@
 services:
-  pipeline-ui:
+  foundry-ui:
     build:
       context: .
       dockerfile: Dockerfile
       args:
         BASE_IMAGE: python:3.12-slim
     ports:
-      - "${PIPELINE_UI_PORT:-7865}:7865"
+      - "${FOUNDRY_UI_PORT:-7865}:7865"
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
-      - PIPELINE_OUTPUT_DIR=/app/output
-      - PIPELINE_UI_PORT=7865
+      - FOUNDRY_OUTPUT_DIR=/app/output
+      - FOUNDRY_UI_PORT=7865
       - HSA_ENABLE_SDMA=0
       - PYTORCH_HIP_ALLOC_CONF=backend:native,expandable_segments:True
       - TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
     volumes:
       - model-output:/app/output
-      - model-cache:/home/pipeline/.cache/huggingface
+      - model-cache:/home/foundry/.cache/huggingface
     restart: unless-stopped
 
   magicquant:

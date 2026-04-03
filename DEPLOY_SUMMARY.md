@@ -39,7 +39,7 @@ Verified: `torch 2.11.0a0+rocm7.11.0a20260106` loads with GPU (`Radeon 8060S Gra
 3. **MagicQuant file_type metadata**: Fixed hardcoded `general.file_type = 1` that reported wrong quantization type to llama.cpp.
 
 ### Infrastructure Added
-- **Configuration**: Pydantic-settings `BaseSettings` in both repos with environment variable support and `.env` file loading
+- **Configuration**: Pydantic-settings `FoundrySettings` / `BaseSettings` in both repos with environment variable support and `.env` file loading
 - **Structured logging**: structlog integration with consistent schema and WebSocket callback support in pipeline
 - **Retry logic**: tenacity decorators on HuggingFace API calls and llama.cpp subprocess calls
 - **Service layer**: Extracted FastAPI business logic from route handlers into `core/services.py`
@@ -71,7 +71,7 @@ Verified: `torch 2.11.0a0+rocm7.11.0a20260106` loads with GPU (`Radeon 8060S Gra
 ### Resolved
 1. ~~**Complete unsloth-env cleanup**~~ — DONE. Fresh venvs created in both repos with ROCm wheels repacked from unsloth-env. `unsloth-env/` deleted. MagicQuant symlink removed.
 2. ~~**MagicQuant as proper dependency**~~ — DONE. Installed as editable package (`pip install -e ../MagicQuant`) in pipeline's venv. `pyproject.toml` declares `magicquant>=0.1.0` for portability.
-3. ~~**UI authentication**~~ — DONE. Optional API key auth added via `PIPELINE_API_KEY` env var. Bearer token on REST, query param on WebSocket. Backward compatible when unset.
+3. ~~**UI authentication**~~ — DONE. Optional API key auth added via `FOUNDRY_API_KEY` env var. Bearer token on REST, query param on WebSocket. Backward compatible when unset.
 
 ### Remaining
 4. **Training data**: `data/zeroclaw_training_data.jsonl` is tracked in git. Consider moving to HuggingFace Datasets or S3 for production.
@@ -85,7 +85,7 @@ No hardcoded secrets were found in either repository. HF_TOKEN is properly sourc
 
 | Document | Location | Purpose |
 |----------|----------|---------|
-| PIPELINE_MAP.md | pipeline/ | Full pipeline architecture and data flow |
+| FOUNDRY_MAP.md | pipeline/ | Full pipeline architecture and data flow |
 | AUDIT_REPORT.md | MagicQuant/ | Code audit findings |
 | AUDIT_REPORT.md | pipeline/ | Code audit findings |
 | CHANGELOG.md | MagicQuant/ | Change documentation |
