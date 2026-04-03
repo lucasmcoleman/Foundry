@@ -6,16 +6,17 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="${SCRIPT_DIR}/../.venv/bin"
 
-# Fallback to parent-level venv
 if [ ! -f "$VENV/uvicorn" ]; then
-    VENV="/server/programming/unsloth-env/bin"
+    echo "ERROR: uvicorn not found in $VENV"
+    echo "Install with: pip install uvicorn"
+    exit 1
 fi
 
 PORT="${1:-7865}"
 
 export HSA_ENABLE_SDMA=0
 export PYTORCH_HIP_ALLOC_CONF="backend:native,expandable_segments:True"
-export UNSLOTH_SKIP_TORCHVISION_CHECK=1
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 echo "Starting Pipeline UI on http://localhost:${PORT}"

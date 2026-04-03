@@ -12,6 +12,7 @@ Port defaults to 7865 (configurable via PIPELINE_UI_PORT env var).
 import asyncio
 import json
 import os
+import signal
 import sys
 import time
 from enum import Enum
@@ -22,12 +23,29 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+from config import settings as pipeline_settings
+from services import (
+    TrainingService,
+    ExportService,
+    MagicQuantService,
+    UploadService,
+)
+
 app = FastAPI(title="Pipeline UI")
 
 PIPELINE_DIR = Path(__file__).resolve().parent.parent
-VENV_PYTHON = str(PIPELINE_DIR / ".venv" / "bin" / "python")
-if not Path(VENV_PYTHON).exists():
-    VENV_PYTHON = "/server/programming/pipeline/.venv/bin/python"
+
+
+def _resolve_venv_python() -> str:
+    """Locate the venv Python interpreter at runtime."""
+    candidate = PIPELINE_DIR / ".venv" / "bin" / "python"
+    if candidate.exists():
+        return str(candidate)
+    return sys.executable
+
+
+VENV_PYTHON = _resolve_venv_python()
 
 
 # ── State ────────────────────────────────────────────────────────────────────
@@ -50,10 +68,11 @@ class PipelineState:
         self.current_stage = None
         self.progress = 0
         self.ws_clients: list[WebSocket] = []
+        self.active_proc = None
 
     async def broadcast(self, msg: dict):
         dead = []
-        for ws in self.ws_clients:
+        for ws in list(self.ws_clients):
             try:
                 await ws.send_json(msg)
             except Exception:
@@ -93,8 +112,8 @@ class TrainingCfg(BaseModel):
     gradient_accumulation_steps: int = 4
     learning_rate: float = 2e-4
     lr_scheduler_type: str = "cosine"
-    warmup_ratio: float = 0.05
-    optim: str = "adamw_8bit"
+    warmup_steps: int = 10
+    optim: str = "paged_adamw_8bit"
     output_dir: str = "./output"
 
 class ExportCfg(BaseModel):
@@ -117,6 +136,7 @@ class UploadCfg(BaseModel):
     upload_gguf: bool = True
     upload_lora: bool = False
     upload_merged: bool = False
+    upload_dataset: bool = True
 
 class RunRequest(BaseModel):
     training: TrainingCfg = TrainingCfg()
@@ -147,48 +167,72 @@ async def run_script(script: str, output_dir: str) -> int:
         "PYTHONUNBUFFERED": "1",
     })
 
-    proc = await asyncio.create_subprocess_exec(
-        VENV_PYTHON, "-u", str(script_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env=env, cwd=str(PIPELINE_DIR),
-        limit=1024 * 1024,  # 1MB line buffer — tqdm \r bars can be huge
-    )
+    log_path = script_path.with_suffix(".log")
+    log_file = open(log_path, "w")
 
-    async for raw in proc.stdout:
-        # tqdm uses \r without \n, so one "line" may contain many \r-separated updates.
-        # Split on \r and process the last (most recent) segment.
-        segments = raw.decode("utf-8", errors="replace").split("\r")
-        for text in segments:
-            text = text.strip()
-            if not text:
-                continue
-            if "it/s]" in text or "s/it]" in text:
-                try:
-                    pct = int(float(text.split("%|")[0].strip().split()[-1]))
-                    await state.set_progress(pct)
-                except (ValueError, IndexError):
-                    pass
-                continue  # don't log every progress bar update
-            if "'loss'" in text:
-                await state.log(text, "metric")
-            elif "PIPELINE_STAGE_COMPLETE" in text:
-                await state.log(text, "success")
-            elif "Error" in text or "error" in text.lower():
-                await state.log(text, "error")
-            else:
-                await state.log(text)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            VENV_PYTHON, "-u", str(script_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env, cwd=str(PIPELINE_DIR),
+            limit=1024 * 1024,  # 1MB line buffer — tqdm \r bars can be huge
+            start_new_session=True,
+        )
+        state.active_proc = proc
 
-    await proc.wait()
+        try:
+            async for raw in proc.stdout:
+                log_file.write(raw.decode("utf-8", errors="replace"))
+                log_file.flush()
+                # tqdm uses \r without \n, so one "line" may contain many \r-separated updates.
+                # Split on \r and process the last (most recent) segment.
+                segments = raw.decode("utf-8", errors="replace").split("\r")
+                for text in segments:
+                    text = text.strip()
+                    if not text:
+                        continue
+                    if "it/s]" in text or "s/it]" in text:
+                        try:
+                            pct = int(float(text.split("%|")[0].strip().split()[-1]))
+                            await state.set_progress(pct)
+                        except (ValueError, IndexError):
+                            pass
+                        continue  # don't log every progress bar update
+                    if "'loss'" in text:
+                        await state.log(text, "metric")
+                    elif "PIPELINE_STAGE_COMPLETE" in text:
+                        await state.log(text, "success")
+                    elif "Error" in text or "error" in text.lower():
+                        await state.log(text, "error")
+                    else:
+                        await state.log(text)
+        except Exception:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            raise
+        finally:
+            await proc.wait()
+            state.active_proc = None
+    finally:
+        log_file.close()
+
     return proc.returncode
 
 
 # ── Dataset validation (Improvement #3) ──────────────────────────────────────
 
+PIPELINE_ROOT = Path(__file__).resolve().parent.parent
+
+
 async def validate_dataset(path: str) -> bool:
     """Pre-flight dataset check."""
     await state.log("Validating dataset...", "stage")
     p = Path(path)
+    if not p.is_absolute():
+        p = PIPELINE_ROOT / p
     if not p.exists():
         await state.log(f"Dataset not found: {path}", "error")
         return False
@@ -263,7 +307,7 @@ async def do_training(cfg: RunRequest) -> bool:
         await state.set_progress(100)
         return True
 
-    # Improvement #3: validate first
+    # Validate dataset before committing GPU time
     if not await validate_dataset(tc.dataset_path):
         return False
 
@@ -271,104 +315,24 @@ async def do_training(cfg: RunRequest) -> bool:
     await state.set_progress(0)
     await state.log("Starting QLoRA training (completion-only loss)", "stage")
 
-    # Improvement #2: completion_only_loss
-    script = f'''
-import os
-os.environ["HSA_ENABLE_SDMA"] = "0"
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
-os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
-os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
-
-from pathlib import Path as _P
-_model_id = "{tc.model_name}"
-_is_local = _P(_model_id).exists()
-if _is_local:
-    print(f"Loading from local path: {{_model_id}}")
-else:
-    try:
-        from huggingface_hub import scan_cache_dir
-        _cached = False
-        for _repo in scan_cache_dir().repos:
-            if _repo.repo_id == _model_id:
-                _size_gb = _repo.size_on_disk / 1e9
-                print(f"Model found in HF cache ({{_size_gb:.1f}} GB) — no download needed")
-                _cached = True
-                break
-        if not _cached:
-            print(f"Model not in cache — will download from HuggingFace: {{_model_id}}")
-    except Exception:
-        print(f"Loading model: {{_model_id}}")
-
-import sys, torch
-sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
-from fast_train_zeroclaw import fast_load_quantized_model, detect_response_template, find_latest_checkpoint
-from datasets import load_dataset
-from trl import SFTTrainer, SFTConfig
-from peft import LoraConfig, prepare_model_for_kbit_training
-
-DEVICE = torch.device("cuda:0")
-model, tokenizer = fast_load_quantized_model("{tc.model_name}")
-
-model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-lora_config = LoraConfig(
-    r={tc.lora_r}, lora_alpha={tc.lora_alpha}, lora_dropout={tc.lora_dropout},
-    target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-    use_rslora={tc.use_rslora}, task_type="CAUSAL_LM",
-)
-from peft import get_peft_model
-model = get_peft_model(model, lora_config)
-model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={{"use_reentrant": False}})
-
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total = sum(p.numel() for p in model.parameters())
-print(f"Trainable: {{trainable:,}} / {{total:,}} ({{100*trainable/total:.2f}}%)")
-
-dataset = load_dataset("json", data_files="{tc.dataset_path}", split="train")
-print(f"Dataset: {{len(dataset)}} examples")
-
-def fmt(ex):
-    ex["text"] = tokenizer.apply_chat_template(ex["messages"], tokenize=False, add_generation_prompt=False)
-    return ex
-dataset = dataset.map(fmt)
-
-from trl import DataCollatorForCompletionOnlyLM
-response_template = detect_response_template(tokenizer)
-print(f"Response template: {{repr(response_template)}}")
-response_ids = tokenizer.encode(response_template, add_special_tokens=False)
-collator = DataCollatorForCompletionOnlyLM(response_template=response_ids, tokenizer=tokenizer)
-
-resume_ckpt = find_latest_checkpoint("{tc.output_dir}")
-if resume_ckpt:
-    print(f"Resuming from checkpoint: {{resume_ckpt}}")
-
-trainer = SFTTrainer(
-    model=model, tokenizer=tokenizer, train_dataset=dataset,
-    data_collator=collator,
-    args=SFTConfig(
-        output_dir="{tc.output_dir}",
-        num_train_epochs={tc.num_train_epochs},
-        per_device_train_batch_size={tc.per_device_train_batch_size},
-        gradient_accumulation_steps={tc.gradient_accumulation_steps},
-        learning_rate={tc.learning_rate},
-        lr_scheduler_type="{tc.lr_scheduler_type}",
-        warmup_ratio={tc.warmup_ratio}, optim="{tc.optim}",
-        weight_decay=0.01, max_grad_norm=1.0, fp16=False, bf16=True,
-        logging_steps=1, save_strategy="epoch", seed=42,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={{"use_reentrant": False}},
-        report_to="none",
-        max_seq_length={tc.max_seq_length},
-        dataset_text_field="text",
-    ),
-)
-stats = trainer.train(resume_from_checkpoint=resume_ckpt)
-print(f"Final loss: {{stats.training_loss:.4f}}")
-
-lora_dir = "{tc.output_dir}/lora_adapters"
-model.save_pretrained(lora_dir)
-tokenizer.save_pretrained(lora_dir)
-print("PIPELINE_STAGE_COMPLETE=training")
-'''
+    svc = TrainingService(PIPELINE_ROOT, VENV_PYTHON)
+    script = svc.build_script(
+        model_name=tc.model_name,
+        dataset_path=tc.dataset_path,
+        output_dir=tc.output_dir,
+        max_seq_length=tc.max_seq_length,
+        lora_r=tc.lora_r,
+        lora_alpha=tc.lora_alpha,
+        lora_dropout=tc.lora_dropout,
+        use_rslora=tc.use_rslora,
+        num_train_epochs=tc.num_train_epochs,
+        per_device_train_batch_size=tc.per_device_train_batch_size,
+        gradient_accumulation_steps=tc.gradient_accumulation_steps,
+        learning_rate=tc.learning_rate,
+        lr_scheduler_type=tc.lr_scheduler_type,
+        warmup_steps=tc.warmup_steps,
+        optim=tc.optim,
+    )
     rc = await run_script(script, tc.output_dir)
     ok = rc == 0
     await state.set_stage("training", StageStatus.COMPLETE if ok else StageStatus.FAILED)
@@ -406,98 +370,50 @@ async def do_export(cfg: RunRequest) -> bool:
     await state.set_stage("export", StageStatus.RUNNING)
     await state.set_progress(0)
 
-    # Determine model source: training output (lora) or user-specified model
+    # Determine model source: base model ID for streaming_merge + optional LoRA dir
     if training_enabled:
-        model_source = f"{out}/lora_adapters"
+        base_model_id = cfg.training.model_name
+        lora_source = f"{out}/lora_adapters"
         has_lora = True
     elif ec.source_model:
-        model_source = ec.source_model
-        # Detect if source is a LoRA adapter dir (has adapter_config.json)
-        has_lora = (Path(model_source) / "adapter_config.json").exists()
+        base_model_id = ec.source_model
+        has_lora = (Path(ec.source_model) / "adapter_config.json").exists()
+        if has_lora:
+            try:
+                adapter_cfg_data = json.loads((Path(ec.source_model) / "adapter_config.json").read_text())
+                base_model_id = adapter_cfg_data.get("base_model_name_or_path", ec.source_model)
+            except (json.JSONDecodeError, OSError):
+                pass
+            lora_source = ec.source_model
+        else:
+            lora_source = None
     else:
         await state.log("Export requires a model source. Enable Training or set a Source Model path.", "error")
         await state.set_stage("export", StageStatus.FAILED)
         return False
 
     # Validate source exists (for local paths)
-    if not model_source.startswith(("http", "hf://")) and "/" in model_source:
-        source_path = Path(model_source)
+    if not base_model_id.startswith(("http", "hf://")) and "/" in base_model_id:
+        source_path = Path(base_model_id)
         if source_path.is_absolute() and not source_path.exists():
-            await state.log(f"Source model not found: {model_source}", "error")
+            await state.log(f"Source model not found: {base_model_id}", "error")
             await state.set_stage("export", StageStatus.FAILED)
             return False
 
     load_desc = "LoRA adapters" if has_lora else "model"
-
-    # Shared preamble: env vars + HF cache check
-    env_setup = '''
-import os
-os.environ["HSA_ENABLE_SDMA"] = "0"
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
-os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
-os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
-'''
-    cache_check = f'''
-from pathlib import Path as _P
-_model_id = "{model_source}"
-_is_local = _P(_model_id).exists()
-if _is_local:
-    print(f"Loading from local path: {{_model_id}}")
-else:
-    try:
-        from huggingface_hub import scan_cache_dir
-        _cached = False
-        for _repo in scan_cache_dir().repos:
-            if _repo.repo_id == _model_id:
-                _size_gb = _repo.size_on_disk / 1e9
-                print(f"Model found in HF cache ({{_size_gb:.1f}} GB) — no download needed")
-                _cached = True
-                break
-        if not _cached:
-            print(f"Model not in cache — will download from HuggingFace: {{_model_id}}")
-    except Exception:
-        print(f"Loading model: {{_model_id}}")
-'''
-
     if mq_enabled:
-        if has_lora:
-            await state.log(f"Merging {load_desc} to safetensors (MagicQuant reads them directly)", "stage")
-            save_line = f'model.save_pretrained_merged("{out}/merged_model", tokenizer, save_method="merged_16bit")'
-        else:
-            await state.log(f"Saving {load_desc} as safetensors for MagicQuant", "stage")
-            save_line = f'''
-from peft import PeftModel as _PM
-if isinstance(model, _PM):
-    model.save_pretrained_merged("{out}/merged_model", tokenizer, save_method="merged_16bit")
-else:
-    print("Base model (no LoRA) — saving directly with save_pretrained")
-    model.save_pretrained("{out}/merged_model")
-    tokenizer.save_pretrained("{out}/merged_model")
-'''
-        script = env_setup + cache_check + f'''
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
-from fast_export import streaming_merge
-streaming_merge(
-    model_id="{model_source}",
-    lora_dir="{out}/lora_adapters" if {has_lora} else None,
-    merged_dir="{out}/merged_model",
-)
-print("PIPELINE_STAGE_COMPLETE=export")
-'''
+        desc = f"Merging {load_desc} to safetensors" if has_lora else f"Saving {load_desc} as safetensors for MagicQuant"
     else:
-        await state.log(f"Exporting {load_desc} to safetensors (for GGUF conversion)", "stage")
-        script = env_setup + cache_check + f'''
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
-from fast_export import streaming_merge
-streaming_merge(
-    model_id="{model_source}",
-    lora_dir="{out}/lora_adapters" if {has_lora} else None,
-    merged_dir="{out}/merged_model",
-)
-print("PIPELINE_STAGE_COMPLETE=export")
-'''
+        desc = f"Exporting {load_desc} to safetensors (for GGUF conversion)"
+    await state.log(desc, "stage")
+
+    svc = ExportService(PIPELINE_ROOT, VENV_PYTHON)
+    script = svc.build_script(
+        base_model_id=base_model_id,
+        lora_source=lora_source,
+        has_lora=has_lora,
+        merged_dir=str(out_abs / "merged_model"),
+    )
     rc = await run_script(script, out)
     ok = rc == 0
     await state.set_stage("export", StageStatus.COMPLETE if ok else StageStatus.FAILED)
@@ -526,103 +442,40 @@ async def do_magicquant(cfg: RunRequest) -> bool:
 
     await state.set_stage("magicquant", StageStatus.RUNNING)
     await state.set_progress(0)
+
+    # Pull latest MagicQuant before running
+    mq_symlink = PIPELINE_ROOT / "MagicQuant" / "magicquant"
+    mq_repo = Path(os.path.realpath(mq_symlink)).parent if mq_symlink.is_symlink() else PIPELINE_ROOT / "MagicQuant"
+    if (mq_repo / ".git").exists():
+        import subprocess
+        result = subprocess.run(
+            ["git", "-C", str(mq_repo), "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and "Already up to date" not in result.stdout:
+            await state.log(f"MagicQuant updated: {result.stdout.strip()}", "info")
+        elif result.returncode != 0:
+            await state.log(f"MagicQuant git pull failed (using local): {result.stderr.strip()}", "warn")
+
     await state.log("Starting MagicQuant evolutionary search", "stage")
 
     tiers_json = json.dumps(mc.tiers)
-    # Derive model name from the effective source, not just the training config
     model_name = _derive_model_short_name(cfg)
     hint = mc.llamacpp_path or ""
+    mq_source_override = mc.source_model if (mc.source_model and not export_enabled) else ""
 
-    # Determine source model for MagicQuant
-    if mc.source_model and not export_enabled:
-        mq_source_override = mc.source_model
-    else:
-        mq_source_override = ""
-
-    # Improvement #4: auto-install llama.cpp
-    script = f'''
-import sys, os, subprocess, multiprocessing
-from pathlib import Path
-
-def find_llamacpp():
-    for p in ["{hint}", os.environ.get("LLAMACPP_PATH",""),
-              str(Path.home()/"llama.cpp"), "./llama.cpp", "/usr/local"]:
-        if not p: continue
-        pp = Path(p)
-        for sub in [pp/"convert_hf_to_gguf.py", pp/"build"/"bin"/"llama-perplexity"]:
-            if sub.exists(): return str(pp)
-    return None
-
-llamacpp = find_llamacpp()
-if not llamacpp:
-    install_dir = Path.home() / "llama.cpp"
-    print("llama.cpp not found — auto-installing...")
-    rc = subprocess.run(["git", "clone", "--depth", "1",
-                         "https://github.com/ggml-org/llama.cpp.git", str(install_dir)]).returncode
-    if rc == 0:
-        build_dir = install_dir / "build"
-        rc = subprocess.run(["cmake", "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release",
-                             str(install_dir)]).returncode
-        if rc == 0:
-            jobs = str(multiprocessing.cpu_count())
-            rc = subprocess.run(["cmake", "--build", str(build_dir), "-j", jobs]).returncode
-    if rc == 0:
-        llamacpp = str(install_dir)
-        print(f"llama.cpp installed: {{llamacpp}}")
-    else:
-        print("Warning: llama.cpp install failed, using heuristic probing")
-        llamacpp = None
-
-print(f"llama.cpp: {{llamacpp or 'not found (heuristic mode)'}}")
-
-from magicquant.orchestrator import MagicQuantOrchestrator
-import json
-
-# Determine source: explicit override > merged safetensors > GGUF
-override = "{mq_source_override}"
-if override:
-    source = override
-elif Path("{out}/merged_model").exists():
-    source = "{out}/merged_model"
-elif Path("{out}/model-bf16.gguf").exists():
-    source = "{out}/model-bf16.gguf"
-else:
-    print("Error: no source model found. Enable Export or set a Source Model path in MagicQuant config.")
-    sys.exit(1)
-print(f"MagicQuant source: {{source}}")
-
-orch = MagicQuantOrchestrator(
-    source_model_path=source,
-    output_dir="{out}/magicquant",
-    llamacpp_path=llamacpp,
-)
-
-print(f"Search: generations={mc.generations}, population={mc.population_size}, base={mc.target_base_quant}")
-
-best_configs, tiered = orch.run_full_search(
-    target_base_quant="{mc.target_base_quant}",
-    max_generations={mc.generations},
-    population_size={mc.population_size},
-    verbose=True,
-)
-
-if not tiered:
-    print("Error: no viable configurations found")
-    sys.exit(1)
-
-print(f"Tiers found: {{list(tiered.keys())}}")
-
-tiers = json.loads('{tiers_json}')
-paths = orch.generate_tiered_models(
-    tiered=tiered, model_name_prefix="{model_name}", tiers=tiers, verify=False,
-)
-valid = [p for p in paths if p]
-for p in valid:
-    size = os.path.getsize(p) / 1e9
-    print(f"  {{Path(p).name}} ({{size:.1f}} GB)")
-print(f"Generated {{len(valid)}} hybrid GGUF files")
-print("PIPELINE_STAGE_COMPLETE=magicquant")
-'''
+    svc = MagicQuantService(PIPELINE_ROOT, VENV_PYTHON)
+    script = svc.build_script(
+        llamacpp_hint=hint,
+        pipeline_root_str=str(PIPELINE_ROOT),
+        mq_source_override=mq_source_override,
+        out_abs_str=str(out_abs),
+        generations=mc.generations,
+        population_size=mc.population_size,
+        target_base_quant=mc.target_base_quant,
+        tiers_json=tiers_json,
+        model_name=model_name,
+    )
     rc = await run_script(script, out)
     ok = rc == 0
     await state.set_stage("magicquant", StageStatus.COMPLETE if ok else StageStatus.FAILED)
@@ -649,39 +502,31 @@ async def do_upload(cfg: RunRequest) -> bool:
         return False
 
     tc = cfg.training
+    out_abs = _resolve_out(out)
 
-    script = f'''
-import sys
-sys.path.insert(0, "core")
-from hf_upload import HFUploadConfig, upload
-
-cfg = HFUploadConfig(
-    repo_id="{uc.repo_id}",
-    private={uc.private},
-    license="{uc.license}",
-    upload_gguf={uc.upload_gguf},
-    upload_lora={uc.upload_lora},
-    upload_merged={uc.upload_merged},
-    base_model="{tc.model_name}",
-    dataset_name="{tc.dataset_path}",
-    lora_r={tc.lora_r},
-    lora_alpha={tc.lora_alpha},
-    lora_dropout={tc.lora_dropout},
-    num_epochs={tc.num_train_epochs},
-    learning_rate={tc.learning_rate},
-    max_seq_length={tc.max_seq_length},
-    batch_size={tc.per_device_train_batch_size},
-    gradient_accumulation={tc.gradient_accumulation_steps},
-    optimizer="{tc.optim}",
-    lr_scheduler="{tc.lr_scheduler_type}",
-)
-
-ok = upload(cfg, "{out}")
-if ok:
-    print("PIPELINE_STAGE_COMPLETE=upload")
-else:
-    sys.exit(1)
-'''
+    svc = UploadService(PIPELINE_ROOT, VENV_PYTHON)
+    script = svc.build_script(
+        repo_id=uc.repo_id,
+        private=uc.private,
+        license_id=uc.license,
+        upload_gguf=uc.upload_gguf,
+        upload_lora=uc.upload_lora,
+        upload_merged=uc.upload_merged,
+        upload_dataset=uc.upload_dataset,
+        base_model=tc.model_name,
+        dataset_name=tc.dataset_path,
+        lora_r=tc.lora_r,
+        lora_alpha=tc.lora_alpha,
+        lora_dropout=tc.lora_dropout,
+        num_epochs=tc.num_train_epochs,
+        learning_rate=tc.learning_rate,
+        max_seq_length=tc.max_seq_length,
+        batch_size=tc.per_device_train_batch_size,
+        gradient_accumulation=tc.gradient_accumulation_steps,
+        optimizer=tc.optim,
+        lr_scheduler=tc.lr_scheduler_type,
+        out_abs=str(out_abs),
+    )
     rc = await run_script(script, out)
     ok = rc == 0
     await state.set_stage("upload", StageStatus.COMPLETE if ok else StageStatus.FAILED)
@@ -766,12 +611,15 @@ def _derive_model_short_name(cfg: RunRequest) -> str:
 async def run_pipeline(cfg: RunRequest):
     """Execute enabled pipeline stages in order: training, export, magicquant, upload."""
     state.running = True
+    state.current_stage = None
+    state.progress = 0
     enabled = set(cfg.enabled_stages)
 
-    # Create model-specific output subdirectory
+    # Create model-specific output subdirectory (avoid nested dirs on re-run)
     model_name = _derive_model_short_name(cfg)
     base_out = cfg.training.output_dir
-    cfg.training.output_dir = f"{base_out}/{model_name}"
+    if not base_out.rstrip("/").endswith(f"/{model_name}") and Path(base_out).name != model_name:
+        cfg.training.output_dir = f"{base_out}/{model_name}"
     out_abs = _resolve_out(cfg.training.output_dir)
     out_abs.mkdir(parents=True, exist_ok=True)
     await state.log(f"Output directory: {out_abs}", "info")
@@ -787,6 +635,9 @@ async def run_pipeline(cfg: RunRequest):
         for stage_name in ALL_STAGES:
             if stage_name not in enabled:
                 continue
+            if not state.running:
+                await state.log("Pipeline stopped by user", "warn")
+                break
             ok = await STAGE_RUNNERS[stage_name](cfg)
             if not ok:
                 await state.log(f"Pipeline stopped at {stage_name}", "error")
@@ -863,6 +714,7 @@ async def start_pipeline(cfg: RunRequest):
     """
     if state.running:
         return {"error": "Pipeline is already running"}
+    state.running = True
     for s in ALL_STAGES:
         state.stages[s] = StageStatus.PENDING
     state.progress = 0
@@ -872,10 +724,15 @@ async def start_pipeline(cfg: RunRequest):
 
 @app.post("/api/stop")
 async def stop_pipeline():
-    """Request a graceful pipeline stop. Sets the running flag to False."""
+    """Request a graceful pipeline stop. Kills active subprocess and sets running flag to False."""
     if not state.running:
         return {"error": "Pipeline is not running"}
     state.running = False
+    if state.active_proc and state.active_proc.returncode is None:
+        try:
+            os.killpg(os.getpgid(state.active_proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
     await state.log("Stop requested by user", "warn")
     await state.broadcast({"type": "pipeline_done"})
     return {"status": "stopping"}
@@ -895,12 +752,12 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         while True:
             await ws.receive_text()
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, ConnectionResetError, RuntimeError, Exception):
         if ws in state.ws_clients:
             state.ws_clients.remove(ws)
 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PIPELINE_UI_PORT", 7865))
+    port = int(os.environ.get("PIPELINE_UI_PORT", pipeline_settings.ui_port))
     uvicorn.run(app, host="0.0.0.0", port=port)

@@ -8,7 +8,7 @@ ZeroClaw's XmlToolDispatcher format:
   - Tool results: [Tool results]\n<tool_result name="..." status="ok">...</tool_result>
   - Think tags:   <think>...</think> (optional, for reasoning models)
 
-Output: JSONL with {"messages": [...]} per line, ready for Unsloth SFTTrainer.
+Output: JSONL with {"messages": [...]} per line, ready for SFTTrainer.
 """
 
 import json
@@ -18,6 +18,23 @@ from pathlib import Path
 from zeroclaw_tools import TOOLS, format_tools_for_system_prompt
 from scenarios import SCENARIOS
 from scenarios_extended import SCENARIOS_EXTENDED
+
+try:
+    from scenarios_generated import SCENARIOS_GENERATED
+except (ImportError, NameError):
+    # Fall back to loading as JSON (handles null/true/false from LLM output)
+    from pathlib import Path as _Path
+    _gen_path = _Path(__file__).parent / "scenarios_generated.py"
+    SCENARIOS_GENERATED = []
+    if _gen_path.exists():
+        import re as _re
+        _text = _gen_path.read_text()
+        _match = _re.search(r'SCENARIOS_GENERATED\s*=\s*(\[.*)', _text, _re.DOTALL)
+        if _match:
+            try:
+                SCENARIOS_GENERATED = json.loads(_match.group(1))
+            except Exception:
+                pass
 
 
 def build_system_prompt() -> str:
@@ -65,8 +82,8 @@ Host: dev-workstation | OS: linux | Model: local/omnicoder-9b"""
 
 def format_tool_call(name: str, arguments: dict) -> str:
     """Format a tool call in ZeroClaw XML format."""
-    args_json = json.dumps(arguments, ensure_ascii=False)
-    return f'<tool_call>\n{{"name": "{name}", "arguments": {args_json}}}\n</tool_call>'
+    call_obj = json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False)
+    return f'<tool_call>\n{call_obj}\n</tool_call>'
 
 
 def format_tool_result(name: str, output: str, status: str = "ok") -> str:
@@ -74,13 +91,24 @@ def format_tool_result(name: str, output: str, status: str = "ok") -> str:
     return f'[Tool results]\n<tool_result name="{name}" status="{status}">\n{output}\n</tool_result>'
 
 
+def _to_str(val) -> str:
+    """Coerce a value to string — handles lists/dicts from LLM output."""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        return "\n".join(_to_str(v) for v in val)
+    if isinstance(val, dict):
+        return json.dumps(val, ensure_ascii=False)
+    return str(val) if val is not None else ""
+
+
 def scenario_to_messages(scenario: dict, system_prompt: str) -> list[dict]:
     """Convert a scenario into a list of chat messages."""
     messages = [{"role": "system", "content": system_prompt}]
-    messages.append({"role": "user", "content": scenario["user"]})
+    messages.append({"role": "user", "content": _to_str(scenario["user"])})
 
     turns = scenario.get("turns", [])
-    final = scenario["final"]
+    final = _to_str(scenario["final"])
     think = scenario.get("think")
 
     if not turns:
@@ -99,7 +127,7 @@ def scenario_to_messages(scenario: dict, system_prompt: str) -> list[dict]:
         tool_name = turn["tool"]
         tool_args = turn["args"]
         status = turn.get("status", "ok")
-        result = turn["result"]
+        result = _to_str(turn["result"])
 
         # Build assistant message with tool call
         assistant_content = ""
@@ -127,7 +155,26 @@ def generate_dataset(output_path: str = "zeroclaw_training_data.jsonl"):
     """Generate the full training dataset."""
     system_prompt = build_system_prompt()
 
-    all_scenarios = SCENARIOS + SCENARIOS_EXTENDED
+    all_raw = SCENARIOS + SCENARIOS_EXTENDED + SCENARIOS_GENERATED
+
+    # Filter out invalid scenarios (empty user, missing turns, non-string results)
+    all_scenarios = []
+    skipped = 0
+    for s in all_raw:
+        if not str(s.get("user", "")).strip() or not str(s.get("final", "")).strip():
+            skipped += 1
+            continue
+        bad_turn = False
+        for t in s.get("turns", []):
+            if not isinstance(t.get("result"), str) or not isinstance(t.get("args"), dict):
+                bad_turn = True
+                break
+        if bad_turn:
+            skipped += 1
+            continue
+        all_scenarios.append(s)
+    if skipped:
+        print(f"Filtered out {skipped} invalid scenarios")
 
     examples = []
     for scenario in all_scenarios:

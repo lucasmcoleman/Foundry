@@ -15,6 +15,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+import requests
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
 LogFn = Callable[[str, str], None]
 
 
@@ -36,6 +44,7 @@ class HFUploadConfig:
     upload_gguf: bool = True
     upload_lora: bool = False
     upload_merged: bool = False
+    upload_dataset: bool = True
 
     # Model metadata (for the model card)
     base_model: str = ""
@@ -104,6 +113,7 @@ def discover_upload_files(
 def generate_model_card(
     cfg: HFUploadConfig,
     files_to_upload: list[tuple[Path, str]],
+    dataset_repo_id: str = "",
 ) -> str:
     """Generate a complete model card with YAML front matter.
 
@@ -161,11 +171,29 @@ def generate_model_card(
     tags = ["gguf", "quantized", "fine-tuned", "magicquant", "qlora"]
     tags_yaml = "\n".join(f"  - {t}" for t in tags)
 
+    # Determine quantization types from GGUF filenames for metadata
+    quant_types = set()
+    for local_path, repo_path in files_to_upload:
+        name = repo_path.lower()
+        if name.endswith(".gguf"):
+            for qt in ["q3", "q4", "q5", "q6", "q8", "mxfp4", "iq4", "bf16", "f16"]:
+                if qt in name:
+                    quant_types.add(qt.upper())
+
+    # If training was done (non-zero epochs, has LoRA config), it's a fine-tune.
+    # If only quantization was done, it's a quantized version.
+    is_finetune = cfg.num_epochs > 0 and cfg.lora_r > 0
+    base_model_relation = "finetune" if is_finetune else "quantized"
+
     yaml_block = f"""---
 license: {cfg.license}
 library_name: llama.cpp
-base_model: {base_model}
+base_model:
+  - {base_model}
+base_model_relation: {base_model_relation}
+{"datasets:" + chr(10) + "  - " + dataset_repo_id if dataset_repo_id else ""}
 pipeline_tag: text-generation
+quantized_by: MagicQuant
 language:
   - en
 tags:
@@ -204,7 +232,8 @@ The base model's license applies to this derivative.
 
 ## Quantization Method
 
-Quantized using **MagicQuant** hybrid evolutionary per-tensor quantization:
+Quantized using **[MagicQuant](https://github.com/lucasmcoleman/MagicQuant)** hybrid evolutionary per-tensor quantization,
+based on the methodology by **[magiccodingman](https://github.com/magiccodingman/MagicQuant-Wiki)**:
 
 - Tensors are classified into sensitivity groups (Embeddings, Head, Query, Key, Output, FFN Up/Down, MoE Experts, Router)
 - An evolutionary search finds the optimal quantization type per group, balancing size vs. perplexity
@@ -225,9 +254,9 @@ Quantized using **MagicQuant** hybrid evolutionary per-tensor quantization:
 | LR scheduler | {cfg.lr_scheduler} |
 | Batch size | {cfg.batch_size} (effective {effective_batch} with gradient accumulation) |
 | Optimizer | {cfg.optimizer} |
-| Max sequence length | {cfg.max_seq_length} |
+| Training sequence length | {cfg.max_seq_length} |
 | Precision | BF16 |
-| Dataset | {dataset_name} |
+| Dataset | {f"[{Path(dataset_name).stem}](https://huggingface.co/datasets/{dataset_repo_id})" if dataset_repo_id else dataset_name} |
 | Hardware | AMD Ryzen AI Max+ 395 (Strix Halo), 128 GB unified memory (GTT), ROCm |
 | Training pipeline | Custom fast QLoRA with shard-by-shard BnB 4-bit quantization |
 
@@ -243,19 +272,19 @@ than memorizing prompts.
 1. Download the GGUF file of your preferred quantization tier
 2. Place it in your LM Studio models directory
 3. Load the model in LM Studio -- it will auto-detect the chat template
-4. Recommended context length: {cfg.max_seq_length} tokens
+4. The model supports the base model's full context length
 
 ### llama.cpp
 
 ```bash
 # Interactive chat
-llama-cli -m {repo_name}-Q5.gguf -c {cfg.max_seq_length} --chat-template chatml -cnv
+llama-cli -m {repo_name}-Q5.gguf -c 8192 --chat-template chatml -cnv
 
 # Single prompt
-llama-cli -m {repo_name}-Q5.gguf -c {cfg.max_seq_length} -p "Your prompt here"
+llama-cli -m {repo_name}-Q5.gguf -c 8192 -p "Your prompt here"
 
 # Server mode
-llama-server -m {repo_name}-Q5.gguf -c {cfg.max_seq_length} --port 8080
+llama-server -m {repo_name}-Q5.gguf -c 8192 --port 8080
 ```
 
 ### Python (llama-cpp-python)
@@ -263,7 +292,7 @@ llama-server -m {repo_name}-Q5.gguf -c {cfg.max_seq_length} --port 8080
 ```python
 from llama_cpp import Llama
 
-llm = Llama(model_path="./{repo_name}-Q5.gguf", n_ctx={cfg.max_seq_length})
+llm = Llama(model_path="./{repo_name}-Q5.gguf", n_ctx=8192)
 output = llm.create_chat_completion(
     messages=[
         {{"role": "user", "content": "Hello, how are you?"}}
@@ -283,7 +312,7 @@ print(output["choices"][0]["message"]["content"])
 
 ## Limitations
 
-- Context length is limited to {cfg.max_seq_length} tokens (as trained)
+- Training data used sequences up to {cfg.max_seq_length} tokens; the model retains the base model's full context window
 - Performance on tasks not represented in the training data may be degraded
 - Quantized models may exhibit subtle differences from the full-precision fine-tune
 - This model inherits any limitations and biases present in the base model
@@ -292,6 +321,39 @@ print(output["choices"][0]["message"]["content"])
 *Generated with the MagicQuant Pipeline*
 """
     return card
+
+
+# ── Retry wrappers ──────────────────────────────────────────────────────────
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=2, max=30),
+    retry=retry_if_exception_type(requests.exceptions.RequestException),
+)
+def _create_repo_with_retry(api, **kwargs):
+    """Create or verify a HuggingFace repo with automatic retry on transient failures."""
+    return api.create_repo(**kwargs)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=2, max=30),
+    retry=retry_if_exception_type(requests.exceptions.RequestException),
+)
+def _upload_with_retry(api, **kwargs):
+    """Upload a single file to HuggingFace with automatic retry on transient failures."""
+    return api.upload_file(**kwargs)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=2, max=30),
+    retry=retry_if_exception_type(requests.exceptions.RequestException),
+)
+def _whoami_with_retry(api):
+    """Validate HuggingFace token with automatic retry on transient failures."""
+    return api.whoami()
 
 
 # ── Dry-run mode ─────────────────────────────────────────────────────────────
@@ -353,7 +415,7 @@ def dry_run(
 
     api = HfApi(token=hf_token)
     try:
-        user_info = api.whoami()
+        user_info = _whoami_with_retry(api)
         report.token_valid = True
         report.token_username = user_info.get("name", user_info.get("fullname", "unknown"))
         log(f"  Authenticated as: {report.token_username}")
@@ -482,7 +544,7 @@ def upload(
 
     # Validate credentials
     try:
-        user_info = api.whoami()
+        user_info = _whoami_with_retry(api)
         username = user_info.get("name", "unknown")
         log(f"Authenticated as: {username}")
     except Exception as e:
@@ -492,7 +554,8 @@ def upload(
     # Create/verify repo
     log(f"Creating/verifying repo: {cfg.repo_id}", "stage")
     try:
-        api.create_repo(
+        _create_repo_with_retry(
+            api,
             repo_id=cfg.repo_id,
             repo_type="model",
             private=cfg.private,
@@ -515,12 +578,57 @@ def upload(
         log("No files found to upload", "warn")
         return False
 
+    # Upload dataset as a separate HF dataset repo if configured (before model card so we can link it)
+    dataset_repo_id = ""
+    if cfg.upload_dataset and cfg.dataset_name:
+        ds_path = Path(cfg.dataset_name)
+        if not ds_path.is_absolute():
+            ds_path = Path(output_dir).parent / cfg.dataset_name
+            if not ds_path.exists():
+                ds_path = Path(output_dir) / cfg.dataset_name
+        if ds_path.exists() and ds_path.is_file():
+            # Derive dataset repo name from model repo: "user/model-GGUF" -> "user/model-training-data"
+            namespace = cfg.repo_id.split("/")[0] if "/" in cfg.repo_id else username
+            model_short = cfg.repo_id.split("/")[-1] if "/" in cfg.repo_id else cfg.repo_id
+            # Strip common suffixes to get a clean base name
+            for suffix in ["-GGUF", "-MagicQuant-GGUF", "-gguf"]:
+                if model_short.endswith(suffix):
+                    model_short = model_short[:-len(suffix)]
+                    break
+            dataset_repo_id = f"{namespace}/{model_short}-training-data"
+
+            log(f"Uploading dataset to {dataset_repo_id}", "stage")
+            try:
+                _create_repo_with_retry(
+                    api,
+                    repo_id=dataset_repo_id,
+                    repo_type="dataset",
+                    private=cfg.private,
+                    exist_ok=True,
+                )
+                _upload_with_retry(
+                    api,
+                    path_or_fileobj=str(ds_path),
+                    path_in_repo=ds_path.name,
+                    repo_id=dataset_repo_id,
+                    repo_type="dataset",
+                    commit_message=f"Upload training data ({ds_path.name})",
+                )
+                log(f"  Dataset uploaded to https://huggingface.co/datasets/{dataset_repo_id}", "success")
+            except Exception as e:
+                log(f"  Dataset upload failed (continuing): {e}", "warn")
+                dataset_repo_id = ""
+
+        # Remove dataset from the model file list — it goes to its own repo
+        files_to_upload = [(p, r) for p, r in files_to_upload
+                           if not r.startswith("training_data/")]
+
     total_size = sum(f.stat().st_size for f, _ in files_to_upload) / 1e9
     log(f"Found {len(files_to_upload)} files ({total_size:.2f} GB total)")
 
-    # Generate and upload model card
+    # Generate and upload model card (after dataset upload so we have the repo ID to link)
     log("Generating model card", "stage")
-    card_content = generate_model_card(cfg, files_to_upload)
+    card_content = generate_model_card(cfg, files_to_upload, dataset_repo_id=dataset_repo_id)
     try:
         card = ModelCard(card_content)
         card.push_to_hub(cfg.repo_id, token=hf_token)
@@ -535,7 +643,8 @@ def upload(
         log(f"  [{i}/{len(files_to_upload)}] {repo_path} ({size_gb:.2f} GB)")
 
         try:
-            api.upload_file(
+            _upload_with_retry(
+                api,
                 path_or_fileobj=str(local_path),
                 path_in_repo=repo_path,
                 repo_id=cfg.repo_id,

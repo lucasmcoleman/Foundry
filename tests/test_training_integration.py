@@ -120,8 +120,7 @@ def test_training_one_epoch(model, tokenizer):
     """Test that 1 epoch of training completes and saves a checkpoint."""
     print("\n=== Test 4: Training (1 epoch) ===")
     from datasets import load_dataset
-    from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
-    from fast_train_zeroclaw import detect_response_template
+    from trl import SFTTrainer, SFTConfig
 
     # Load dataset.
     dataset = load_dataset("json", data_files=DATASET_PATH, split="train")
@@ -133,14 +132,6 @@ def test_training_one_epoch(model, tokenizer):
         )
         return ex
     dataset = dataset.map(fmt)
-
-    # Set up completion-only loss masking.
-    response_template = detect_response_template(tokenizer)
-    response_ids = tokenizer.encode(response_template, add_special_tokens=False)
-    collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_ids,
-        tokenizer=tokenizer,
-    )
 
     training_args = SFTConfig(
         output_dir=TEST_OUTPUT_DIR,
@@ -162,15 +153,15 @@ def test_training_one_epoch(model, tokenizer):
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to="none",
         dataset_text_field="text",
+        max_length=4096,
+        completion_only_loss=True,
     )
-    tokenizer.model_max_length = 4096
 
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
         args=training_args,
-        data_collator=collator,
     )
 
     stats = trainer.train()
