@@ -896,7 +896,8 @@ function toggleAutoScroll() {
 async function runPipeline() {
   if (S.running) return;
   dismissStatus();
-  const enabled = Array.from(S.enabledStages);
+  const stageOrder = ['training', 'export', 'heretic', 'magicquant', 'upload'];
+  const enabled = stageOrder.filter(s => S.enabledStages.has(s));
   if (enabled.length === 0) {
     showStatus('Enable at least one stage before running.', 'error');
     appendLog('Enable at least one stage.', 'error');
