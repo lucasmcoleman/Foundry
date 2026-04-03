@@ -5,8 +5,8 @@ Fast training script for AMD APU unified memory systems.
 WHY THIS EXISTS:
 On the Strix Halo APU (gfx1151), CPU and GPU share 128 GB of system RAM via GTT.
 The default transformers from_pretrained() path loads tensors one at a time through
-Python's GIL, taking hours for 40B+ models. Unsloth's memory handling made this
-worse: as GTT filled, safetensors chunking became single-threaded and crawled.
+Python's GIL, taking hours for 40B+ models. Third-party loaders (e.g. Unsloth)
+made this worse: as GTT filled, safetensors chunking became single-threaded and crawled.
 
 This script bypasses both by:
 1. Creating model skeleton on meta device (instant, zero memory)
@@ -33,34 +33,23 @@ import time
 #   for better performance on RDNA/CDNA architectures.
 os.environ["HSA_ENABLE_SDMA"] = "0"
 os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
-os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
 import torch
 from pathlib import Path
 
-MODEL_ID = "DavidAU/Qwen3.5-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking"
-DATASET_PATH = "data/zeroclaw_training_data.jsonl"
-OUTPUT_DIR = "./output"
-HF_REPO = "lmcoleman/Qwen3.5-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-Zeroclaw-GGUF"
 
-# LoRA config
-LORA_R = 32
-LORA_ALPHA = 64
-LORA_DROPOUT = 0.05
-TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-
-# Training config
-NUM_EPOCHS = 3
-BATCH_SIZE = 1
-GRAD_ACCUM = 8
-LEARNING_RATE = 2e-4
-MAX_SEQ_LENGTH = 4096
-
-DEVICE = torch.device("cuda:0")
+def get_device() -> torch.device:
+    """Detect the best available device at runtime."""
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    return torch.device("cpu")
 
 
-def fast_load_quantized_model(model_id: str = MODEL_ID):
+DEVICE = get_device()
+
+
+def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
     """Load model with shard-by-shard 4-bit quantization on GPU.
 
     This is dramatically faster than transformers' default from_pretrained() on
@@ -88,10 +77,20 @@ def fast_load_quantized_model(model_id: str = MODEL_ID):
     print(f"Model path: {model_path}")
 
     # Load the safetensors index to know which tensors live in which shard file.
+    # Multi-shard models have an index.json; single-shard models have a single
+    # model.safetensors file with no index.
     idx_path = os.path.join(model_path, "model.safetensors.index.json")
-    with open(idx_path) as f:
-        idx = json.load(f)
-    weight_map = idx["weight_map"]
+    single_path = os.path.join(model_path, "model.safetensors")
+    if os.path.exists(idx_path):
+        with open(idx_path) as f:
+            idx = json.load(f)
+        weight_map = idx["weight_map"]
+    elif os.path.exists(single_path):
+        from safetensors import safe_open
+        with safe_open(single_path, framework="pt") as f:
+            weight_map = {k: "model.safetensors" for k in f.keys()}
+    else:
+        raise FileNotFoundError(f"No safetensors files found in {model_path}")
 
     # Group tensors by shard so we can load one shard file at a time.
     shards = {}
@@ -159,50 +158,100 @@ def fast_load_quantized_model(model_id: str = MODEL_ID):
         # than loading tensor-by-tensor through safetensors' Python interface.
         shard_data = load_file(shard_path, device="cpu")
 
-        for name in tensor_names:
-            # Navigate the module tree to find the target parameter.
-            parts = name.split(".")
-            target = model
-            for part in parts[:-1]:
-                target = getattr(target, part)
-            attr = parts[-1]
+        try:
+            for name in tensor_names:
+                # Navigate the module tree to find the target parameter.
+                parts = name.split(".")
+                target = model
+                for part in parts[:-1]:
+                    target = getattr(target, part)
+                attr = parts[-1]
 
-            tensor = shard_data[name]
+                tensor = shard_data[name]
 
-            if isinstance(target, bnb.nn.Linear4bit) and attr == "weight":
-                # Quantize to NF4 on GPU. The .to(DEVICE) transfer and Params4bit
-                # quantization both happen on GPU, utilizing all available CUs.
-                tensor_gpu = tensor.to(DEVICE, dtype=compute_dtype)
-                target.weight = bnb.nn.Params4bit(
-                    tensor_gpu.contiguous(),
-                    requires_grad=False,
-                    quant_type=quant_type,
-                    blocksize=blocksize,
-                    compress_statistics=True,
-                ).to(DEVICE)
-                del tensor_gpu
-            else:
-                # Non-quantized tensors: embeddings, layer norms, biases.
-                # These stay in bfloat16 (or their native dtype if non-float).
-                dtype = compute_dtype if tensor.is_floating_point() else tensor.dtype
-                new_param = torch.nn.Parameter(tensor.to(DEVICE, dtype=dtype), requires_grad=False)
-                setattr(target, attr, new_param)
+                if isinstance(target, bnb.nn.Linear4bit) and attr == "weight":
+                    # Quantize to NF4 on GPU. The .to(DEVICE) transfer and Params4bit
+                    # quantization both happen on GPU, utilizing all available CUs.
+                    tensor_gpu = tensor.to(DEVICE, dtype=compute_dtype)
+                    target.weight = bnb.nn.Params4bit(
+                        tensor_gpu.contiguous(),
+                        requires_grad=False,
+                        quant_type=quant_type,
+                        blocksize=blocksize,
+                        compress_statistics=True,
+                    ).to(DEVICE)
+                    del tensor_gpu
+                else:
+                    # Non-quantized tensors: embeddings, layer norms, biases.
+                    # These stay in bfloat16 (or their native dtype if non-float).
+                    dtype = compute_dtype if tensor.is_floating_point() else tensor.dtype
+                    new_param = torch.nn.Parameter(tensor.to(DEVICE, dtype=dtype), requires_grad=False)
+                    setattr(target, attr, new_param)
 
-            del tensor
-            loaded += 1
-
-        # Free this shard's CPU buffer before loading the next one.
-        del shard_data
-        gc.collect()
-        torch.cuda.empty_cache()
+                del tensor
+                loaded += 1
+        finally:
+            # Free this shard's CPU buffer before loading the next one.
+            del shard_data
+            gc.collect()
+            torch.cuda.empty_cache()
 
         elapsed = time.time() - t0
         total_elapsed = time.time() - total_t0
         print(f"  Done in {elapsed:.1f}s | Progress: {loaded}/{total} ({100*loaded/total:.0f}%) | Total: {total_elapsed:.0f}s")
 
+    # Handle tied weights (e.g. lm_head.weight = embed_tokens.weight) and any
+    # other parameters still on meta device after shard loading.
+    meta_params = [(n, p) for n, p in model.named_parameters() if p.device.type == "meta"]
+    if meta_params:
+        print(f"Materializing {len(meta_params)} tied/missing parameters...")
+        for name, param in meta_params:
+            # Check if this is a tied weight by looking for the source
+            parts = name.split(".")
+            if parts[-1] == "weight" and "lm_head" in name:
+                # Tie lm_head to embed_tokens
+                embed = model.model.embed_tokens.weight
+                if embed.device.type != "meta":
+                    model.lm_head.weight = embed
+                    print(f"  Tied {name} -> model.embed_tokens.weight")
+                    continue
+            # Fallback: materialize as zeros on GPU
+            dtype = compute_dtype if param.is_floating_point() else param.dtype
+            new_param = torch.nn.Parameter(
+                torch.zeros(param.shape, device=DEVICE, dtype=dtype),
+                requires_grad=False,
+            )
+            # Navigate to parent and set
+            target = model
+            for p in parts[:-1]:
+                target = getattr(target, p)
+            setattr(target, parts[-1], new_param)
+            print(f"  Materialized {name} as zeros on {DEVICE}")
+
+    # Also handle any meta buffers
+    meta_bufs = [(n, b) for n, b in model.named_buffers() if b.device.type == "meta"]
+    for name, buf in meta_bufs:
+        parts = name.split(".")
+        target = model
+        for p in parts[:-1]:
+            target = getattr(target, p)
+        new_buf = torch.zeros(buf.shape, device=DEVICE, dtype=buf.dtype)
+        setattr(target, parts[-1], new_buf)
+        print(f"  Materialized buffer {name} on {DEVICE}")
+
     total_time = time.time() - total_t0
     gpu_mb = torch.cuda.memory_allocated() / 1e6
     print(f"\nModel loaded in {total_time:.0f}s | GPU allocated: {gpu_mb:.0f} MB")
+
+    # Tell HF Trainer + Accelerate the model is already on the correct device.
+    # quantization_method = "bitsandbytes" makes Trainer skip its .to(device).
+    # hf_device_map with >1 entry makes Accelerate's verify_device_map() return
+    # True, which skips Accelerate's .to(device) in prepare_model().
+    # is_quantized must stay False to avoid validate_quantization_for_training()
+    # trying to access model.hf_quantizer (which doesn't exist for manual BnB).
+    model.quantization_method = "bitsandbytes"
+    model.is_quantized = False
+    model.hf_device_map = {"": 0, "_dummy": 0}  # >1 entry triggers skip
 
     return model, tokenizer
 
@@ -270,31 +319,46 @@ def find_latest_checkpoint(output_dir: str):
     return None
 
 
-def main():
+def main(
+    model_id: str = "Tesslate/OmniCoder-9B",
+    dataset_path: str = "data/zeroclaw_training_data.jsonl",
+    output_dir: str = "./output",
+    lora_r: int = 32,
+    lora_alpha: int = 64,
+    lora_dropout: float = 0.05,
+    num_epochs: int = 3,
+    batch_size: int = 1,
+    grad_accum: int = 8,
+    learning_rate: float = 2e-4,
+    max_seq_length: int = 4096,
+) -> None:
+    """Run fast QLoRA training end-to-end as a standalone script."""
+    target_modules = [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ]
+
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     # ── Stage 1: Fast model loading ──
-    # Uses shard-by-shard quantization instead of transformers' default.
-    model, tokenizer = fast_load_quantized_model()
+    model, tokenizer = fast_load_quantized_model(model_id)
 
     import psutil
     rss = psutil.Process(os.getpid()).memory_info().rss / 1e9
     print(f"Process RSS: {rss:.1f} GB")
 
     # ── Stage 2: Attach LoRA adapters ──
-    # prepare_model_for_kbit_training freezes base weights and enables gradient
-    # checkpointing so only LoRA parameters consume gradient memory.
     print("\nAttaching LoRA adapters...")
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
     lora_config = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
-        target_modules=TARGET_MODULES,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=target_modules,
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -305,13 +369,12 @@ def main():
     print(f"Trainable: {trainable:,} / {total_params:,} ({100*trainable/total_params:.2f}%)")
 
     # ── Stage 3: Load and format dataset ──
-    print(f"\nLoading dataset: {DATASET_PATH}")
+    print(f"\nLoading dataset: {dataset_path}")
     from datasets import load_dataset
 
-    dataset = load_dataset("json", data_files=DATASET_PATH, split="train")
+    dataset = load_dataset("json", data_files=dataset_path, split="train")
     print(f"Dataset: {len(dataset)} examples")
 
-    # Apply the model's chat template to format messages into a single text string.
     def fmt(ex):
         ex["text"] = tokenizer.apply_chat_template(
             ex["messages"], tokenize=False, add_generation_prompt=False,
@@ -320,27 +383,14 @@ def main():
 
     dataset = dataset.map(fmt)
 
-    # ── Stage 4: Set up completion-only loss masking ──
-    # Only the assistant's responses contribute to the loss. System prompts and
-    # user messages are masked so the model learns to generate responses, not
-    # memorize prompts. This is critical for tool-call training (ZeroClaw) where
-    # the system prompt is long and we want the model to learn the response format.
-    from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
-
-    response_template = detect_response_template(tokenizer)
-    response_ids = tokenizer.encode(response_template, add_special_tokens=False)
-    collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_ids,
-        tokenizer=tokenizer,
-    )
-
-    # ── Stage 5: Train ──
+    # ── Stage 4: Train with completion-only loss ──
+    from trl import SFTTrainer, SFTConfig
     training_args = SFTConfig(
-        output_dir=OUTPUT_DIR,
-        num_train_epochs=NUM_EPOCHS,
-        per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=LEARNING_RATE,
+        output_dir=output_dir,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=grad_accum,
+        learning_rate=learning_rate,
         lr_scheduler_type="cosine",
         warmup_ratio=0.05,
         optim="adamw_8bit",
@@ -349,38 +399,31 @@ def main():
         fp16=False,
         bf16=True,
         logging_steps=1,
-        # Save at each epoch so training can resume if interrupted.
         save_strategy="epoch",
         seed=42,
         gradient_checkpointing=True,
-        # use_reentrant=False is required for LoRA + gradient checkpointing to
-        # work correctly. The reentrant implementation doesn't handle the mixed
-        # frozen/trainable parameter graph that PEFT creates.
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to="none",
         dataset_text_field="text",
+        max_length=max_seq_length,
+        completion_only_loss=True,
     )
-    tokenizer.model_max_length = MAX_SEQ_LENGTH
 
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
         args=training_args,
-        data_collator=collator,
     )
 
-    # Resume from the latest checkpoint if one exists (e.g. after OOM or crash).
-    resume_checkpoint = find_latest_checkpoint(OUTPUT_DIR)
+    resume_checkpoint = find_latest_checkpoint(output_dir)
 
     print("\nStarting training...")
     stats = trainer.train(resume_from_checkpoint=resume_checkpoint)
     print(f"\nTraining complete! Final loss: {stats.training_loss:.4f}")
 
-    # ── Stage 6: Save LoRA adapters ──
-    # Only the LoRA adapter weights are saved (tiny compared to the full model).
-    # fast_export.py can later merge these with the base model shard-by-shard.
-    lora_dir = os.path.join(OUTPUT_DIR, "lora_adapters")
+    # ── Save LoRA adapters ──
+    lora_dir = os.path.join(output_dir, "lora_adapters")
     print(f"\nSaving LoRA adapters to {lora_dir}")
     model.save_pretrained(lora_dir)
     tokenizer.save_pretrained(lora_dir)

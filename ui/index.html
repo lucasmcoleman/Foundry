@@ -272,7 +272,7 @@ const S = {
     },
     export: { gguf_type: 'bf16', also_save_merged: false, source_model: '' },
     magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '' },
-    upload: { repo_id: '', private: true, license: 'apache-2.0', upload_gguf: true, upload_lora: false, upload_merged: false },
+    upload: { repo_id: '', private: true, license: 'apache-2.0', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
   mqTiers: ['Q3','Q4','Q5','Q6'],
   hfUsername: '',
@@ -697,6 +697,7 @@ function renderUpload() {
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_gguf" ${c.upload_gguf?'checked':''}><span class="form-label" style="margin:0">GGUF files</span></label></div>
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_lora" ${c.upload_lora?'checked':''}><span class="form-label" style="margin:0">LoRA adapters</span></label></div>
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_merged" ${c.upload_merged?'checked':''}><span class="form-label" style="margin:0">Merged model (large)</span></label></div>
+    <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_dataset" ${c.upload_dataset?'checked':''}><span class="form-label" style="margin:0">Training dataset (separate repo)</span></label></div>
   </div>
   <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-2);margin-top:16px;">Requires <code style="color:var(--amber)">HF_TOKEN</code> environment variable with write access. Set it in your shell before starting the pipeline server.</div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Upload</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>

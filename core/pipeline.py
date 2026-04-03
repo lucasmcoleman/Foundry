@@ -1,8 +1,8 @@
 """
 Unified pipeline: Training → Export → MagicQuant → HF Upload.
 
-Uses custom fast loaders instead of Unsloth to avoid single-threaded
-safetensors chunking that stalls on AMD APU unified memory (128 GB GTT).
+Uses custom fast loaders to avoid single-threaded safetensors chunking
+that stalls on AMD APU unified memory (128 GB GTT).
 
 Key design decisions:
   - Training uses shard-by-shard BnB 4-bit quantization on GPU (fast_train_zeroclaw.py)
@@ -32,7 +32,7 @@ class TrainingConfig:
     lora_r: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
-    use_rslora: bool = True  # Unused by fast loader (Unsloth-specific), kept for config compat
+    use_rslora: bool = True  # Unused by fast loader, kept for config compat
     num_train_epochs: int = 3
     per_device_train_batch_size: int = 2
     gradient_accumulation_steps: int = 4
@@ -118,7 +118,6 @@ def _run(cmd: list[str], log: LogFn, env_extra: dict = None, cwd: str = None) ->
     env.update({
         "HSA_ENABLE_SDMA": "0",
         "PYTORCH_HIP_ALLOC_CONF": "backend:native,expandable_segments:True",
-        "UNSLOTH_SKIP_TORCHVISION_CHECK": "1",
         "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
         "PYTHONUNBUFFERED": "1",
     })
@@ -283,18 +282,16 @@ def ensure_llamacpp(hint: Optional[str], log: LogFn) -> Optional[Path]:
 
 # ── Stage: Training (with completion-only loss) ─────────────────────────────
 #
-# Uses the custom fast loader (fast_train_zeroclaw.py) instead of Unsloth.
-# The fast loader creates the model on meta device, loads safetensors
-# shard-by-shard with inline BnB 4-bit quantization, and uses PEFT LoRA
-# directly. This avoids Unsloth's single-threaded safetensors chunking
-# that crawls to a halt on unified memory as GTT fills.
+# Uses the custom fast loader (fast_train_zeroclaw.py) which creates the model
+# on meta device, loads safetensors shard-by-shard with inline BnB 4-bit
+# quantization, and uses PEFT LoRA directly. This avoids single-threaded
+# safetensors chunking that crawls to a halt on unified memory as GTT fills.
 
 def stage_training(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
     """Run QLoRA training with completion-only loss using the custom fast loader.
 
-    Uses fast_train_zeroclaw.py's shard-by-shard loading instead of Unsloth's
-    FastLanguageModel, which causes single-threaded sequential safetensors
-    chunking on AMD APU unified memory.
+    Uses fast_train_zeroclaw.py's shard-by-shard loading to avoid
+    single-threaded sequential safetensors chunking on AMD APU unified memory.
     """
     # Validate dataset before committing GPU time.
     if not validate_dataset(config.training.dataset_path, log):
@@ -309,20 +306,19 @@ def stage_training(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> 
 import os, re, gc, json, time
 os.environ["HSA_ENABLE_SDMA"] = "0"
 os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
-os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
 import torch
 from pathlib import Path
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
+from trl import SFTTrainer, SFTConfig
 
 # ── Fast model loading (shard-by-shard with inline BnB quantization) ──
-# Import and call the fast loader directly instead of Unsloth.
+# Import and call the fast loader directly.
 import sys
 sys.path.insert(0, str(Path("{Path.cwd()}") / "core"))
-from fast_train_zeroclaw import fast_load_quantized_model, detect_response_template, find_latest_checkpoint
+from fast_train_zeroclaw import fast_load_quantized_model, find_latest_checkpoint
 
 DEVICE = torch.device("cuda:0")
 model, tokenizer = fast_load_quantized_model("{tc.model_name}")
@@ -351,16 +347,8 @@ def fmt(ex):
     return ex
 dataset = dataset.map(fmt)
 
-# ── Completion-only loss masking ──
+# ── Training with completion-only loss ──
 # Only assistant turns contribute to the loss. System/user turns are masked.
-response_template = detect_response_template(tokenizer)
-response_ids = tokenizer.encode(response_template, add_special_tokens=False)
-collator = DataCollatorForCompletionOnlyLM(
-    response_template=response_ids,
-    tokenizer=tokenizer,
-)
-
-# ── Training ──
 training_args = SFTConfig(
     output_dir="{config.output_dir}",
     num_train_epochs={tc.num_train_epochs},
@@ -376,16 +364,14 @@ training_args = SFTConfig(
     gradient_checkpointing=True,
     gradient_checkpointing_kwargs={{"use_reentrant": False}},
     report_to="none",
-    max_seq_length={tc.max_seq_length},
+    max_length={tc.max_seq_length},
     dataset_text_field="text",
+    completion_only_loss=True,
 )
-
-tokenizer.model_max_length = {tc.max_seq_length}
 
 trainer = SFTTrainer(
     model=model, processing_class=tokenizer, train_dataset=dataset,
     args=training_args,
-    data_collator=collator,
 )
 
 # Resume from checkpoint if one exists (e.g. after crash or OOM).
@@ -418,7 +404,7 @@ print("PIPELINE_STAGE_COMPLETE=training")
 
 # ── Stage: Export (streaming LoRA merge) ──────────────────────────────────────
 #
-# Uses fast_export.py's streaming shard-by-shard merge instead of Unsloth's
+# Uses fast_export.py's streaming shard-by-shard merge instead of standard
 # save_pretrained_merged(), which loads the entire model into memory (~80 GB
 # for a 40B model). The streaming merge peaks at ~6 GB.
 
@@ -426,7 +412,7 @@ def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bo
     """Merge LoRA adapters into base model using streaming shard-by-shard merge.
 
     Always produces safetensors output (MagicQuant or llama.cpp handles GGUF).
-    Uses fast_export.py instead of Unsloth to avoid loading the full model.
+    Uses fast_export.py's streaming merge to avoid loading the full model.
     """
     ec = config.export
 
@@ -449,6 +435,7 @@ def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bo
     # Generate an export script that uses the custom fast merge.
     script = f'''
 import os, sys
+from pathlib import Path
 os.environ["HSA_ENABLE_SDMA"] = "0"
 os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"

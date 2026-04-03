@@ -3,7 +3,7 @@
 Fast LoRA merge + export for AMD APU unified memory systems.
 
 WHY THIS EXISTS:
-Unsloth's save_pretrained_merged() loads the entire model into memory to merge
+Standard save_pretrained_merged() loads the entire model into memory to merge
 LoRA weights — 80+ GB for a 40B model. On the Strix Halo APU this exhausts the
 shared 128 GB GTT pool and forces swapping to disk.
 
@@ -26,14 +26,20 @@ import torch
 from pathlib import Path
 from safetensors.torch import load_file, save_file
 
-MODEL_ID = "DavidAU/Qwen3.5-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking"
-LORA_DIR = "./output-zeroclaw-qwen40b/lora_adapters"
-MERGED_DIR = "./output-zeroclaw-qwen40b/merged_model"
 
-# Use GPU for LoRA merge math (matmul B @ A). On unified memory this is
-# effectively free since the tensors are in the same physical RAM, but the
-# GPU can parallelize the matmul across all compute units.
-DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+def get_device() -> torch.device:
+    """Detect the best available device at runtime.
+
+    Uses GPU for LoRA merge math (matmul B @ A). On unified memory this is
+    effectively free since the tensors are in the same physical RAM, but the
+    GPU can parallelize the matmul across all compute units.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
+DEVICE = get_device()
 
 
 def load_lora_weights(lora_dir: str):
@@ -47,10 +53,17 @@ def load_lora_weights(lora_dir: str):
     with open(config_path) as f:
         lora_config = json.load(f)
 
-    weights_path = os.path.join(lora_dir, "adapter_model.safetensors")
+    # PEFT can save adapter weights as either safetensors or .bin (PyTorch).
+    safetensors_path = os.path.join(lora_dir, "adapter_model.safetensors")
+    bin_path = os.path.join(lora_dir, "adapter_model.bin")
     # Load directly to GPU — LoRA weights are small and we need them for
     # every shard that contains a target module.
-    lora_weights = load_file(weights_path, device=str(DEVICE))
+    if os.path.exists(safetensors_path):
+        lora_weights = load_file(safetensors_path, device=str(DEVICE))
+    elif os.path.exists(bin_path):
+        lora_weights = torch.load(bin_path, map_location=DEVICE, weights_only=True)
+    else:
+        raise FileNotFoundError(f"No adapter weights found in {lora_dir}")
 
     print(f"LoRA config: r={lora_config['r']}, alpha={lora_config['lora_alpha']}")
     print(f"Target modules: {lora_config['target_modules']}")
@@ -97,8 +110,11 @@ def build_lora_map(lora_config, lora_weights):
     return lora_map
 
 
-def streaming_merge(model_id: str = MODEL_ID, lora_dir: str = LORA_DIR,
-                    merged_dir: str = MERGED_DIR):
+def streaming_merge(
+    model_id: str = "Tesslate/OmniCoder-9B",
+    lora_dir: str = "./output/lora_adapters",
+    merged_dir: str = "./output/merged_model",
+) -> None:
     """Merge LoRA adapters into base model shard-by-shard.
 
     For each shard:
@@ -109,20 +125,39 @@ def streaming_merge(model_id: str = MODEL_ID, lora_dir: str = LORA_DIR,
     4. Free the shard before loading the next
 
     This keeps peak memory to ~6 GB (one shard + LoRA weights).
+
+    If lora_dir is None, copies the base model shards without merging (useful
+    when exporting a base model without LoRA adapters).
     """
     from huggingface_hub import snapshot_download
 
-    print(f"Loading LoRA from {lora_dir}")
-    lora_config, lora_weights = load_lora_weights(lora_dir)
-    lora_map = build_lora_map(lora_config, lora_weights)
+    if lora_dir is not None:
+        print(f"Loading LoRA from {lora_dir}")
+        lora_config, lora_weights = load_lora_weights(lora_dir)
+        lora_map = build_lora_map(lora_config, lora_weights)
+    else:
+        print("No LoRA adapters — copying base model shards directly")
+        lora_map = {}
 
     print(f"\nEnsuring base model cached: {model_id}")
     model_path = snapshot_download(model_id)
 
+    # Multi-shard models have an index.json; single-shard models have a single
+    # model.safetensors file with no index.
     idx_path = os.path.join(model_path, "model.safetensors.index.json")
-    with open(idx_path) as f:
-        idx = json.load(f)
-    weight_map = idx["weight_map"]
+    single_path = os.path.join(model_path, "model.safetensors")
+    idx_metadata = {}
+    if os.path.exists(idx_path):
+        with open(idx_path) as f:
+            idx = json.load(f)
+        weight_map = idx["weight_map"]
+        idx_metadata = idx.get("metadata", {})
+    elif os.path.exists(single_path):
+        from safetensors import safe_open
+        with safe_open(single_path, framework="pt") as f:
+            weight_map = {k: "model.safetensors" for k in f.keys()}
+    else:
+        raise FileNotFoundError(f"No safetensors files found in {model_path}")
 
     # Group tensors by shard file for sequential processing.
     shards = {}
@@ -141,8 +176,8 @@ def streaming_merge(model_id: str = MODEL_ID, lora_dir: str = LORA_DIR,
     # Tokenizer files: prefer LoRA dir (training may have modified tokenizer_config),
     # fall back to base model.
     for fname in ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]:
-        src = os.path.join(lora_dir, fname)
-        if os.path.exists(src):
+        src = os.path.join(lora_dir, fname) if lora_dir is not None else None
+        if src and os.path.exists(src):
             shutil.copy2(src, merged_path / fname)
         else:
             src2 = os.path.join(model_path, fname)
@@ -162,40 +197,44 @@ def streaming_merge(model_id: str = MODEL_ID, lora_dir: str = LORA_DIR,
 
         shard_data = load_file(shard_path, device="cpu")
 
-        modified = 0
-        for name in tensor_names:
-            if name in lora_map:
-                a_weight, b_weight, scaling = lora_map[name]
-                orig_dtype = shard_data[name].dtype
+        try:
+            modified = 0
+            for name in tensor_names:
+                if name in lora_map:
+                    a_weight, b_weight, scaling = lora_map[name]
+                    orig_dtype = shard_data[name].dtype
 
-                # Perform the LoRA merge on GPU: W_new = W + scaling * (B @ A)
-                # The matmul B @ A is the expensive part and benefits from GPU
-                # parallelism. On unified memory the transfer cost is near zero.
-                w = shard_data[name].to(DEVICE, dtype=torch.float32)
-                delta = scaling * (b_weight.float() @ a_weight.float())
-                shard_data[name] = (w + delta).to(dtype=orig_dtype).cpu()
-                modified += 1
-                merged_count += 1
-                del w, delta
+                    # Perform the LoRA merge on GPU: W_new = W + scaling * (B @ A)
+                    # The matmul B @ A is the expensive part and benefits from GPU
+                    # parallelism. On unified memory the transfer cost is near zero.
+                    w = shard_data[name].to(DEVICE, dtype=torch.float32)
+                    delta = scaling * (b_weight.float() @ a_weight.float())
+                    shard_data[name] = (w + delta).to(dtype=orig_dtype).cpu()
+                    modified += 1
+                    merged_count += 1
+                    del w, delta
 
-            new_weight_map[name] = shard_name
+                new_weight_map[name] = shard_name
 
-        # Save merged shard to output directory.
-        out_path = merged_path / shard_name
-        save_file(shard_data, str(out_path))
-
-        # Free shard memory before loading the next one.
-        del shard_data
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            # Save merged shard to output directory. Write to a temp file first
+            # then atomically rename, so a crash mid-write can't leave a corrupt shard.
+            out_path = merged_path / shard_name
+            tmp_path = out_path.with_suffix(".tmp")
+            save_file(shard_data, str(tmp_path))
+            tmp_path.rename(out_path)
+        finally:
+            # Free shard memory before loading the next one.
+            del shard_data
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         elapsed = time.time() - t0
         print(f"  Done in {elapsed:.1f}s ({modified} LoRA merges)")
 
     # Write the safetensors index so HF tooling can find the shards.
     new_index = {
-        "metadata": idx.get("metadata", {}),
+        "metadata": idx_metadata,
         "weight_map": new_weight_map,
     }
     with open(merged_path / "model.safetensors.index.json", "w") as f:

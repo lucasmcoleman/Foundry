@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pipeline"
+version = "0.1.0"
+description = "ML fine-tuning and hybrid quantization pipeline for AMD ROCm"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "lmcoleman"},
+]
+
+dependencies = [
+    # Core ML
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "peft>=0.10.0",
+    "trl>=0.8.0",
+    "datasets>=2.18.0",
+    "bitsandbytes>=0.43.0",
+    "accelerate>=0.30.0",
+    "safetensors>=0.4.0",
+
+    # HuggingFace Hub
+    "huggingface_hub>=0.20.0",
+    "hf_transfer>=0.1.0",
+
+    # Web UI
+    "fastapi>=0.100.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+
+    # Configuration and logging
+    "structlog>=24.0.0",
+    "tenacity>=8.2.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+
+    # Quantization
+    "magicquant>=0.1.0",
+
+    # Utilities
+    "tqdm>=4.60.0",
+    "psutil>=5.9.0",
+    "numpy>=1.21.0",
+]
+
+[project.optional-dependencies]
+datagen = [
+    "anthropic>=0.20.0",
+    "ebooklib>=0.18",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.25.0",
+]
+
+[project.scripts]
+pipeline = "core.pipeline:main"
+pipeline-upload = "core.hf_upload:main"
+
+[project.urls]
+Repository = "https://github.com/lucasmcoleman/pipeline"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "ui*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
