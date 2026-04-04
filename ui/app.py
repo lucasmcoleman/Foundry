@@ -211,12 +211,27 @@ async def run_script(script: str, output_dir: str) -> int:
                     text = text.strip()
                     if not text:
                         continue
-                    if "it/s]" in text or "s/it]" in text:
+                    # Parse progress from any tqdm bar or shard-loading output.
+                    # Tqdm: "  5%|█         | 3/57 [00:15<04:30, 5.00s/it]"
+                    # Shard: "Done in 2.1s | Progress: 45/1275 (4%) | Total: 4s"
+                    pct_parsed = False
+                    if "%|" in text:
                         try:
                             pct = int(float(text.split("%|")[0].strip().split()[-1]))
-                            await state.set_progress(pct)
+                            # Ignore "Fetching N files" — it's instant for cached models
+                            if "Fetching" not in text:
+                                await state.set_progress(pct)
+                            pct_parsed = True
                         except (ValueError, IndexError):
                             pass
+                    elif "Progress:" in text and "%" in text:
+                        try:
+                            pct = int(text.split("(")[1].split("%")[0])
+                            await state.set_progress(pct)
+                            pct_parsed = True
+                        except (ValueError, IndexError):
+                            pass
+                    if pct_parsed:
                         continue  # don't log every progress bar update
                     if "'loss'" in text:
                         await state.log(text, "metric")
