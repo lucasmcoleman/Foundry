@@ -27,7 +27,7 @@ from typing import Callable, Optional
 @dataclass
 class TrainingConfig:
     model_name: str = "Tesslate/OmniCoder-9B"
-    dataset_path: str = "data/zeroclaw_training_data.jsonl"
+    datasets: list[str] = field(default_factory=lambda: ["data/zeroclaw_training_data.jsonl"])
     max_seq_length: int = 8192
     load_in_4bit: bool = True  # Unused by fast loader (always 4-bit), kept for config compat
     lora_r: int = 32
@@ -41,6 +41,16 @@ class TrainingConfig:
     lr_scheduler_type: str = "cosine"
     warmup_ratio: float = 0.05
     optim: str = "adamw_8bit"
+
+    @property
+    def dataset_path(self) -> str:
+        """Backward compat -- returns first dataset."""
+        return self.datasets[0] if self.datasets else ""
+
+    @dataset_path.setter
+    def dataset_path(self, value: str):
+        """Backward compat -- sets datasets to a single-element list."""
+        self.datasets = [value]
 
 
 @dataclass
@@ -178,11 +188,8 @@ def _find_llamacpp(hint: Optional[str] = None) -> Optional[Path]:
 
 # ── Improvement #3: Dataset validation ───────────────────────────────────────
 
-def validate_dataset(dataset_path: str, log: LogFn) -> bool:
-    """Pre-flight check on the training dataset before committing GPU time."""
-    log("Validating dataset", "stage")
-    path = Path(dataset_path)
-
+def _validate_local_dataset(path: Path, log: LogFn) -> bool:
+    """Validate a single local dataset file (JSONL/JSON)."""
     if not path.exists():
         log(f"Dataset not found: {path}", "error")
         return False
@@ -255,7 +262,51 @@ def validate_dataset(dataset_path: str, log: LogFn) -> bool:
     log(f"  Roles: {sorted(roles_seen)}")
     log(f"  Tool call turns: {tool_calls}")
     log(f"  File size: {path.stat().st_size / 1024:.1f} KB")
-    log("Dataset validation passed", "success")
+    return True
+
+
+def validate_dataset(dataset_path_or_sources, log: LogFn) -> bool:
+    """Pre-flight check on one or more dataset sources before committing GPU time.
+
+    Accepts either a single path string (backward compat) or a list of sources.
+    Local files are fully validated; HuggingFace dataset IDs are noted as remote.
+    """
+    log("Validating dataset(s)", "stage")
+
+    # Normalize to list
+    if isinstance(dataset_path_or_sources, str):
+        sources = [dataset_path_or_sources]
+    else:
+        sources = list(dataset_path_or_sources)
+
+    if not sources or all(not s.strip() for s in sources):
+        log("No datasets configured", "error")
+        return False
+
+    all_ok = True
+    for src in sources:
+        src = src.strip()
+        if not src:
+            continue
+
+        # Strip config/split suffixes for path detection
+        clean = src.split("[")[0].split(":")[0] if (":" in src and not src.startswith("/") and not Path(src).suffix) or "[" in src else src
+
+        local = Path(clean)
+        if local.suffix in (".jsonl", ".json", ".csv", ".parquet"):
+            # Local file -- full validation
+            if not _validate_local_dataset(local, log):
+                all_ok = False
+        else:
+            # Could be a HF dataset ID or a local path without extension
+            if local.exists():
+                if not _validate_local_dataset(local, log):
+                    all_ok = False
+            else:
+                log(f"  HF dataset: {src} (will be downloaded if not cached)")
+
+    if all_ok:
+        log("Dataset validation passed", "success")
     return True
 
 
@@ -310,8 +361,8 @@ def stage_training(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> 
     Uses fast_train_zeroclaw.py's shard-by-shard loading to avoid
     single-threaded sequential safetensors chunking on AMD APU unified memory.
     """
-    # Validate dataset before committing GPU time.
-    if not validate_dataset(config.training.dataset_path, log):
+    # Validate dataset(s) before committing GPU time.
+    if not validate_dataset(config.training.datasets, log):
         return False
 
     log("Starting QLoRA training (fast loader, completion-only loss)", "stage")
@@ -353,8 +404,44 @@ trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in model.parameters())
 print(f"Trainable: {{trainable:,}} / {{total:,}} ({{100*trainable/total:.2f}}%)")
 
-# ── Load and format dataset ──
-dataset = load_dataset("json", data_files="{tc.dataset_path}", split="train")
+# ── Load and format dataset(s) ──
+_sources = {tc.datasets!r}
+_loaded = []
+for _src in _sources:
+    _src = _src.strip()
+    if not _src:
+        continue
+    _local = Path(_src)
+    if not _local.is_absolute():
+        _local = Path("{Path.cwd()}") / _local
+    if _local.exists():
+        _ext = _local.suffix.lstrip(".")
+        _fmt = {{"jsonl": "json", "json": "json", "csv": "csv", "parquet": "parquet"}}.get(_ext, "json")
+        _ds = load_dataset(_fmt, data_files=str(_local), split="train")
+        print(f"Loaded local: {{_src}} ({{len(_ds)}} examples)")
+    else:
+        _split = "train"
+        _cfg_name = None
+        _clean = _src
+        if "[" in _clean and _clean.endswith("]"):
+            _clean, _split = _clean[:-1].split("[", 1)
+        if ":" in _clean and not _clean.startswith("/") and "." not in _clean.split("/")[-1]:
+            _clean, _cfg_name = _clean.rsplit(":", 1)
+        _kwargs = {{"split": _split}}
+        if _cfg_name:
+            _kwargs["name"] = _cfg_name
+        _ds = load_dataset(_clean, **_kwargs)
+        print(f"Loaded HF: {{_src}} ({{len(_ds)}} examples)")
+    _loaded.append(_ds)
+
+if len(_loaded) == 1:
+    dataset = _loaded[0]
+elif len(_loaded) > 1:
+    from datasets import concatenate_datasets
+    dataset = concatenate_datasets(_loaded).shuffle(seed=42)
+    print(f"Combined: {{len(dataset)}} examples from {{len(_loaded)}} sources")
+else:
+    raise ValueError("No datasets loaded")
 print(f"Dataset: {{len(dataset)}} examples")
 
 def fmt(ex):
@@ -1029,7 +1116,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, help="YAML config file")
     parser.add_argument("--output-dir", type=str, default="./output")
     parser.add_argument("--model", type=str)
-    parser.add_argument("--dataset", type=str)
+    parser.add_argument("--dataset", type=str, help="Single dataset (local path or HF ID)")
+    parser.add_argument("--datasets", nargs="+", help="Multiple datasets (local paths or HF IDs)")
     parser.add_argument("--no-export", action="store_true")
     parser.add_argument("--heretic", action="store_true", help="Enable heretic abliteration stage")
     parser.add_argument("--no-heretic", action="store_true", help="Disable heretic abliteration stage")
@@ -1055,8 +1143,10 @@ if __name__ == "__main__":
 
     if args.model:
         cfg.training.model_name = args.model
-    if args.dataset:
-        cfg.training.dataset_path = args.dataset
+    if args.datasets:
+        cfg.training.datasets = args.datasets
+    elif args.dataset:
+        cfg.training.datasets = [args.dataset]
     if args.no_export:
         cfg.export = None
     if args.heretic and not args.no_heretic:

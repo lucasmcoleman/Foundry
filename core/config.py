@@ -34,7 +34,7 @@ class FoundrySettings(BaseSettings):
 
     # -- Training --
     model_name: str = "Tesslate/OmniCoder-9B"
-    dataset_path: Path = Path("data/zeroclaw_training_data.jsonl")
+    datasets: list[str] = ["data/zeroclaw_training_data.jsonl"]
     max_seq_length: int = 8192
     lora_r: int = 32
     lora_alpha: int = 64

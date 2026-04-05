@@ -73,7 +73,8 @@ class TrainingService:
         self,
         *,
         model_name: str,
-        dataset_path: str,
+        datasets: list[str] = None,
+        dataset_path: str = "",
         output_dir: str,
         max_seq_length: int,
         lora_r: int,
@@ -91,6 +92,10 @@ class TrainingService:
         """Generate the training subprocess script text."""
         core_path = repr(str(self.pipeline_root / "core"))
         pipeline_root_str = repr(str(self.pipeline_root))
+
+        # Resolve datasets list: prefer new 'datasets' param, fall back to 'dataset_path'
+        sources = datasets if datasets else ([dataset_path] if dataset_path else ["data/zeroclaw_training_data.jsonl"])
+        sources_repr = repr(sources)
 
         script = _env_preamble()
         script += _hf_cache_check(repr(model_name))
@@ -134,11 +139,43 @@ class TrainingService:
             f'print(f"Trainable: {{trainable:,}} / {{total:,}} '
             f'({{100*trainable/total:.2f}}%)")\n'
             f"\n"
-            f"_dataset_path = _P({repr(dataset_path)})\n"
-            f"if not _dataset_path.is_absolute():\n"
-            f"    _dataset_path = _P({pipeline_root_str}) / _dataset_path\n"
-            f'dataset = load_dataset("json", '
-            f'data_files=str(_dataset_path), split="train")\n'
+            f"_sources = {sources_repr}\n"
+            f"_loaded = []\n"
+            f"for _src in _sources:\n"
+            f"    _src = _src.strip()\n"
+            f"    if not _src:\n"
+            f"        continue\n"
+            f"    _local = _P(_src)\n"
+            f"    if not _local.is_absolute():\n"
+            f"        _local = _P({pipeline_root_str}) / _local\n"
+            f"    if _local.exists():\n"
+            f"        _ext = _local.suffix.lstrip('.')\n"
+            f"        _fmt = {{'jsonl':'json','json':'json','csv':'csv','parquet':'parquet'}}.get(_ext,'json')\n"
+            f"        _ds = load_dataset(_fmt, data_files=str(_local), split='train')\n"
+            f'        print(f"Loaded local: {{_src}} ({{len(_ds)}} examples)")\n'
+            f"    else:\n"
+            f"        _split = 'train'\n"
+            f"        _cfg_name = None\n"
+            f"        _clean = _src\n"
+            f"        if '[' in _clean and _clean.endswith(']'):\n"
+            f"            _clean, _split = _clean[:-1].split('[', 1)\n"
+            f"        if ':' in _clean and not _clean.startswith('/') and '.' not in _clean.split('/')[-1]:\n"
+            f"            _clean, _cfg_name = _clean.rsplit(':', 1)\n"
+            f"        _kwargs = {{'split': _split}}\n"
+            f"        if _cfg_name:\n"
+            f"            _kwargs['name'] = _cfg_name\n"
+            f"        _ds = load_dataset(_clean, **_kwargs)\n"
+            f'        print(f"Loaded HF: {{_src}} ({{len(_ds)}} examples)")\n'
+            f"    _loaded.append(_ds)\n"
+            f"\n"
+            f"if len(_loaded) == 1:\n"
+            f"    dataset = _loaded[0]\n"
+            f"elif len(_loaded) > 1:\n"
+            f"    from datasets import concatenate_datasets\n"
+            f"    dataset = concatenate_datasets(_loaded).shuffle(seed=42)\n"
+            f'    print(f"Combined: {{len(dataset)}} examples from {{len(_loaded)}} sources")\n'
+            f"else:\n"
+            f"    raise ValueError('No datasets loaded')\n"
             f'print(f"Dataset: {{len(dataset)}} examples")\n'
             f"\n"
             f"def fmt(ex):\n"

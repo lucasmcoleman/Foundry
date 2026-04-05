@@ -167,6 +167,130 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-bright); }
+
+/* ── Touch-friendly baseline ── */
+* { touch-action: manipulation; }
+
+/* ── Tablet (768px–1024px) ── */
+@media (max-width: 1024px) {
+  .app { grid-template-columns: 200px 1fr; }
+  .sidebar { padding: 12px 0; }
+  .stage-item { padding: 10px 12px 10px 32px; }
+  .stage-list::before { left: 31px; }
+  .main { padding: 20px 20px; }
+  .form-label[data-tip]:hover::after { max-width: 220px; }
+}
+
+/* ── Mobile (<768px) ── */
+@media (max-width: 768px) {
+  html, body { overflow: auto; }
+
+  .app {
+    display: flex;
+    flex-direction: column;
+    height: auto;
+    min-height: 100vh;
+    gap: 0;
+  }
+
+  /* Header */
+  .header { padding: 0 12px; min-height: 48px; }
+  .header-tag { display: none; }
+  .logo { font-size: 16px; }
+  .gpu-badge { font-size: 10px; padding: 3px 6px; }
+
+  /* Sidebar → horizontal scrollable tab strip */
+  .sidebar {
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+    width: 100%;
+    min-height: auto;
+    padding: 8px 12px;
+    gap: 8px;
+    border-bottom: 1px solid var(--border);
+    -webkit-overflow-scrolling: touch;
+  }
+  .sidebar-title { display: none; }
+  .stage-list {
+    display: flex;
+    flex-direction: row;
+    gap: 6px;
+    padding: 0;
+    flex-shrink: 0;
+  }
+  .stage-list::before { display: none; }
+  .stage-item {
+    flex-shrink: 0;
+    padding: 8px 14px;
+    margin-bottom: 0;
+    white-space: nowrap;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .stage-item .stage-indicator { position: static; transform: none; width: 14px; height: 14px; flex-shrink: 0; }
+  .stage-item .stage-desc { display: none; }
+  .stage-item .stage-name { font-size: 12px; margin-bottom: 0; }
+  .stage-toggle { position: static; transform: none; }
+
+  /* Toggle switches: min 44×44 touch target */
+  .toggle { width: 44px; height: 26px; min-width: 44px; min-height: 44px; display: flex; align-items: center; }
+  .toggle-track { height: 26px; border-radius: 13px; }
+  .toggle-thumb { width: 18px; height: 18px; top: 4px; left: 4px; }
+  .toggle input:checked ~ .toggle-thumb { left: 22px; }
+
+  /* Main content: full width, single-column */
+  .main { width: 100%; padding: 16px 12px; flex: 1; }
+  .section-header { margin-bottom: 16px; flex-wrap: wrap; gap: 8px; }
+  .section-title { font-size: 17px; }
+
+  .form-grid { grid-template-columns: 1fr; gap: 12px; }
+  .form-group.span-2 { grid-column: span 1; }
+  .form-divider { grid-column: span 1; }
+  .form-section-label { grid-column: span 1; }
+
+  /* Larger touch targets for inputs and buttons */
+  .form-input, select.form-input { min-height: 44px; font-size: 16px; padding: 10px 12px; }
+  .btn { min-height: 44px; font-size: 14px; padding: 10px 16px; }
+  .checkbox-row input[type="checkbox"] { width: 20px; height: 20px; min-width: 44px; min-height: 44px; }
+
+  /* Stage master toggle */
+  .stage-master-toggle { padding: 12px; flex-wrap: wrap; gap: 8px; }
+  .stage-master-toggle .smt-hint { display: none; }
+
+  /* Tags */
+  .tag { min-height: 36px; display: inline-flex; align-items: center; padding: 6px 12px; font-size: 12px; }
+
+  /* Log panel */
+  .logs { width: 100%; max-height: 40vh; min-height: 160px; border-top: 1px solid var(--border); }
+  .logs-header { padding: 6px 12px; }
+  .logs-body { padding: 6px 12px; font-size: 11px; }
+
+  /* Progress bar */
+  .progress-container { margin-top: 12px; padding: 12px; }
+
+  /* Settings popover */
+  .settings-pop { width: calc(100vw - 24px); right: -12px; }
+
+  /* Status banner */
+  .status-banner { margin: 0 12px 12px; }
+
+  /* Dependency banner */
+  .dep-banner { font-size: 11px; padding: 10px 12px; }
+}
+
+/* ── Small mobile (<400px) ── */
+@media (max-width: 400px) {
+  .header-right .btn { font-size: 12px; padding: 8px 10px; }
+  .header-left { gap: 8px; }
+  .logo { font-size: 14px; }
+  .main { padding: 12px 8px; }
+  .stage-item { padding: 6px 10px; }
+  .stage-item .stage-name { font-size: 11px; }
+}
 </style>
 </head>
 <body>
@@ -351,7 +475,7 @@ const S = {
   ws: null,
   config: {
     training: {
-      model_name: 'Tesslate/OmniCoder-9B', dataset_path: 'data/zeroclaw_training_data.jsonl',
+      model_name: 'Tesslate/OmniCoder-9B', datasets: ['data/zeroclaw_training_data.jsonl'],
       max_seq_length: 4096, load_in_4bit: true,
       lora_r: 32, lora_alpha: 64, lora_dropout: 0.05, use_rslora: true,
       num_train_epochs: 3, per_device_train_batch_size: 2, gradient_accumulation_steps: 4,
@@ -371,7 +495,7 @@ const S = {
 const LS_KEY = 'foundry_form_state';
 // Bump this when defaults change. Mismatched versions discard saved state
 // so users pick up corrected defaults instead of perpetuating stale values.
-const LS_VERSION = 2;
+const LS_VERSION = 3;
 
 /**
  * Save the current form config and enabled stages to localStorage.
@@ -681,7 +805,7 @@ function suggestRepoId() {
   // Infer a training-data tag from the dataset filename
   let dataTag = '';
   if (trainingOn) {
-    const ds = S.config.training.dataset_path || '';
+    const ds = (S.config.training.datasets && S.config.training.datasets[0]) || '';
     const dsFile = ds.includes('/') ? ds.split('/').pop() : ds;
     const dsBase = dsFile.replace(/\.(jsonl|json|csv|parquet|arrow)$/i, '')
                          .replace(/_training_data$|_data$/i, '');
@@ -718,6 +842,34 @@ function masterToggleStage(stage, on) {
 
 // ── Stage Renderers ────────────────────────────────────────────────────────
 
+/** Update a dataset entry at the given index. */
+function updateDataset(index, value) {
+  if (!S.config.training.datasets) S.config.training.datasets = [];
+  S.config.training.datasets[index] = value;
+  saveFormState();
+}
+
+/** Add a new empty dataset entry and re-render. */
+function addDataset() {
+  if (!S.config.training.datasets) S.config.training.datasets = [];
+  S.config.training.datasets.push('');
+  renderStageContent();
+  // Focus the newly added input
+  const entries = document.querySelectorAll('#dataset-list .dataset-entry input');
+  if (entries.length) entries[entries.length - 1].focus();
+}
+
+/** Remove a dataset entry at the given index and re-render. */
+function removeDataset(index) {
+  if (!S.config.training.datasets) return;
+  S.config.training.datasets.splice(index, 1);
+  if (S.config.training.datasets.length === 0) {
+    S.config.training.datasets.push('');
+  }
+  saveFormState();
+  renderStageContent();
+}
+
 /** @returns {string} HTML for the Training configuration panel. */
 function renderTraining() {
   const c = S.config.training;
@@ -729,7 +881,14 @@ function renderTraining() {
   <div class="form-grid">
     <div class="form-section-label">Model</div>
     <div class="form-group span-2">${L('Model Name / HuggingFace ID','HuggingFace model repo (e.g. Qwen/Qwen3-8B) or local path to a model directory')}<input class="form-input" data-key="training.model_name" value="${c.model_name}"></div>
-    <div class="form-group span-2">${L('Dataset Path','Path to a JSONL file where each line has a &quot;messages&quot; array in chat format. Validated before training starts.')}<input class="form-input" data-key="training.dataset_path" value="${c.dataset_path}"></div>
+    <div class="form-group span-2">
+      ${L('Datasets','Local file paths or HuggingFace dataset IDs. Each line is validated before training starts.')}
+      <div id="dataset-list">
+        ${(c.datasets || ['data/zeroclaw_training_data.jsonl']).map((ds, i) => `<div class="dataset-entry" style="display:flex;gap:8px;margin-bottom:6px;align-items:center"><input class="form-input" style="flex:1" value="${ds}" placeholder="Local path or HuggingFace dataset ID" oninput="updateDataset(${i},this.value)"><button class="btn" style="padding:4px 10px;font-size:14px;line-height:1" onclick="removeDataset(${i})" title="Remove this dataset">&times;</button></div>`).join('')}
+      </div>
+      <button class="btn" style="margin-top:4px;font-size:11px;padding:4px 12px" onclick="addDataset()">+ Add Dataset</button>
+      <div class="form-hint">Local JSONL/JSON/CSV/Parquet paths or HuggingFace dataset IDs (e.g. mlabonne/harmless_alpaca, org/dataset:config[split])</div>
+    </div>
     <div class="form-group">${L('Max Sequence Length','Maximum number of tokens per training example. Longer sequences use more VRAM. 4096 is a good default.')}<input class="form-input" type="number" data-key="training.max_seq_length" value="${c.max_seq_length}"></div>
     <div class="form-group">${L('Output Directory','Where to save LoRA adapters, checkpoints, and all pipeline artifacts')}<input class="form-input" data-key="training.output_dir" value="${c.output_dir}"></div>
     <div class="form-group span-2"><label class="checkbox-row"><input type="checkbox" data-key="training.load_in_4bit" ${c.load_in_4bit?'checked':''}><span class="form-label" data-tip="Load base model weights in 4-bit NormalFloat quantization. Drastically reduces VRAM usage with minimal quality loss." style="margin:0">Load in 4-bit (QLoRA)</span></label></div>
