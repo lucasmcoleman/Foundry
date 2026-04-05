@@ -110,7 +110,7 @@ state = PipelineState()
 
 class TrainingCfg(BaseModel):
     model_name: str = "Tesslate/OmniCoder-9B"
-    dataset_path: str = "data/zeroclaw_training_data.jsonl"
+    datasets: list[str] = ["data/zeroclaw_training_data.jsonl"]
     max_seq_length: int = 4096
     load_in_4bit: bool = True
     lora_r: int = 32
@@ -185,6 +185,11 @@ async def run_script(script: str, output_dir: str) -> int:
         "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
         "PYTHONUNBUFFERED": "1",
     })
+    # Auto-load HF token from cache if not in environment
+    if "HF_TOKEN" not in env:
+        token_path = Path.home() / ".cache" / "huggingface" / "token"
+        if token_path.exists():
+            env["HF_TOKEN"] = token_path.read_text().strip()
 
     log_path = script_path.with_suffix(".log")
     log_file = open(log_path, "w")
@@ -264,63 +269,95 @@ async def run_script(script: str, output_dir: str) -> int:
 FOUNDRY_ROOT = Path(__file__).resolve().parent.parent
 
 
-async def validate_dataset(path: str) -> bool:
-    """Pre-flight dataset check."""
-    await state.log("Validating dataset...", "stage")
-    p = Path(path)
-    if not p.is_absolute():
-        p = FOUNDRY_ROOT / p
-    if not p.exists():
-        await state.log(f"Dataset not found: {path}", "error")
-        return False
-    if p.stat().st_size == 0:
-        await state.log("Dataset file is empty", "error")
+async def validate_dataset(sources: list[str]) -> bool:
+    """Pre-flight dataset check for one or more dataset sources."""
+    await state.log("Validating dataset(s)...", "stage")
+
+    if not sources or all(not s.strip() for s in sources):
+        await state.log("No datasets configured", "error")
         return False
 
-    errors = []
-    n = 0
-    tool_calls = 0
-    roles = set()
+    all_ok = True
+    for src in sources:
+        src = src.strip()
+        if not src:
+            continue
 
-    with open(p) as f:
-        for i, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ex = json.loads(line)
-            except json.JSONDecodeError as e:
-                errors.append(f"Line {i}: invalid JSON — {e}")
-                if len(errors) >= 5:
-                    break
-                continue
-            n += 1
-            if "messages" not in ex:
-                errors.append(f"Line {i}: missing 'messages' field")
-                continue
-            msgs = ex["messages"]
-            if not isinstance(msgs, list) or len(msgs) < 2:
-                errors.append(f"Line {i}: 'messages' needs >= 2 entries")
-                continue
-            for msg in msgs:
-                if "role" not in msg or "content" not in msg:
-                    errors.append(f"Line {i}: message missing 'role' or 'content'")
-                    break
-                roles.add(msg["role"])
-                if msg["role"] == "assistant" and "<tool_call>" in msg.get("content", ""):
-                    tool_calls += 1
+        # Strip config/split suffixes for path detection
+        clean = src
+        if "[" in clean and clean.endswith("]"):
+            clean = clean.split("[")[0]
+        if ":" in clean and not clean.startswith("/") and not Path(clean).suffix:
+            clean = clean.rsplit(":", 1)[0]
 
-    if errors:
-        for e in errors[:5]:
-            await state.log(f"  {e}", "error")
-        await state.log(f"Validation failed ({len(errors)} errors)", "error")
-        return False
+        local = Path(clean)
+        if local.suffix in (".jsonl", ".json", ".csv", ".parquet"):
+            # Local file -- full validation
+            p = local
+            if not p.is_absolute():
+                p = FOUNDRY_ROOT / p
+            if not p.exists():
+                await state.log(f"Dataset not found: {src}", "error")
+                all_ok = False
+                continue
+            if p.stat().st_size == 0:
+                await state.log(f"Dataset file is empty: {src}", "error")
+                all_ok = False
+                continue
 
-    if n < 10:
-        await state.log(f"  Warning: only {n} examples", "warn")
-    await state.log(f"  {n} examples, {tool_calls} tool-call turns, roles: {sorted(roles)}")
-    await state.log("Dataset valid", "success")
-    return True
+            errors = []
+            n = 0
+            tool_calls = 0
+            roles = set()
+
+            with open(p) as f:
+                for i, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ex = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        errors.append(f"Line {i}: invalid JSON -- {e}")
+                        if len(errors) >= 5:
+                            break
+                        continue
+                    n += 1
+                    if "messages" not in ex:
+                        errors.append(f"Line {i}: missing 'messages' field")
+                        continue
+                    msgs = ex["messages"]
+                    if not isinstance(msgs, list) or len(msgs) < 2:
+                        errors.append(f"Line {i}: 'messages' needs >= 2 entries")
+                        continue
+                    for msg in msgs:
+                        if "role" not in msg or "content" not in msg:
+                            errors.append(f"Line {i}: message missing 'role' or 'content'")
+                            break
+                        roles.add(msg["role"])
+                        if msg["role"] == "assistant" and "<tool_call>" in msg.get("content", ""):
+                            tool_calls += 1
+
+            if errors:
+                for e in errors[:5]:
+                    await state.log(f"  {e}", "error")
+                await state.log(f"Validation failed for {src} ({len(errors)} errors)", "error")
+                all_ok = False
+                continue
+
+            if n < 10:
+                await state.log(f"  Warning: only {n} examples in {src}", "warn")
+            await state.log(f"  {src}: {n} examples, {tool_calls} tool-call turns, roles: {sorted(roles)}")
+        else:
+            # Possibly a HuggingFace dataset -- check if it exists locally first
+            if local.exists():
+                await state.log(f"  Local path: {src}")
+            else:
+                await state.log(f"  HF dataset: {src} (will be downloaded if not cached)")
+
+    if all_ok:
+        await state.log("Dataset validation passed", "success")
+    return all_ok
 
 
 # ── Stage runners ────────────────────────────────────────────────────────────
@@ -344,8 +381,8 @@ async def do_training(cfg: RunRequest) -> bool:
         await state.set_progress(100)
         return True
 
-    # Validate dataset before committing GPU time
-    if not await validate_dataset(tc.dataset_path):
+    # Validate dataset(s) before committing GPU time
+    if not await validate_dataset(tc.datasets):
         return False
 
     await state.set_stage("training", StageStatus.RUNNING)
@@ -355,7 +392,7 @@ async def do_training(cfg: RunRequest) -> bool:
     svc = TrainingService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
         model_name=tc.model_name,
-        dataset_path=tc.dataset_path,
+        datasets=tc.datasets,
         output_dir=tc.output_dir,
         max_seq_length=tc.max_seq_length,
         lora_r=tc.lora_r,
@@ -585,7 +622,7 @@ async def do_upload(cfg: RunRequest) -> bool:
         upload_merged=uc.upload_merged,
         upload_dataset=uc.upload_dataset,
         base_model=tc.model_name,
-        dataset_name=tc.dataset_path,
+        dataset_name=tc.datasets[0] if tc.datasets else "",
         did_training="training" in enabled,
         did_heretic="heretic" in enabled,
         did_magicquant="magicquant" in enabled,
