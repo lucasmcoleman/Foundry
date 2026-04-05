@@ -527,20 +527,6 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     await state.set_stage("magicquant", StageStatus.RUNNING)
     await state.set_progress(0)
 
-    # Pull latest MagicQuant before running
-    mq_symlink = FOUNDRY_ROOT / "MagicQuant" / "magicquant"
-    mq_repo = Path(os.path.realpath(mq_symlink)).parent if mq_symlink.is_symlink() else FOUNDRY_ROOT / "MagicQuant"
-    if (mq_repo / ".git").exists():
-        import subprocess
-        result = subprocess.run(
-            ["git", "-C", str(mq_repo), "pull", "--ff-only"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0 and "Already up to date" not in result.stdout:
-            await state.log(f"MagicQuant updated: {result.stdout.strip()}", "info")
-        elif result.returncode != 0:
-            await state.log(f"MagicQuant git pull failed (using local): {result.stderr.strip()}", "warn")
-
     await state.log("Starting MagicQuant evolutionary search", "stage")
 
     tiers_json = json.dumps(mc.tiers)

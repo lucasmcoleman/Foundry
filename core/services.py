@@ -562,8 +562,6 @@ class MagicQuantService:
             f"print(f\"llama.cpp: "
             f"{{llamacpp or 'not found (heuristic mode)'}}\")\n"
             f"\n"
-            f"sys.path.insert(0, str(Path({repr(pipeline_root_str)}) "
-            f'/ "MagicQuant"))\n'
             f"from magicquant.orchestrator import "
             f"MagicQuantOrchestrator\n"
             f"import json\n"
