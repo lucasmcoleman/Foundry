@@ -99,20 +99,25 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
         raise FileNotFoundError(f"No safetensors files found in {model_path}")
 
     # Composite models save weights with a "model.language_model." prefix and
-    # include vision encoder tensors ("model.visual.").  Since we build a
-    # text-only CausalLM, remap the language_model keys and drop vision keys.
+    # include non-text tensors (vision encoder, embeddings, etc.).  Since we
+    # build a text-only CausalLM, remap the language_model keys and drop
+    # everything that isn't part of the text model.
     if _is_composite:
         remapped_weight_map = {}
         skipped = 0
         for orig_name, shard_name in weight_map.items():
-            if orig_name.startswith("model.visual"):
+            # Keep only language_model tensors — skip vision, multimodal, etc.
+            if orig_name.startswith("model.language_model."):
+                new_name = orig_name.replace("model.language_model.", "model.", 1)
+                remapped_weight_map[new_name] = (shard_name, orig_name)
+            elif not orig_name.startswith("model."):
+                # Top-level tensors (lm_head, etc.) — keep as-is
+                remapped_weight_map[orig_name] = (shard_name, orig_name)
+            else:
                 skipped += 1
-                continue
-            new_name = orig_name.replace("model.language_model.", "model.", 1)
-            remapped_weight_map[new_name] = (shard_name, orig_name)
         weight_map = remapped_weight_map
         if skipped:
-            print(f"  Skipped {skipped} vision encoder tensors (not needed for CausalLM)")
+            print(f"  Skipped {skipped} non-text tensors (vision/multimodal, not needed for CausalLM)")
     else:
         weight_map = {name: (shard, name) for name, shard in weight_map.items()}
 
