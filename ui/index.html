@@ -573,7 +573,7 @@ const S = {
       lora_r: 32, lora_alpha: 64, lora_dropout: 0.05, use_rslora: true,
       num_train_epochs: 3, per_device_train_batch_size: 2, gradient_accumulation_steps: 4,
       learning_rate: 0.0002, lr_scheduler_type: 'cosine', warmup_ratio: 0.05, optim: 'adamw_8bit',
-      output_dir: './output',
+      packing: false, output_dir: './output',
     },
     export: { gguf_type: 'bf16', also_save_merged: false, source_model: '' },
     heretic: { n_trials: 200, n_startup_trials: 60, quantization: 'bnb_4bit', kl_divergence_scale: 1.0, orthogonalize_direction: false, row_normalization: 'none' },
@@ -588,7 +588,7 @@ const S = {
 const LS_KEY = 'foundry_form_state';
 // Bump this when defaults change. Mismatched versions discard saved state
 // so users pick up corrected defaults instead of perpetuating stale values.
-const LS_VERSION = 5;
+const LS_VERSION = 6;
 
 /**
  * Save the current form config and enabled stages to localStorage.
@@ -1149,8 +1149,11 @@ function renderTraining() {
     <div class="form-group">${L('LR Scheduler','How the learning rate changes during training. Cosine anneals smoothly to 0. Linear decays steadily.')}<input class="form-input" data-key="training.lr_scheduler_type" value="${c.lr_scheduler_type}"></div>
     <div class="form-group">${L('Warmup Ratio','Fraction of training spent linearly increasing LR from 0. Prevents early instability. 0.03-0.1 typical.')}<input class="form-input" type="number" step="0.01" data-key="training.warmup_ratio" value="${c.warmup_ratio}"></div>
     <div class="form-group">${L('Optimizer','Weight update algorithm. adamw_8bit uses 8-bit Adam to save VRAM with negligible quality difference.')}<input class="form-input" data-key="training.optim" value="${c.optim}"></div>
+    <div class="form-divider"></div><div class="form-section-label">Performance</div>
+    <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="training.packing" ${c.packing?'checked':''}><span class="form-label" data-tip="Pack multiple short examples into one sequence to maximize GPU utilization. Can dramatically speed up training when examples are shorter than max_length. Disables completion-only loss masking." style="margin:0">Enable packing</span></label></div>
   </div>
-  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:11px;color:var(--text-2);">Completion-only loss enabled -- only assistant responses are trained on. System prompts and user messages are masked.</div>
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:11px;color:var(--text-2);">${c.packing ? 'Packing enabled -- multiple examples packed per sequence for faster training. Completion-only loss masking is disabled.' : 'Completion-only loss enabled -- only assistant responses are trained on. System prompts and user messages are masked.'}</div>
+  <div style="padding:8px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:11px;color:var(--text-2);margin-top:8px;">Token length analysis will be logged before training starts — check the logs to tune max_length.</div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Training</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
   </div>`;
 }
