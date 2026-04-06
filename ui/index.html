@@ -487,7 +487,7 @@ const S = {
     magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '' },
     upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
-  mqTiers: ['Q3','Q4','Q5','Q6'],
+  mqTiers: ['Q3','Q4','Q5','Q6','Q8'],
   hfUsername: '',
 };
 
@@ -802,17 +802,34 @@ function suggestRepoId() {
   let short = modelName.includes('/') ? modelName.split('/').pop() : modelName;
   short = short.replace(/\.(gguf|bin|safetensors)$/i, '');
 
-  // Infer a training-data tag from the dataset filename
+  // Infer training-data tags from all dataset sources
   let dataTag = '';
-  if (trainingOn) {
-    const ds = (S.config.training.datasets && S.config.training.datasets[0]) || '';
-    const dsFile = ds.includes('/') ? ds.split('/').pop() : ds;
-    const dsBase = dsFile.replace(/\.(jsonl|json|csv|parquet|arrow)$/i, '')
-                         .replace(/_training_data$|_data$/i, '');
-    // Use it if it's meaningful (not just "train" or "data")
-    if (dsBase && dsBase.length > 2 && !/^(train|data|dataset)$/i.test(dsBase)) {
-      dataTag = '-' + dsBase.charAt(0).toUpperCase() + dsBase.slice(1);
+  if (trainingOn && S.config.training.datasets) {
+    const tags = [];
+    for (const ds of S.config.training.datasets) {
+      if (!ds || !ds.trim()) continue;
+      const src = ds.trim();
+      // For HF datasets like "org/dataset-name", use the dataset name part
+      // For local files, use the filename stem
+      let dsBase;
+      if (src.includes('/') && !src.includes('.')) {
+        // Looks like a HF dataset ID (org/name, no file extension)
+        dsBase = src.split('/').pop().replace(/-/g, ' ');
+      } else {
+        const dsFile = src.includes('/') ? src.split('/').pop() : src;
+        dsBase = dsFile.replace(/\.(jsonl|json|csv|parquet|arrow)$/i, '')
+                       .replace(/_training_data$|_data$/i, '')
+                       .replace(/[-_]/g, ' ');
+      }
+      // Capitalize each word and skip generic names
+      if (dsBase && dsBase.length > 2 && !/^(train|data|dataset)$/i.test(dsBase.trim())) {
+        const capitalized = dsBase.trim().split(/\s+/)
+          .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+          .join('');
+        if (!tags.includes(capitalized)) tags.push(capitalized);
+      }
     }
+    if (tags.length) dataTag = '-' + tags.join('-');
   }
 
   // Build suffix from active post-training stages
@@ -976,7 +993,7 @@ function renderMagicQuant() {
     <div class="form-group span-2">
       ${L('Output Tiers','Quality tiers to generate. Each tier targets a different size/quality tradeoff. Q6 is closest to original, Q3 is smallest.')}
       <div class="tag-list">${S.mqTiers.map(t=>`<div class="tag ${sel.has(t)?'selected':''}" data-tier="${t}" onclick="toggleTier('${t}')">${t}</div>`).join('')}</div>
-      <div class="form-hint">Q6 = highest quality, Q3 = smallest size</div>
+      <div class="form-hint">Q8 = near-lossless, Q6 = high quality, Q4 = balanced, Q3 = smallest</div>
     </div>
   </div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">MagicQuant</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
