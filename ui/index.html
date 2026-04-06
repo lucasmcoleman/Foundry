@@ -586,8 +586,10 @@ const S = {
 
 // ── localStorage Form Persistence ──────────────────────────────────────────
 const LS_KEY = 'foundry_form_state';
-// Bump this when defaults change. Mismatched versions discard saved state
-// so users pick up corrected defaults instead of perpetuating stale values.
+// Only bump this when an existing default value CHANGES (not for new fields).
+// New fields are handled gracefully by the merge logic — they keep their
+// code defaults when absent from saved state. Only bump when keeping the
+// old saved value would cause breakage (e.g. wrong path, renamed field).
 const LS_VERSION = 6;
 
 /**
@@ -615,11 +617,10 @@ function restoreFormState() {
     const raw = localStorage.getItem(LS_KEY);
     if (!raw) return;
     const data = JSON.parse(raw);
-    // Version mismatch: discard stale state so new defaults take effect
-    if (data.version !== LS_VERSION) {
-      localStorage.removeItem(LS_KEY);
-      return;
-    }
+    // Merge saved config into current defaults. The merge only copies keys
+    // that exist in the current schema, so new fields keep their defaults
+    // and removed fields are ignored. No data is lost on version mismatch —
+    // we always merge what we can.
     if (data.config) {
       for (const section of Object.keys(S.config)) {
         if (!data.config[section]) continue;
