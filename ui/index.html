@@ -1506,9 +1506,9 @@ async function initAuth() {
   restoreFormState();
   await initAuth();
   loadConfig();
-  await refreshWorkflowList();
   connectWS();
   renderStageContent();
+  refreshWorkflowList();
 })();
 </script>
 </body>
