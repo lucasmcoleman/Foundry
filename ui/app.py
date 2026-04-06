@@ -150,7 +150,7 @@ class MagicQuantCfg(BaseModel):
 class UploadCfg(BaseModel):
     repo_id: str = ""
     private: bool = True
-    license: str = "apache-2.0"
+    license: str = ""  # empty = auto-detect from base model
     upload_gguf: bool = True
     upload_lora: bool = False
     upload_merged: bool = False
@@ -612,11 +612,29 @@ async def do_upload(cfg: RunRequest) -> bool:
     out_abs = _resolve_out(out)
 
     enabled = set(cfg.enabled_stages)
+    # Auto-detect license from base model if not explicitly set
+    license_id = uc.license
+    if not license_id or license_id == "auto":
+        await state.log("Detecting license from base model...")
+        try:
+            from huggingface_hub import model_info as _mi
+            _info = _mi(tc.model_name)
+            for _tag in (_info.tags or []):
+                if _tag.startswith("license:"):
+                    license_id = _tag.split(":", 1)[1]
+                    break
+            if not license_id or license_id == "auto":
+                license_id = getattr(getattr(_info, 'card_data', None), 'license', '') or "unknown"
+            await state.log(f"  License: {license_id}")
+        except Exception as e:
+            license_id = "unknown"
+            await state.log(f"  Could not detect license: {e}", "warn")
+
     svc = UploadService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
         repo_id=uc.repo_id,
         private=uc.private,
-        license_id=uc.license,
+        license_id=license_id,
         upload_gguf=uc.upload_gguf,
         upload_lora=uc.upload_lora,
         upload_merged=uc.upload_merged,
