@@ -125,6 +125,7 @@ class TrainingCfg(BaseModel):
     lr_scheduler_type: str = "cosine"
     warmup_steps: int = 10
     optim: str = "paged_adamw_8bit"
+    packing: bool = False
     output_dir: str = "./output"
 
 class ExportCfg(BaseModel):
@@ -411,6 +412,7 @@ async def do_training(cfg: RunRequest) -> bool:
         lr_scheduler_type=tc.lr_scheduler_type,
         warmup_steps=tc.warmup_steps,
         optim=tc.optim,
+        packing=tc.packing,
     )
     rc = await run_script(script, tc.output_dir)
     ok = rc == 0

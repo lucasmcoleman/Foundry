@@ -88,6 +88,7 @@ class TrainingService:
         lr_scheduler_type: str,
         warmup_steps: int,
         optim: str,
+        packing: bool = False,
     ) -> str:
         """Generate the training subprocess script text."""
         core_path = repr(str(self.pipeline_root / "core"))
@@ -206,6 +207,20 @@ class TrainingService:
             f"    return ex\n"
             f"dataset = dataset.map(fmt)\n"
             f"\n"
+            f"# Analyze token lengths to help tune max_length\n"
+            f"_lengths = [len(tokenizer.encode(ex['text'])) for ex in dataset]\n"
+            f"_lengths.sort()\n"
+            f"_p50 = _lengths[len(_lengths)//2]\n"
+            f"_p90 = _lengths[int(len(_lengths)*0.9)]\n"
+            f"_p99 = _lengths[int(len(_lengths)*0.99)]\n"
+            f"_max = _lengths[-1]\n"
+            f"print(f'Token lengths: median={{_p50}}, p90={{_p90}}, p99={{_p99}}, max={{_max}}, max_length={max_seq_length}')\n"
+            f"if _p90 < {max_seq_length} // 2:\n"
+            f"    print(f'  Hint: p90 is {{_p90}} — you could set max_length to ~{{int(_p90*1.1)}} to save memory and speed up training')\n"
+            f"_over = sum(1 for l in _lengths if l > {max_seq_length})\n"
+            f"if _over:\n"
+            f"    print(f'  Warning: {{_over}} examples ({{100*_over/len(_lengths):.1f}}%) exceed max_length={max_seq_length} and will be truncated')\n"
+            f"\n"
             f"resume_ckpt = find_latest_checkpoint({repr(output_dir)})\n"
             f"if resume_ckpt:\n"
             f'    print(f"Resuming from checkpoint: {{resume_ckpt}}")\n'
@@ -234,7 +249,8 @@ class TrainingService:
             f'        report_to="none",\n'
             f"        max_length={max_seq_length},\n"
             f'        dataset_text_field="text",\n'
-            f"        completion_only_loss=True,\n"
+            f"        packing={packing},\n"
+            f"        completion_only_loss={not packing},\n"
             f"    ),\n"
             f")\n"
             f"stats = trainer.train(resume_from_checkpoint=resume_ckpt)\n"
