@@ -81,12 +81,36 @@ class MagicQuantConfig:
     llamacpp_path: Optional[str] = None
 
 
+def detect_license(model_id: str) -> str:
+    """Fetch the license from a HuggingFace model's metadata.
+
+    Returns the SPDX-style license string (e.g. 'apache-2.0', 'mit',
+    'llama3.2') or 'unknown' if it can't be determined.
+    """
+    try:
+        from huggingface_hub import model_info
+        info = model_info(model_id)
+        tags = info.tags or []
+        # HF stores license as a tag like "license:apache-2.0"
+        for tag in tags:
+            if tag.startswith("license:"):
+                return tag.split(":", 1)[1]
+        # Also check the card_data field
+        if hasattr(info, 'card_data') and info.card_data:
+            lic = getattr(info.card_data, 'license', None)
+            if lic:
+                return lic
+    except Exception:
+        pass
+    return "unknown"
+
+
 @dataclass
 class UploadConfig:
     repo_id: str = ""
     private: bool = True
     base_model: str = ""
-    license: str = "apache-2.0"
+    license: str = ""  # empty = auto-detect from base model
     upload_lora: bool = False
     upload_merged: bool = False
     upload_gguf: bool = True
@@ -981,6 +1005,17 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -
 
 # ── Stage: Upload ────────────────────────────────────────────────────────────
 
+def _resolve_license(uc: UploadConfig, model_name: str, log: LogFn) -> str:
+    """Return the license string, auto-detecting from HF if not explicitly set."""
+    if uc.license:
+        return uc.license
+    base = uc.base_model or model_name
+    log("Detecting license from base model...")
+    lic = detect_license(base)
+    log(f"  License: {lic}")
+    return lic
+
+
 def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
     """Upload artifacts to HuggingFace Hub.
 
@@ -995,10 +1030,11 @@ def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bo
         return False
 
     tc = config.training
+    license_id = _resolve_license(uc, tc.model_name, log)
     hf_cfg = HFUploadConfig(
         repo_id=uc.repo_id,
         private=uc.private,
-        license=uc.license,
+        license=license_id,
         upload_gguf=uc.upload_gguf,
         upload_lora=uc.upload_lora,
         upload_merged=uc.upload_merged,
@@ -1035,10 +1071,11 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
         return None
 
     tc = config.training
+    license_id = _resolve_license(uc, tc.model_name, log)
     hf_cfg = HFUploadConfig(
         repo_id=uc.repo_id,
         private=uc.private,
-        license=uc.license,
+        license=license_id,
         upload_gguf=uc.upload_gguf,
         upload_lora=uc.upload_lora,
         upload_merged=uc.upload_merged,
