@@ -589,7 +589,7 @@ const S = {
     magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '' },
     upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
-  mqTiers: ['Q3','Q4','Q5','Q6','Q8'],
+  mqTiers: ['Q2','Q3','Q4','Q5','Q6','Q8'],
   hfUsername: '',
 };
 
@@ -1268,9 +1268,9 @@ function renderMagicQuant() {
     <div class="form-group">${L('Population Size','Number of candidate configurations per generation. More = broader search but slower. 50-200 typical.')}<input class="form-input" type="number" data-key="magicquant.population_size" value="${c.population_size}"></div>
     <div class="form-group">${L('Generations','Number of evolutionary iterations. More = better optimization but diminishing returns after ~30-50.')}<input class="form-input" type="number" data-key="magicquant.generations" value="${c.generations}"></div>
     <div class="form-group span-2">
-      ${L('Output Tiers','Quality tiers to generate. Each tier targets a different size/quality tradeoff. Q6 is closest to original, Q3 is smallest.')}
+      ${L('Output Tiers','Quality tiers to generate. Each tier targets a different size/quality tradeoff. Q6 is closest to original, Q2 is smallest.')}
       <div class="tag-list">${S.mqTiers.map(t=>`<div class="tag ${sel.has(t)?'selected':''}" data-tier="${t}" onclick="toggleTier('${t}')">${t}</div>`).join('')}</div>
-      <div class="form-hint">Q8 = near-lossless, Q6 = high quality, Q4 = balanced, Q3 = smallest</div>
+      <div class="form-hint">Q8 = near-lossless, Q6 = high quality, Q4 = balanced, Q3 = small, Q2 = smallest</div>
     </div>
   </div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">MagicQuant</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
@@ -1312,7 +1312,7 @@ function renderUpload() {
 // ── Tier Selection ─────────────────────────────────────────────────────────
 
 /**
- * Toggle a quantization tier (Q3/Q4/Q5/Q6) on or off in the MagicQuant config.
+ * Toggle a quantization tier (Q2/Q3/Q4/Q5/Q6/Q8) on or off in the MagicQuant config.
  * @param {string} t - Tier name
  */
 function toggleTier(t) {
