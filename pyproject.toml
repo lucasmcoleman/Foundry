@@ -84,3 +84,6 @@ include = ["core*", "ui*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow (requires GPU, network, and optional heavy deps like amd-quark)",
+]
