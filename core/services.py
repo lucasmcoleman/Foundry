@@ -949,3 +949,87 @@ class UploadService:
             f"    sys.exit(1)\n"
         )
         return script
+
+
+class OnnxService:
+    """Orchestrates the AMD Quark + ORT-GenAI model builder subprocess.
+
+    The actual Quark and OGA builder calls live in core/onnx_quark.py — this
+    service just generates the small subprocess script that resolves the
+    source path and calls run_onnx_pipeline().
+    """
+
+    def __init__(self, pipeline_root: Path, venv_python: str) -> None:
+        self.pipeline_root = pipeline_root
+        self.venv_python = venv_python
+
+    def build_script(
+        self,
+        *,
+        pipeline_root_str: str,
+        out_abs_str: str,
+        source_override: str,
+        quant_scheme: str,
+        quant_algo: str,
+        execution_provider: str,
+        data_type: str,
+        num_calib_data: int,
+        seq_len: int,
+        calib_dataset: str,
+        cleanup_intermediates: bool,
+    ) -> str:
+        """Generate the subprocess script text for the ONNX stage."""
+        script = _env_preamble()
+        script += (
+            f"\nimport sys\n"
+            f"from pathlib import Path\n"
+            f"sys.path.insert(0, str(Path({repr(str(self.pipeline_root))}) / 'core'))\n"
+            f"from onnx_quark import run_onnx_pipeline\n"
+            f"\n"
+            f"override = {repr(source_override)}\n"
+            f"out_dir = Path({repr(out_abs_str)})\n"
+            f"\n"
+            f"def _resolve_source(override, out_dir):\n"
+            f"    candidates = []\n"
+            f"    if override:\n"
+            f"        p = Path(override)\n"
+            f"        if not p.is_absolute():\n"
+            f"            candidates = [out_dir / override, "
+            f"Path({repr(pipeline_root_str)}) / override]\n"
+            f"        else:\n"
+            f"            candidates = [p]\n"
+            f"    if not candidates:\n"
+            f"        candidates = [out_dir]\n"
+            f"    for c in candidates:\n"
+            f"        if c.is_dir():\n"
+            f"            for sub in ('reap_model', 'heretic_model', 'merged_model'):\n"
+            f"                _p = c / sub\n"
+            f"                if _p.exists() and any(_p.glob('*.safetensors')):\n"
+            f"                    return str(_p)\n"
+            f"            if any(c.glob('*.safetensors')):\n"
+            f"                return str(c)\n"
+            f"    return None\n"
+            f"\n"
+            f"source = _resolve_source(override, out_dir)\n"
+            f"if not source:\n"
+            f"    print('Error: no safetensors source model found. Enable an "
+            f"upstream stage (export/heretic/reap) or set OnnxConfig.source_model.')\n"
+            f"    sys.exit(1)\n"
+            f"print(f'ONNX source: {{source}}')\n"
+            f"\n"
+            f"run_onnx_pipeline(\n"
+            f"    source_dir=source,\n"
+            f"    quark_dir=str(out_dir / 'quark_safetensors'),\n"
+            f"    onnx_dir=str(out_dir / 'onnx_model'),\n"
+            f"    quant_scheme={repr(quant_scheme)},\n"
+            f"    quant_algo={repr(quant_algo)},\n"
+            f"    execution_provider={repr(execution_provider)},\n"
+            f"    data_type={repr(data_type)},\n"
+            f"    num_calib_data={num_calib_data},\n"
+            f"    seq_len={seq_len},\n"
+            f"    calib_dataset={repr(calib_dataset)},\n"
+            f"    cleanup_intermediates={cleanup_intermediates},\n"
+            f")\n"
+            f"print('PIPELINE_STAGE_COMPLETE=onnx')\n"
+        )
+        return script
