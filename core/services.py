@@ -898,6 +898,8 @@ class UploadService:
         did_heretic: bool = False,
         did_reap: bool = False,
         did_magicquant: bool = True,
+        did_onnx: bool = False,
+        upload_onnx: bool = True,
         lora_r: int,
         lora_alpha: int,
         lora_dropout: float,
@@ -924,12 +926,14 @@ class UploadService:
             f"    upload_lora={upload_lora},\n"
             f"    upload_merged={upload_merged},\n"
             f"    upload_dataset={upload_dataset},\n"
+            f"    upload_onnx={upload_onnx},\n"
             f"    base_model={repr(base_model)},\n"
             f"    dataset_name={repr(dataset_name)},\n"
             f"    did_training={did_training},\n"
             f"    did_heretic={did_heretic},\n"
             f"    did_reap={did_reap},\n"
             f"    did_magicquant={did_magicquant},\n"
+            f"    did_onnx={did_onnx},\n"
             f"    lora_r={lora_r},\n"
             f"    lora_alpha={lora_alpha},\n"
             f"    lora_dropout={lora_dropout},\n"
