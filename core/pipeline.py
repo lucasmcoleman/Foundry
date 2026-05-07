@@ -100,6 +100,24 @@ class MagicQuantConfig:
     llamacpp_path: Optional[str] = None
 
 
+@dataclass
+class OnnxConfig:
+    """AMD Quark INT4 AWQ → ORT-GenAI ONNX for Lemonade NPU+iGPU hybrid serving.
+
+    Output: <output_dir>/onnx_model/ (model.onnx, model.onnx.data, genai_config.json,
+    tokenizer files). Drop-in for `lemonade pull <hf_repo>` then `lemonade run`.
+    """
+    quant_scheme: str = "uint4_wo_128"          # uint4_wo_32 | uint4_wo_64 | uint4_wo_128
+    quant_algo: str = "awq"                      # awq | gptq
+    execution_provider: str = "dml"              # dml (hybrid) | cpu (NPU-only); dml only tested
+    data_type: str = "float16"                   # float16 | bfloat16
+    num_calib_data: int = 128
+    seq_len: int = 512
+    calib_dataset: str = "pileval_for_awq_benchmark"  # HF id or local .jsonl path
+    cleanup_intermediates: bool = True           # delete quark_safetensors/ after build
+    source_model: str = ""                       # override when running without upstream stages
+
+
 def detect_license(model_id: str) -> str:
     """Fetch the license from a HuggingFace model's metadata.
 
@@ -143,6 +161,7 @@ class PipelineConfig:
     heretic: Optional[HereticConfig] = None
     reap: Optional[ReapConfig] = None
     magicquant: Optional[MagicQuantConfig] = field(default_factory=MagicQuantConfig)
+    onnx: Optional[OnnxConfig] = None
     upload: Optional[UploadConfig] = None
 
 
@@ -176,6 +195,14 @@ class Artifacts:
     @property
     def magicquant_dir(self) -> Path:
         return self.output_dir / "magicquant"
+
+    @property
+    def quark_dir(self) -> Path:
+        return self.output_dir / "quark_safetensors"
+
+    @property
+    def onnx_dir(self) -> Path:
+        return self.output_dir / "onnx_model"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1380,6 +1407,7 @@ STAGES = [
     ("heretic",    stage_heretic),
     ("reap",       stage_reap),
     ("magicquant", stage_magicquant),
+    # ("onnx",       stage_onnx),     # uncommented in Task 4 when stage_onnx is defined
     ("upload",     stage_upload),
 ]
 
