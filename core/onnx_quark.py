@@ -1,0 +1,252 @@
+"""Runtime helper for the ONNX pipeline stage.
+
+This module is imported by the subprocess script generated in
+core/services.py:OnnxService. It handles:
+
+  - ensuring the amd-quark and onnxruntime-genai pip packages are installed
+  - cloning the AMD Quark GitHub repo (the reference quantize_quark.py
+    script lives there, not in the pip wheel)
+  - invoking quantize_quark.py with the right argv
+  - invoking python -m onnxruntime_genai.models.builder with the right argv
+  - copying tokenizer files into the final onnx_model/ directory
+  - optionally cleaning up the intermediate quark_safetensors/
+
+End-to-end behavior is covered by tests/test_onnx_stage.py.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Callable, Optional
+
+QUARK_REPO_URL = "https://github.com/amd/Quark.git"
+QUARK_REPO_BRANCH = "release/0.11"   # pinned; bump deliberately
+QUARK_HOME = Path.home() / "quark-amd"
+QUARK_SCRIPT_RELPATH = Path("examples/torch/language_modeling/llm_ptq/quantize_quark.py")
+
+LogFn = Callable[[str], None]
+
+
+def _default_log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def ensure_quark_installed(log: LogFn = _default_log) -> None:
+    """Install amd-quark and onnxruntime-genai into the current venv if missing.
+
+    Raises RuntimeError if pip install fails — we don't silently skip the stage.
+    """
+    missing = []
+    try:
+        import quark.torch  # noqa: F401
+    except ImportError:
+        missing.append("amd-quark>=0.11")
+    try:
+        import onnxruntime_genai  # noqa: F401
+    except ImportError:
+        missing.append("onnxruntime-genai>=0.6")
+
+    if not missing:
+        log("amd-quark and onnxruntime-genai already installed")
+        return
+
+    log(f"Installing: {', '.join(missing)}")
+    rc = subprocess.run(
+        [sys.executable, "-m", "pip", "install", *missing],
+        check=False,
+    ).returncode
+    if rc != 0:
+        raise RuntimeError(
+            f"pip install failed (exit {rc}) for: {missing}. "
+            "Cannot proceed with ONNX stage."
+        )
+    log("Install complete")
+
+
+def ensure_quark_repo(log: LogFn = _default_log) -> Path:
+    """Clone the AMD Quark GitHub repo if it isn't already at QUARK_HOME.
+
+    Returns the local repo path. Raises RuntimeError on clone failure.
+    """
+    if (QUARK_HOME / QUARK_SCRIPT_RELPATH).exists():
+        log(f"Quark repo found at {QUARK_HOME}")
+        return QUARK_HOME
+
+    log(f"Cloning amd/Quark ({QUARK_REPO_BRANCH}) to {QUARK_HOME}")
+    rc = subprocess.run(
+        ["git", "clone", "--depth", "1",
+         "--branch", QUARK_REPO_BRANCH,
+         QUARK_REPO_URL, str(QUARK_HOME)],
+        check=False,
+    ).returncode
+    if rc != 0:
+        raise RuntimeError(
+            f"git clone of {QUARK_REPO_URL} failed (exit {rc})"
+        )
+
+    if not (QUARK_HOME / QUARK_SCRIPT_RELPATH).exists():
+        raise RuntimeError(
+            f"Cloned repo at {QUARK_HOME} does not contain "
+            f"{QUARK_SCRIPT_RELPATH} — branch may have moved"
+        )
+    log(f"Quark repo cloned to {QUARK_HOME}")
+    return QUARK_HOME
+
+
+def find_quantize_quark_script() -> Optional[Path]:
+    """Return the path to quantize_quark.py if the cloned repo contains it."""
+    candidate = QUARK_HOME / QUARK_SCRIPT_RELPATH
+    return candidate if candidate.exists() else None
+
+
+def build_quark_argv(
+    *,
+    script_path: str,
+    model_dir: str,
+    output_dir: str,
+    quant_scheme: str,
+    quant_algo: str,
+    data_type: str,
+    num_calib_data: int,
+    seq_len: int,
+    calib_dataset: str,
+) -> list[str]:
+    """Construct the argv list for quantize_quark.py.
+
+    Mirrors the recipe documented at
+    https://quark.docs.amd.com/latest/supported_accelerators/ryzenai/tutorial_uint4_oga.html
+    for INT4 AWQ -> HF-format safetensors suitable for the OGA builder.
+    """
+    return [
+        sys.executable, script_path,
+        "--model_dir", model_dir,
+        "--output_dir", output_dir,
+        "--quant_scheme", quant_scheme,
+        "--quant_algo", quant_algo,
+        "--data_type", data_type,
+        "--num_calib_data", str(num_calib_data),
+        "--seq_len", str(seq_len),
+        "--dataset", calib_dataset,
+        "--model_export", "hf_format",
+        "--custom_mode", "awq",
+    ]
+
+
+def build_oga_builder_argv(
+    *,
+    input_dir: str,
+    output_dir: str,
+    precision: str = "int4",
+    execution_provider: str = "dml",
+) -> list[str]:
+    """Construct the argv list for `python -m onnxruntime_genai.models.builder`."""
+    return [
+        sys.executable, "-m", "onnxruntime_genai.models.builder",
+        "-i", input_dir,
+        "-o", output_dir,
+        "-p", precision,
+        "-e", execution_provider,
+    ]
+
+
+def _copy_tokenizer_files(source_dir: Path, dest_dir: Path, log: LogFn) -> None:
+    """Copy tokenizer + chat-template files from source to dest if not already there.
+
+    The OGA builder copies most of these itself, but we double-check so the
+    final onnx_model/ is a complete drop-in for `lemonade pull`.
+    """
+    files = [
+        "tokenizer.json", "tokenizer_config.json",
+        "special_tokens_map.json", "tokenizer.model",
+        "chat_template.jinja", "vocab.json", "merges.txt",
+    ]
+    for name in files:
+        src = source_dir / name
+        dst = dest_dir / name
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
+            log(f"  copied {name}")
+
+
+def run_onnx_pipeline(
+    *,
+    source_dir: str,
+    quark_dir: str,
+    onnx_dir: str,
+    quant_scheme: str,
+    quant_algo: str,
+    execution_provider: str,
+    data_type: str,
+    num_calib_data: int,
+    seq_len: int,
+    calib_dataset: str,
+    cleanup_intermediates: bool,
+    log: LogFn = _default_log,
+) -> None:
+    """Run the full ONNX build: Quark -> OGA builder -> tokenizer copy -> cleanup.
+
+    Raises RuntimeError on any subprocess failure. Idempotent at the directory
+    level: if onnx_dir already contains model.onnx, returns early.
+    """
+    onnx_dir_p = Path(onnx_dir)
+    quark_dir_p = Path(quark_dir)
+    source_dir_p = Path(source_dir)
+
+    if (onnx_dir_p / "model.onnx").exists():
+        log(f"ONNX model already exists at {onnx_dir} — skipping")
+        return
+
+    if not source_dir_p.exists():
+        raise RuntimeError(f"Source model not found: {source_dir}")
+
+    ensure_quark_installed(log)
+    ensure_quark_repo(log)
+
+    script = find_quantize_quark_script()
+    if script is None:
+        raise RuntimeError(
+            f"quantize_quark.py not found in {QUARK_HOME / QUARK_SCRIPT_RELPATH}"
+        )
+
+    quark_dir_p.mkdir(parents=True, exist_ok=True)
+    onnx_dir_p.mkdir(parents=True, exist_ok=True)
+
+    log(f"Running Quark INT4 AWQ quantization -> {quark_dir}")
+    quark_argv = build_quark_argv(
+        script_path=str(script),
+        model_dir=str(source_dir_p),
+        output_dir=str(quark_dir_p),
+        quant_scheme=quant_scheme,
+        quant_algo=quant_algo,
+        data_type=data_type,
+        num_calib_data=num_calib_data,
+        seq_len=seq_len,
+        calib_dataset=calib_dataset,
+    )
+    rc = subprocess.run(quark_argv, check=False).returncode
+    if rc != 0:
+        raise RuntimeError(f"Quark quantization failed (exit {rc})")
+
+    log(f"Running ORT-GenAI model builder -> {onnx_dir}")
+    oga_argv = build_oga_builder_argv(
+        input_dir=str(quark_dir_p),
+        output_dir=str(onnx_dir_p),
+        precision="int4",
+        execution_provider=execution_provider,
+    )
+    rc = subprocess.run(oga_argv, check=False).returncode
+    if rc != 0:
+        raise RuntimeError(f"ORT-GenAI model builder failed (exit {rc})")
+
+    log("Copying tokenizer files")
+    _copy_tokenizer_files(source_dir_p, onnx_dir_p, log)
+
+    if cleanup_intermediates:
+        log(f"Cleaning up intermediate {quark_dir}")
+        shutil.rmtree(quark_dir_p, ignore_errors=True)
+
+    log(f"ONNX build complete: {onnx_dir}")
