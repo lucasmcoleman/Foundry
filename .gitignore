@@ -43,3 +43,9 @@ unsloth_compiled_cache/
 
 # pytest
 .pytest_cache/
+
+# Local worktrees
+.worktrees/
+
+# Spec/plan working dirs (tracked separately if needed)
+# (intentionally NOT ignored: docs/superpowers/ is committed)
