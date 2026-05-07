@@ -722,6 +722,7 @@ def upload(
         upload_gguf=cfg.upload_gguf,
         upload_lora=cfg.upload_lora,
         upload_merged=cfg.upload_merged,
+        upload_onnx=cfg.upload_onnx,
     )
 
     if not files_to_upload:
