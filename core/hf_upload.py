@@ -79,6 +79,7 @@ def discover_upload_files(
     upload_gguf: bool = True,
     upload_lora: bool = False,
     upload_merged: bool = False,
+    upload_onnx: bool = False,
 ) -> list[tuple[Path, str]]:
     """Find files to upload from the output directory.
 
@@ -112,6 +113,14 @@ def discover_upload_files(
                 gguf_files = [bf16]
         for f in gguf_files:
             files.append((f, f.name))
+
+    if upload_onnx:
+        onnx_dir = out / "onnx_model"
+        if onnx_dir.exists() and (onnx_dir / "model.onnx").exists():
+            for f in sorted(onnx_dir.rglob("*")):
+                if f.is_file():
+                    rel = f.relative_to(onnx_dir)
+                    files.append((f, f"onnx_model/{rel}"))
 
     return files
 
@@ -223,7 +232,7 @@ def generate_model_card(
     base_model_relation = "finetune" if is_finetune else "quantized"
 
     # Dynamic library_name and quantized_by
-    library_name = "llama.cpp" if has_gguf else "transformers"
+    library_name = "llama.cpp" if has_gguf else ("onnxruntime-genai" if cfg.did_onnx else "transformers")
     quantized_by = "MagicQuant" if cfg.did_magicquant else ""
 
     yaml_block = f"""---
@@ -482,6 +491,16 @@ def _upload_with_retry(api, **kwargs):
     wait=wait_exponential(min=2, max=30),
     retry=retry_if_exception_type(requests.exceptions.RequestException),
 )
+def _upload_folder_with_retry(api, **kwargs):
+    """Upload a folder to HuggingFace with automatic retry on transient failures."""
+    return api.upload_folder(**kwargs)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=2, max=30),
+    retry=retry_if_exception_type(requests.exceptions.RequestException),
+)
 def _whoami_with_retry(api):
     """Validate HuggingFace token with automatic retry on transient failures."""
     return api.whoami()
@@ -595,6 +614,7 @@ def dry_run(
         upload_gguf=cfg.upload_gguf,
         upload_lora=cfg.upload_lora,
         upload_merged=cfg.upload_merged,
+        upload_onnx=cfg.upload_onnx,
     )
 
     if not file_tuples:
@@ -794,7 +814,8 @@ def upload(
         if onnx_dir.exists() and (onnx_dir / "model.onnx").exists():
             log(f"Uploading {onnx_dir} → onnx_model/", "info")
             try:
-                api.upload_folder(
+                _upload_folder_with_retry(
+                    api,
                     folder_path=str(onnx_dir),
                     path_in_repo="onnx_model",
                     repo_id=cfg.repo_id,
