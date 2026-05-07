@@ -1285,6 +1285,90 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -
         return False
 
 
+# ── Stage: ONNX (AMD Quark INT4 AWQ + ORT-GenAI builder) ─────────────────────
+#
+# Builds an ONNX model directory for OGA hybrid (NPU+iGPU) execution via
+# Lemonade Server on Linux. Sibling to magicquant — both can run from the
+# same upstream artifacts, neither blocks the other.
+
+def stage_onnx(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
+    """Run AMD Quark INT4 AWQ + ORT-GenAI model builder.
+
+    Reads from same source priority as magicquant: reap > heretic > merged.
+    Writes onnx_model/ alongside any existing magicquant/ output. The actual
+    Quark + OGA invocations live in core.onnx_quark.run_onnx_pipeline().
+    """
+    log("Starting ONNX (Quark INT4 AWQ + OGA builder)", "stage")
+
+    # Skip if final artifact already present.
+    if artifacts.onnx_dir.exists() and (artifacts.onnx_dir / "model.onnx").exists():
+        log(f"ONNX model already exists at {artifacts.onnx_dir} — skipping", "success")
+        return True
+
+    # Determine source: same priority as MagicQuant.
+    if artifacts.reap_dir.exists() and any(artifacts.reap_dir.glob("*.safetensors")):
+        source_path = str(artifacts.reap_dir)
+        log(f"Source: REAP-pruned model at {source_path}")
+    elif artifacts.heretic_dir.exists() and any(artifacts.heretic_dir.glob("*.safetensors")):
+        source_path = str(artifacts.heretic_dir)
+        log(f"Source: abliterated model at {source_path}")
+    elif artifacts.merged_dir.exists() and any(artifacts.merged_dir.glob("*.safetensors")):
+        source_path = str(artifacts.merged_dir)
+        log(f"Source: merged safetensors at {source_path}")
+    elif config.onnx and config.onnx.source_model:
+        source_path = config.onnx.source_model
+        log(f"Source: explicit override at {source_path}")
+    else:
+        log("No safetensors source model found — run export first or set OnnxConfig.source_model", "error")
+        return False
+
+    oc = config.onnx
+    _project_root = Path(__file__).resolve().parent.parent
+
+    # Subprocess script — keep imports minimal; the heavy lifting is in core/onnx_quark.py.
+    script = f'''
+import os, sys
+from pathlib import Path
+os.environ["HSA_ENABLE_SDMA"] = "0"
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
+os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+
+sys.path.insert(0, str(Path({repr(str(_project_root))}) / "core"))
+from onnx_quark import run_onnx_pipeline
+
+run_onnx_pipeline(
+    source_dir={source_path!r},
+    quark_dir={str(artifacts.quark_dir)!r},
+    onnx_dir={str(artifacts.onnx_dir)!r},
+    quant_scheme={oc.quant_scheme!r},
+    quant_algo={oc.quant_algo!r},
+    execution_provider={oc.execution_provider!r},
+    data_type={oc.data_type!r},
+    num_calib_data={oc.num_calib_data},
+    seq_len={oc.seq_len},
+    calib_dataset={oc.calib_dataset!r},
+    cleanup_intermediates={oc.cleanup_intermediates},
+)
+print("PIPELINE_STAGE_COMPLETE=onnx")
+'''
+
+    script_path = artifacts.output_dir / "_stage_onnx.py"
+    script_path.write_text(script)
+
+    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(_project_root))
+    if rc != 0:
+        log(f"ONNX stage failed (exit code {rc})", "error")
+        return False
+
+    if not (artifacts.onnx_dir / "model.onnx").exists():
+        log("ONNX stage completed but model.onnx not found — investigate", "error")
+        return False
+
+    size_gb = (artifacts.onnx_dir / "model.onnx.data").stat().st_size / 1e9 if (artifacts.onnx_dir / "model.onnx.data").exists() else 0
+    log(f"ONNX model written: {artifacts.onnx_dir} ({size_gb:.1f} GB weights)", "success")
+    return True
+
+
 # ── Stage: Upload ────────────────────────────────────────────────────────────
 
 def _resolve_license(uc: UploadConfig, model_name: str, log: LogFn) -> str:
@@ -1337,6 +1421,7 @@ def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         did_heretic="heretic" in _enabled,
         did_reap="reap" in _enabled,
         did_magicquant="magicquant" in _enabled,
+        did_onnx="onnx" in _enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
         lora_dropout=tc.lora_dropout,
@@ -1384,6 +1469,7 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
         did_heretic="heretic" in _enabled,
         did_reap="reap" in _enabled,
         did_magicquant="magicquant" in _enabled,
+        did_onnx="onnx" in _enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
         lora_dropout=tc.lora_dropout,
@@ -1407,7 +1493,7 @@ STAGES = [
     ("heretic",    stage_heretic),
     ("reap",       stage_reap),
     ("magicquant", stage_magicquant),
-    # ("onnx",       stage_onnx),     # uncommented in Task 4 when stage_onnx is defined
+    ("onnx",       stage_onnx),
     ("upload",     stage_upload),
 ]
 
@@ -1428,6 +1514,8 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log) -> dict[str,
         enabled.add("reap")
     if config.magicquant is not None:
         enabled.add("magicquant")
+    if config.onnx is not None:
+        enabled.add("onnx")
     if config.upload is not None:
         enabled.add("upload")
 
@@ -1538,6 +1626,8 @@ if __name__ == "__main__":
             _dry_enabled.add("reap")
         if cfg.magicquant is not None:
             _dry_enabled.add("magicquant")
+        if cfg.onnx is not None:
+            _dry_enabled.add("onnx")
         if cfg.upload is not None:
             _dry_enabled.add("upload")
         report = stage_upload_dry_run(cfg, artifacts, _default_log, enabled=_dry_enabled)
