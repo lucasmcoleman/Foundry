@@ -1309,6 +1309,8 @@ def stage_onnx(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool
     if artifacts.reap_dir.exists() and any(artifacts.reap_dir.glob("*.safetensors")):
         source_path = str(artifacts.reap_dir)
         log(f"Source: REAP-pruned model at {source_path}")
+    # Stricter check than stage_magicquant: require *.safetensors to be present
+    # so a partially-written heretic output doesn't get picked up as a valid source.
     elif artifacts.heretic_dir.exists() and any(artifacts.heretic_dir.glob("*.safetensors")):
         source_path = str(artifacts.heretic_dir)
         log(f"Source: abliterated model at {source_path}")
@@ -1332,6 +1334,7 @@ from pathlib import Path
 os.environ["HSA_ENABLE_SDMA"] = "0"
 os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 sys.path.insert(0, str(Path({repr(str(_project_root))}) / "core"))
 from onnx_quark import run_onnx_pipeline
@@ -1364,7 +1367,8 @@ print("PIPELINE_STAGE_COMPLETE=onnx")
         log("ONNX stage completed but model.onnx not found — investigate", "error")
         return False
 
-    size_gb = (artifacts.onnx_dir / "model.onnx.data").stat().st_size / 1e9 if (artifacts.onnx_dir / "model.onnx.data").exists() else 0
+    data_file = artifacts.onnx_dir / "model.onnx.data"
+    size_gb = data_file.stat().st_size / 1e9 if data_file.exists() else 0
     log(f"ONNX model written: {artifacts.onnx_dir} ({size_gb:.1f} GB weights)", "success")
     return True
 
@@ -1421,6 +1425,8 @@ def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         did_heretic="heretic" in _enabled,
         did_reap="reap" in _enabled,
         did_magicquant="magicquant" in _enabled,
+        # NOTE: HFUploadConfig.did_onnx is added in Task 7. Until then, runs
+        # combining onnx and upload will TypeError.
         did_onnx="onnx" in _enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
@@ -1469,6 +1475,8 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
         did_heretic="heretic" in _enabled,
         did_reap="reap" in _enabled,
         did_magicquant="magicquant" in _enabled,
+        # NOTE: HFUploadConfig.did_onnx is added in Task 7. Until then, runs
+        # combining onnx and upload will TypeError.
         did_onnx="onnx" in _enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
