@@ -167,7 +167,7 @@ class OnnxCfg(BaseModel):
     seq_len: int = 512
     calib_dataset: str = "pileval_for_awq_benchmark"
     cleanup_intermediates: bool = True
-    source_model: str = ""
+    source_model: str = ""  # override when running onnx stage without upstream stages
 
 class UploadCfg(BaseModel):
     repo_id: str = ""
