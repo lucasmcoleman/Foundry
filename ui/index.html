@@ -596,7 +596,7 @@ const S = {
     reap: { compression_ratio: 0.25, prune_method: 'reap', samples_per_category: 512, model_max_length: 2048, dataset_name: 'theblackcat102/evol-codealpaca-v1', seed: 42 },
     magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '' },
     onnx: { quant_scheme: 'uint4_wo_128', quant_algo: 'awq', execution_provider: 'dml', data_type: 'float16', num_calib_data: 128, seq_len: 512, calib_dataset: 'pileval_for_awq_benchmark', cleanup_intermediates: true, source_model: '' },
-    upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
+    upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true, upload_onnx: true },
   },
   mqTiers: ['Q2','Q3','Q4','Q5','Q6','Q8'],
   hfUsername: '',
@@ -1341,6 +1341,7 @@ function renderUpload() {
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_lora" ${c.upload_lora?'checked':''}><span class="form-label" style="margin:0">LoRA adapters</span></label></div>
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_merged" ${c.upload_merged?'checked':''}><span class="form-label" style="margin:0">Merged model (large)</span></label></div>
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_dataset" ${c.upload_dataset?'checked':''}><span class="form-label" style="margin:0">Training dataset (separate repo)</span></label></div>
+    <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_onnx" ${c.upload_onnx?'checked':''}><span class="form-label" style="margin:0">ONNX model (onnx_model/)</span></label></div>
   </div>
   <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-2);margin-top:16px;">Requires <code style="color:var(--amber)">HF_TOKEN</code> environment variable with write access. Set it in your shell before starting the Foundry server.</div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Upload</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>

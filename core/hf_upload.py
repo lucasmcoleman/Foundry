@@ -327,8 +327,7 @@ based on the methodology by **[magiccodingman](https://github.com/magiccodingman
     if cfg.did_onnx:
         body_sections.append(f"""## ONNX (INT4 AWQ — OGA Hybrid for NPU+iGPU)
 
-This model includes an ONNX export quantized with **[AMD Quark](https://quark.docs.amd.com/)** using the
-`w4a16` (INT4 AWQ) scheme, compatible with the
+This model includes an ONNX export quantized with **[AMD Quark](https://quark.docs.amd.com/)** (INT4 AWQ weight-only quantization), compatible with the
 **[ONNX Runtime GenAI](https://github.com/microsoft/onnxruntime-genai)** (OGA) hybrid execution
 provider targeting AMD NPU + iGPU.
 
@@ -342,7 +341,7 @@ which provides an OpenAI-compatible API backed by ORT-GenAI:
 lemonade pull {cfg.repo_id}
 
 # Run the server
-lemonade run {cfg.repo_id}
+lemonade run {cfg.repo_id.split('/')[-1]}
 ```
 
 The ONNX artifacts are located in the `onnx_model/` directory of this repository.""")
