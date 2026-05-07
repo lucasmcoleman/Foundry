@@ -979,6 +979,7 @@ class OnnxService:
         cleanup_intermediates: bool,
     ) -> str:
         """Generate the subprocess script text for the ONNX stage."""
+        # Source is always a local safetensors directory — no HF cache probe needed.
         script = _env_preamble()
         script += (
             f"\nimport sys\n"
@@ -1000,6 +1001,7 @@ class OnnxService:
             f"            candidates = [p]\n"
             f"    if not candidates:\n"
             f"        candidates = [out_dir]\n"
+            f"    # Note: no c.is_file() branch — Quark needs a directory, not a single file.\n"
             f"    for c in candidates:\n"
             f"        if c.is_dir():\n"
             f"            for sub in ('reap_model', 'heretic_model', 'merged_model'):\n"
