@@ -423,6 +423,14 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
           <label class="toggle"><input type="checkbox" onchange="toggleStage('magicquant',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
         </div>
       </div>
+      <div class="stage-item" data-stage="onnx" data-status="pending" onclick="selectStage('onnx')">
+        <div class="stage-indicator"></div>
+        <div class="stage-name">ONNX</div>
+        <div class="stage-desc">Quark + OGA hybrid (NPU)</div>
+        <div class="stage-toggle" onclick="event.stopPropagation()">
+          <label class="toggle"><input type="checkbox" id="onnx-enable" onchange="toggleStage('onnx',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+      </div>
       <div class="stage-item" data-stage="upload" data-status="pending" onclick="selectStage('upload')">
         <div class="stage-indicator"></div>
         <div class="stage-name">Upload</div>
@@ -587,6 +595,7 @@ const S = {
     heretic: { n_trials: 200, n_startup_trials: 60, quantization: 'bnb_4bit', kl_divergence_scale: 1.0, orthogonalize_direction: false, row_normalization: 'none' },
     reap: { compression_ratio: 0.25, prune_method: 'reap', samples_per_category: 512, model_max_length: 2048, dataset_name: 'theblackcat102/evol-codealpaca-v1', seed: 42 },
     magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '' },
+    onnx: { quant_scheme: 'uint4_wo_128', quant_algo: 'awq', execution_provider: 'dml', data_type: 'float16', num_calib_data: 128, seq_len: 512, calib_dataset: 'pileval_for_awq_benchmark', cleanup_intermediates: true, source_model: '' },
     upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
   mqTiers: ['Q2','Q3','Q4','Q5','Q6','Q8'],
@@ -734,7 +743,7 @@ async function saveCurrentWorkflow() {
     showStatus('Invalid name. Use letters, numbers, hyphens, underscores only.', 'error');
     return;
   }
-  const stageOrder = ['training', 'export', 'heretic', 'reap', 'magicquant', 'upload'];
+  const stageOrder = ['training', 'export', 'heretic', 'reap', 'magicquant', 'onnx', 'upload'];
   const enabled = stageOrder.filter(s => S.enabledStages.has(s));
   const payload = {
     training: S.config.training,
@@ -742,6 +751,7 @@ async function saveCurrentWorkflow() {
     heretic: S.config.heretic,
     reap: S.config.reap,
     magicquant: S.config.magicquant,
+    onnx: S.config.onnx,
     upload: S.config.upload,
     enabled_stages: enabled,
   };
@@ -799,7 +809,7 @@ function applyWorkflow(data) {
   }
   // Restore enabled stages (ignore unknown stages from old saves)
   if (data.enabled_stages) {
-    const validStages = new Set(['training', 'export', 'heretic', 'reap', 'magicquant', 'upload']);
+    const validStages = new Set(['training', 'export', 'heretic', 'reap', 'magicquant', 'onnx', 'upload']);
     S.enabledStages = new Set(data.enabled_stages.filter(s => validStages.has(s)));
   }
   // Sync sidebar toggles
@@ -955,7 +965,7 @@ function toggleStage(name, on) {
  * Binds data-key inputs to S.config and persists changes to localStorage.
  */
 function renderStageContent() {
-  const r = {training: renderTraining, export: renderExport, heretic: renderHeretic, reap: renderReap, magicquant: renderMagicQuant, upload: renderUpload};
+  const r = {training: renderTraining, export: renderExport, heretic: renderHeretic, reap: renderReap, magicquant: renderMagicQuant, onnx: renderOnnx, upload: renderUpload};
   const container = document.getElementById('stage-content');
   if (!container) return;
   container.innerHTML = (r[S.selectedStage] || (() => ''))();
@@ -1277,6 +1287,34 @@ function renderMagicQuant() {
   </div>`;
 }
 
+/** @returns {string} HTML for the ONNX (Quark + OGA) configuration panel. */
+function renderOnnx() {
+  const c = S.config.onnx;
+  const on = S.enabledStages.has('onnx');
+  const exportOn = S.enabledStages.has('export');
+  const mqOn = S.enabledStages.has('magicquant');
+  const needsSource = !exportOn && !mqOn;
+  return `
+  <div class="section-header"><div class="section-title">ONNX</div><div class="section-badge badge-optional">Optional</div></div>
+  ${masterToggle('onnx', 'ONNX Stage')}
+  <div class="${on?'':'stage-content-disabled'}">
+  ${needsSource ? depBanner('warn', 'Export and MagicQuant are both disabled. Provide a path to a merged safetensors directory or HuggingFace model ID below. If previous pipeline artifacts exist in the output directory, those will be used automatically.') : ''}
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-1);margin-bottom:20px;">Runs AMD Quark INT4 quantization and packages the result as an ONNX model via Olive/OGA for hybrid NPU+iGPU inference via Lemonade. Output goes to <code>&lt;output_dir&gt;/onnx_model/</code>.</div>
+  <div class="form-grid">
+    ${needsSource ? `<div class="form-group span-2">${L('Source Model','Path to a merged safetensors directory or HuggingFace model ID. If left empty, will look for existing artifacts in the output directory.')}<input class="form-input" id="onnx-source-model" data-key="onnx.source_model" value="${c.source_model}" placeholder="auto-detect from output directory"></div>` : ''}
+    <div class="form-group">${L('Quant Scheme','Weight-only INT4 block size. Larger blocks (128) are faster to calibrate; smaller (32) can yield better quality on some models.')}<select class="form-input" id="onnx-quant-scheme" data-key="onnx.quant_scheme"><option value="uint4_wo_32" ${c.quant_scheme==='uint4_wo_32'?'selected':''}>uint4_wo_32</option><option value="uint4_wo_64" ${c.quant_scheme==='uint4_wo_64'?'selected':''}>uint4_wo_64</option><option value="uint4_wo_128" ${c.quant_scheme==='uint4_wo_128'?'selected':''}>uint4_wo_128</option></select></div>
+    <div class="form-group">${L('Quant Algorithm','Calibration algorithm. AWQ (Activation-aware Weight Quantization) generally outperforms GPTQ on AMD hardware.')}<select class="form-input" id="onnx-quant-algo" data-key="onnx.quant_algo"><option value="awq" ${c.quant_algo==='awq'?'selected':''}>awq</option><option value="gptq" ${c.quant_algo==='gptq'?'selected':''}>gptq</option></select></div>
+    <div class="form-group">${L('Execution Provider','dml = hybrid NPU+iGPU via DirectML (recommended for Strix Halo). cpu = NPU-only path, less tested.')}<select class="form-input" id="onnx-ep" data-key="onnx.execution_provider"><option value="dml" ${c.execution_provider==='dml'?'selected':''}>dml (NPU+iGPU)</option><option value="cpu" ${c.execution_provider==='cpu'?'selected':''}>cpu (NPU-only)</option></select></div>
+    <div class="form-group">${L('Data Type','Compute dtype for non-quantized activations. float16 is recommended for DML; bfloat16 may improve stability on some models.')}<select class="form-input" id="onnx-data-type" data-key="onnx.data_type"><option value="float16" ${c.data_type==='float16'?'selected':''}>float16</option><option value="bfloat16" ${c.data_type==='bfloat16'?'selected':''}>bfloat16</option></select></div>
+    <div class="form-group">${L('Calib Samples','Number of calibration sequences. More samples improve quantization accuracy but increase calibration time. 128 is a good default.')}<input class="form-input" type="number" id="onnx-num-calib-data" data-key="onnx.num_calib_data" value="${c.num_calib_data}"></div>
+    <div class="form-group">${L('Seq Length','Token sequence length for calibration samples. Should match the model&apos;s typical input length.')}<input class="form-input" type="number" id="onnx-seq-len" data-key="onnx.seq_len" value="${c.seq_len}"></div>
+    <div class="form-group span-2">${L('Calib Dataset','HuggingFace dataset name for calibration. pileval_for_awq_benchmark is the standard reference dataset used by AWQ.')}<input class="form-input" id="onnx-calib-dataset" data-key="onnx.calib_dataset" value="${c.calib_dataset}"></div>
+    <div class="form-group span-2"><label class="checkbox-row"><input type="checkbox" id="onnx-cleanup-intermediates" data-key="onnx.cleanup_intermediates" ${c.cleanup_intermediates?'checked':''}><span class="form-label" data-tip="Removes the quark_safetensors/ intermediate directory after the ONNX model is built, saving ~20–40 GB of disk space." style="margin:0">Clean up intermediates after build</span></label></div>
+  </div>
+  <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">ONNX</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
+  </div>`;
+}
+
 /** @returns {string} HTML for the HuggingFace Upload configuration panel. */
 function renderUpload() {
   const c = S.config.upload;
@@ -1362,7 +1400,7 @@ function toggleAutoScroll() {
 async function runPipeline() {
   if (S.running) return;
   dismissStatus();
-  const stageOrder = ['training', 'export', 'heretic', 'reap', 'magicquant', 'upload'];
+  const stageOrder = ['training', 'export', 'heretic', 'reap', 'magicquant', 'onnx', 'upload'];
   const enabled = stageOrder.filter(s => S.enabledStages.has(s));
   if (enabled.length === 0) {
     showStatus('Enable at least one stage before running.', 'error');
@@ -1378,6 +1416,7 @@ async function runPipeline() {
     heretic: S.config.heretic,
     reap: S.config.reap,
     magicquant: S.config.magicquant,
+    onnx: S.config.onnx,
     upload: S.config.upload,
     enabled_stages: enabled,
   };

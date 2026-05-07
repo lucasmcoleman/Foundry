@@ -62,3 +62,17 @@ output_dir: ./output
 hub_model_id: null                     # Set to "username/model-name" to push to HF
 save_merged: false                     # Save full merged model (large)
 save_gguf: false                       # Export GGUF quantizations
+
+# --- ONNX (AMD Quark + OGA hybrid for NPU+iGPU via Lemonade) ---
+# Set --onnx on the CLI or enable in the UI to activate this stage.
+# Output: <output_dir>/onnx_model/  (consumed by `lemonade pull <hf_repo>`)
+onnx:
+  quant_scheme: uint4_wo_128       # uint4_wo_32 | uint4_wo_64 | uint4_wo_128
+  quant_algo: awq                  # awq | gptq
+  execution_provider: dml          # dml = hybrid NPU+iGPU; cpu = NPU-only (less tested)
+  data_type: float16               # float16 | bfloat16
+  num_calib_data: 128
+  seq_len: 512
+  calib_dataset: pileval_for_awq_benchmark
+  cleanup_intermediates: true      # delete quark_safetensors/ after build
+  source_model: ""                 # override for runs without upstream stages
