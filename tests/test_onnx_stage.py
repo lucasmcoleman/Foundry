@@ -11,13 +11,13 @@ slower in CI; mark accordingly if/when CI gets one.
 
 import json
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 TINY_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"  # 135M params, OGA-supported arch
 
 
@@ -61,7 +61,6 @@ def test_onnx_stage_end_to_end(tiny_model_dir, tmp_path):
     output_dir = tmp_path / "run"
     output_dir.mkdir()
 
-    sys.path.insert(0, str(PROJECT_ROOT))
     from core.pipeline import (
         Artifacts,
         OnnxConfig,
@@ -97,9 +96,9 @@ def test_onnx_stage_end_to_end(tiny_model_dir, tmp_path):
     config = json.loads((onnx_dir / "genai_config.json").read_text())
     assert "model" in config, "genai_config.json missing 'model' top-level key"
 
-    # Tokenizer files should be present (copied by either OGA builder or our helper).
-    tokenizer_files = list(onnx_dir.glob("tokenizer*"))
-    assert tokenizer_files, "no tokenizer files in onnx_model/"
+    # tokenizer_config.json is critical — Lemonade reads it for OGA inference.
+    assert (onnx_dir / "tokenizer_config.json").exists(), \
+        "tokenizer_config.json missing — Lemonade needs this for OGA inference"
 
     # cleanup_intermediates=True should have deleted quark_safetensors/.
     assert not (output_dir / "quark_safetensors").exists(), (
@@ -113,7 +112,6 @@ def test_stage_onnx_skips_when_artifact_exists(tmp_path):
     This test does NOT require amd-quark or onnxruntime-genai — it only exercises
     the early-exit path in stage_onnx and runs fast + offline.
     """
-    sys.path.insert(0, str(PROJECT_ROOT))
     from core.pipeline import (
         Artifacts,
         OnnxConfig,
