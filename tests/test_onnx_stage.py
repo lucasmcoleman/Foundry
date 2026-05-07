@@ -18,7 +18,7 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-TINY_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"  # 135M params, OGA-supported arch
+TINY_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # 1.1B params, hidden_size=2048 (div by 128), OGA-supported
 
 
 @pytest.fixture(scope="module")
@@ -28,6 +28,11 @@ def _quark_deps():
     This fixture is a dependency of tiny_model_dir so the expensive
     model download never starts if Quark/OGA aren't present.
     """
+    # Install compat shim before probing so the import doesn't fail on torch nightlies.
+    sys.path.insert(0, str(PROJECT_ROOT / "core"))
+    import quark_torch_compat
+    quark_torch_compat.install()
+
     pytest.importorskip("quark.torch", reason="amd-quark not installed")
     pytest.importorskip("onnxruntime_genai", reason="onnxruntime-genai not installed")
 
