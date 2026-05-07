@@ -61,6 +61,20 @@ def test_oga_builder_argv_hybrid_dml():
 
 
 def test_find_quantize_quark_script_returns_none_when_repo_missing(tmp_path, monkeypatch):
-    # Point the helper at a known-empty home dir.
-    monkeypatch.setenv("HOME", str(tmp_path))
-    assert find_quantize_quark_script() is None
+    """If QUARK_HOME points at a directory that doesn't have the script, return None."""
+    import onnx_quark
+    monkeypatch.setattr(onnx_quark, "QUARK_HOME", tmp_path / "quark-amd-nope")
+    assert onnx_quark.find_quantize_quark_script() is None
+
+
+def test_find_quantize_quark_script_returns_path_when_present(tmp_path, monkeypatch):
+    """If QUARK_HOME contains the expected script, return its path."""
+    import onnx_quark
+    fake_home = tmp_path / "quark-amd"
+    script = fake_home / "examples/torch/language_modeling/llm_ptq/quantize_quark.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("# fake")
+
+    monkeypatch.setattr(onnx_quark, "QUARK_HOME", fake_home)
+    result = onnx_quark.find_quantize_quark_script()
+    assert result == script
