@@ -32,6 +32,7 @@ from services import (
     HereticService,
     ReapService,
     MagicQuantService,
+    OnnxService,
     UploadService,
 )
 
@@ -756,7 +757,6 @@ async def do_onnx(cfg: RunRequest) -> bool:
 
     onnx_source_override = oc.source_model if (oc.source_model and not export_enabled) else ""
 
-    from services import OnnxService
     svc = OnnxService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
         pipeline_root_str=str(FOUNDRY_ROOT),
@@ -928,6 +928,7 @@ async def validate_pipeline(cfg: RunRequest) -> bool:
 
     # ONNX without export: needs a source
     if "onnx" in enabled and "export" not in enabled:
+        # ONNX works on safetensors only — no GGUF fallback (unlike MagicQuant).
         oc = cfg.onnx
         source = oc.source_model if oc else ""
         has_reap = (out_abs / "reap_model").exists()
