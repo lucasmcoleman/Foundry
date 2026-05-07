@@ -16,7 +16,6 @@ End-to-end behavior is covered by tests/test_onnx_stage.py.
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -28,10 +27,10 @@ QUARK_REPO_BRANCH = "release/0.11"   # pinned; bump deliberately
 QUARK_HOME = Path.home() / "quark-amd"
 QUARK_SCRIPT_RELPATH = Path("examples/torch/language_modeling/llm_ptq/quantize_quark.py")
 
-LogFn = Callable[[str], None]
+LogFn = Callable[[str, str], None]
 
 
-def _default_log(msg: str) -> None:
+def _default_log(msg: str, level: str = "info") -> None:
     print(msg, flush=True)
 
 
@@ -51,10 +50,10 @@ def ensure_quark_installed(log: LogFn = _default_log) -> None:
         missing.append("onnxruntime-genai>=0.6")
 
     if not missing:
-        log("amd-quark and onnxruntime-genai already installed")
+        log("amd-quark and onnxruntime-genai already installed", "info")
         return
 
-    log(f"Installing: {', '.join(missing)}")
+    log(f"Installing: {', '.join(missing)}", "info")
     rc = subprocess.run(
         [sys.executable, "-m", "pip", "install", *missing],
         check=False,
@@ -64,7 +63,7 @@ def ensure_quark_installed(log: LogFn = _default_log) -> None:
             f"pip install failed (exit {rc}) for: {missing}. "
             "Cannot proceed with ONNX stage."
         )
-    log("Install complete")
+    log("Install complete", "info")
 
 
 def ensure_quark_repo(log: LogFn = _default_log) -> Path:
@@ -73,10 +72,10 @@ def ensure_quark_repo(log: LogFn = _default_log) -> Path:
     Returns the local repo path. Raises RuntimeError on clone failure.
     """
     if (QUARK_HOME / QUARK_SCRIPT_RELPATH).exists():
-        log(f"Quark repo found at {QUARK_HOME}")
+        log(f"Quark repo found at {QUARK_HOME}", "info")
         return QUARK_HOME
 
-    log(f"Cloning amd/Quark ({QUARK_REPO_BRANCH}) to {QUARK_HOME}")
+    log(f"Cloning amd/Quark ({QUARK_REPO_BRANCH}) to {QUARK_HOME}", "stage")
     rc = subprocess.run(
         ["git", "clone", "--depth", "1",
          "--branch", QUARK_REPO_BRANCH,
@@ -93,7 +92,7 @@ def ensure_quark_repo(log: LogFn = _default_log) -> Path:
             f"Cloned repo at {QUARK_HOME} does not contain "
             f"{QUARK_SCRIPT_RELPATH} — branch may have moved"
         )
-    log(f"Quark repo cloned to {QUARK_HOME}")
+    log(f"Quark repo cloned to {QUARK_HOME}", "info")
     return QUARK_HOME
 
 
@@ -163,13 +162,14 @@ def _copy_tokenizer_files(source_dir: Path, dest_dir: Path, log: LogFn) -> None:
         "tokenizer.json", "tokenizer_config.json",
         "special_tokens_map.json", "tokenizer.model",
         "chat_template.jinja", "vocab.json", "merges.txt",
+        "generation_config.json", "added_tokens.json",
     ]
     for name in files:
         src = source_dir / name
         dst = dest_dir / name
         if src.exists() and not dst.exists():
             shutil.copy2(src, dst)
-            log(f"  copied {name}")
+            log(f"  copied {name}", "info")
 
 
 def run_onnx_pipeline(
@@ -197,7 +197,7 @@ def run_onnx_pipeline(
     source_dir_p = Path(source_dir)
 
     if (onnx_dir_p / "model.onnx").exists():
-        log(f"ONNX model already exists at {onnx_dir} — skipping")
+        log(f"ONNX model already exists at {onnx_dir} — skipping", "info")
         return
 
     if not source_dir_p.exists():
@@ -215,7 +215,7 @@ def run_onnx_pipeline(
     quark_dir_p.mkdir(parents=True, exist_ok=True)
     onnx_dir_p.mkdir(parents=True, exist_ok=True)
 
-    log(f"Running Quark INT4 AWQ quantization -> {quark_dir}")
+    log(f"Running Quark INT4 AWQ quantization -> {quark_dir}", "stage")
     quark_argv = build_quark_argv(
         script_path=str(script),
         model_dir=str(source_dir_p),
@@ -231,7 +231,7 @@ def run_onnx_pipeline(
     if rc != 0:
         raise RuntimeError(f"Quark quantization failed (exit {rc})")
 
-    log(f"Running ORT-GenAI model builder -> {onnx_dir}")
+    log(f"Running ORT-GenAI model builder -> {onnx_dir}", "stage")
     oga_argv = build_oga_builder_argv(
         input_dir=str(quark_dir_p),
         output_dir=str(onnx_dir_p),
@@ -242,11 +242,11 @@ def run_onnx_pipeline(
     if rc != 0:
         raise RuntimeError(f"ORT-GenAI model builder failed (exit {rc})")
 
-    log("Copying tokenizer files")
+    log("Copying tokenizer files", "info")
     _copy_tokenizer_files(source_dir_p, onnx_dir_p, log)
 
     if cleanup_intermediates:
-        log(f"Cleaning up intermediate {quark_dir}")
+        log(f"Cleaning up intermediate {quark_dir}", "info")
         shutil.rmtree(quark_dir_p, ignore_errors=True)
 
-    log(f"ONNX build complete: {onnx_dir}")
+    log(f"ONNX build complete: {onnx_dir}", "info")
