@@ -9,6 +9,8 @@ Foundry: LLM fine-tuning and hybrid quantization pipeline for AMD ROCm (Strix Ha
 - **MagicQuant** evolutionary per-tensor hybrid quantization
 - **FastAPI Web UI** for pipeline orchestration
 
+Built artifacts are designed for [Lemonade Server](https://lemonade-server.ai/) on Linux: GGUF tiers route to llama.cpp on ROCm/Vulkan; ONNX models route to OGA for NPU+iGPU hybrid execution.
+
 ## Directory Structure
 
 ```
@@ -72,7 +74,8 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
 1. **Training**: Custom fast QLoRA with completion-only loss (masks system/user turns)
 2. **Export**: Streaming shard-by-shard LoRA merge to safetensors (~6 GB peak)
 3. **MagicQuant**: Evolutionary search → 3-tier hybrid GGUFs (Q4/Q5/Q6)
-4. **Upload**: HuggingFace Hub with model card generation
+4. **ONNX (Quark + OGA)**: AMD Quark INT4 AWQ → onnxruntime-genai model builder → `onnx_model/` directory for **NPU+iGPU Hybrid execution** via [Lemonade Server](https://lemonade-server.ai/) on Linux. Sibling to MagicQuant — both can run from the same source; pick GGUF, ONNX, or both. Auto-installs `amd-quark` and `onnxruntime-genai` and clones `amd/Quark` to `~/quark-amd/` for the reference `quantize_quark.py` script.
+5. **Upload**: HuggingFace Hub with model card generation (now also handles `onnx_model/`)
 
 ### MagicQuant (MagicQuant/magicquant/)
 Classifies tensors into sensitivity groups (E=Embeddings, H=Head, Q=Query, K=Key, O=Output, U=FFN Up, D=FFN Down, X=MoE Experts, R=Router), then runs evolutionary search to find optimal per-group quantization. Supports BF16, Q8_0, Q6_K, Q5_K, IQ4_NL, MXFP4.
@@ -101,3 +104,4 @@ Training data generators in `datagen/` (ZeroClaw tool-calls) and `gardener/` (NC
 - **Qwen3.5 hybrid architecture** has Mamba (linear_attention) layers with 48-element rows. Quantization types with block_size > 32 are incompatible — the GGUF writer falls back to BF16 for these.
 - **GGUF files from MagicQuant need chat template patching** — the source reader pulls from tokenizer_config.json, which must contain `chat_template`. The streaming merge (core/fast_export.py) copies tokenizer files but may omit the template; verify and use `scripts/patch_gguf_metadata.py` if needed.
 - **`UNSLOTH_COMPILE_DISABLE=1`** may be needed for gfx1151 if training produces NaN losses (known Triton code generation issue on RDNA).
+- **Quark memory budget**: AWQ calibration loads the full source model in FP16 plus activation stats. ~30B fits comfortably; 40B is tight; 70B+ will OOM. For larger models, run only the GGUF path (`--no-onnx`) until streaming Quark calibration is added.
