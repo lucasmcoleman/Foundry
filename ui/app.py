@@ -69,7 +69,7 @@ class StageStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
 
-ALL_STAGES = ["training", "export", "heretic", "reap", "magicquant", "upload"]
+ALL_STAGES = ["training", "export", "heretic", "reap", "magicquant", "onnx", "upload"]
 
 class PipelineState:
     """Shared mutable state for the running pipeline, including WebSocket fan-out."""
@@ -158,6 +158,17 @@ class MagicQuantCfg(BaseModel):
     llamacpp_path: str = ""
     source_model: str = ""  # when export is skipped: path to GGUF or merged model dir
 
+class OnnxCfg(BaseModel):
+    quant_scheme: str = "uint4_wo_128"
+    quant_algo: str = "awq"
+    execution_provider: str = "dml"
+    data_type: str = "float16"
+    num_calib_data: int = 128
+    seq_len: int = 512
+    calib_dataset: str = "pileval_for_awq_benchmark"
+    cleanup_intermediates: bool = True
+    source_model: str = ""
+
 class UploadCfg(BaseModel):
     repo_id: str = ""
     private: bool = True
@@ -173,6 +184,7 @@ class RunRequest(BaseModel):
     heretic: Optional[HereticCfg] = None
     reap: Optional[ReapCfg] = None
     magicquant: Optional[MagicQuantCfg] = None
+    onnx: Optional[OnnxCfg] = None
     upload: Optional[UploadCfg] = None
     enabled_stages: list[str] = ["training", "export"]
 

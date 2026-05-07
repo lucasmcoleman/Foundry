@@ -65,6 +65,10 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "httpx>=0.25.0",
 ]
+onnx = [
+    "amd-quark>=0.11",
+    "onnxruntime-genai>=0.6",
+]
 
 [project.scripts]
 foundry = "core.pipeline:main"
