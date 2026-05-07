@@ -732,6 +732,53 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     return ok
 
 
+async def do_onnx(cfg: RunRequest) -> bool:
+    """Run the ONNX (Quark INT4 AWQ + OGA builder) stage.
+
+    Sibling to do_magicquant — same source priority. Skips if onnx_model/model.onnx
+    already exists.
+    """
+    out = cfg.training.output_dir
+    out_abs = _resolve_out(out)
+    oc = cfg.onnx
+    export_enabled = "export" in cfg.enabled_stages
+
+    onnx_dir = out_abs / "onnx_model"
+    if (onnx_dir / "model.onnx").exists():
+        await state.log(f"ONNX model already exists at {onnx_dir} — skipping", "success")
+        await state.set_stage("onnx", StageStatus.COMPLETE)
+        await state.set_progress(100)
+        return True
+
+    await state.set_stage("onnx", StageStatus.RUNNING)
+    await state.set_progress(0)
+    await state.log("Starting ONNX (Quark INT4 AWQ + OGA builder)", "stage")
+
+    onnx_source_override = oc.source_model if (oc.source_model and not export_enabled) else ""
+
+    from services import OnnxService
+    svc = OnnxService(FOUNDRY_ROOT, VENV_PYTHON)
+    script = svc.build_script(
+        pipeline_root_str=str(FOUNDRY_ROOT),
+        out_abs_str=str(out_abs),
+        source_override=onnx_source_override,
+        quant_scheme=oc.quant_scheme,
+        quant_algo=oc.quant_algo,
+        execution_provider=oc.execution_provider,
+        data_type=oc.data_type,
+        num_calib_data=oc.num_calib_data,
+        seq_len=oc.seq_len,
+        calib_dataset=oc.calib_dataset,
+        cleanup_intermediates=oc.cleanup_intermediates,
+    )
+    rc = await run_script(script, out)
+    ok = rc == 0
+    await state.set_stage("onnx", StageStatus.COMPLETE if ok else StageStatus.FAILED)
+    if ok:
+        await state.set_progress(100)
+    return ok
+
+
 async def do_upload(cfg: RunRequest) -> bool:
     """Upload pipeline artifacts (GGUF, LoRA, merged) to HuggingFace Hub.
 
@@ -786,6 +833,7 @@ async def do_upload(cfg: RunRequest) -> bool:
         did_heretic="heretic" in enabled,
         did_reap="reap" in enabled,
         did_magicquant="magicquant" in enabled,
+        did_onnx="onnx" in enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
         lora_dropout=tc.lora_dropout,
@@ -814,6 +862,7 @@ STAGE_RUNNERS = {
     "heretic":    do_heretic,
     "reap":       do_reap,
     "magicquant": do_magicquant,
+    "onnx":       do_onnx,
     "upload":     do_upload,
 }
 
@@ -876,6 +925,27 @@ async def validate_pipeline(cfg: RunRequest) -> bool:
             await state.log(f"Export skipped — MagicQuant will use existing: {out_abs}/merged_model")
         else:
             await state.log(f"Export skipped — MagicQuant will use existing: {out_abs}/model-bf16.gguf")
+
+    # ONNX without export: needs a source
+    if "onnx" in enabled and "export" not in enabled:
+        oc = cfg.onnx
+        source = oc.source_model if oc else ""
+        has_reap = (out_abs / "reap_model").exists()
+        has_heretic = (out_abs / "heretic_model").exists()
+        has_merged = (out_abs / "merged_model").exists()
+        if not source and not has_reap and not has_heretic and not has_merged:
+            await state.log("ONNX is enabled without Export, and no existing safetensors "
+                            "model artifacts were found in the output directory. Set a "
+                            "Source Model path in ONNX config, or enable Export.", "error")
+            return False
+        if source:
+            await state.log(f"Export skipped — ONNX will use source: {source}")
+        elif has_reap:
+            await state.log(f"Export skipped — ONNX will use existing: {out_abs}/reap_model")
+        elif has_heretic:
+            await state.log(f"Export skipped — ONNX will use existing: {out_abs}/heretic_model")
+        else:
+            await state.log(f"Export skipped — ONNX will use existing: {out_abs}/merged_model")
 
     # Upload: check that at least some artifacts will exist
     if "upload" in enabled:
