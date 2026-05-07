@@ -22,6 +22,7 @@ from onnx_quark import (
 
 def test_quark_argv_uses_uint4_wo_128_awq_by_default():
     argv = build_quark_argv(
+        launcher_path="/tmp/launcher.py",
         script_path="/tmp/quantize_quark.py",
         model_dir="/srv/merged",
         output_dir="/srv/quark",
@@ -33,7 +34,8 @@ def test_quark_argv_uses_uint4_wo_128_awq_by_default():
         calib_dataset="pileval_for_awq_benchmark",
     )
     assert argv[0] == sys.executable
-    assert "/tmp/quantize_quark.py" in argv
+    assert argv[1] == "/tmp/launcher.py"        # launcher is argv[1]
+    assert argv[2] == "/tmp/quantize_quark.py"  # target script is argv[2]
     assert "--model_dir" in argv and "/srv/merged" in argv
     assert "--output_dir" in argv and "/srv/quark" in argv
     assert "--quant_scheme" in argv and "uint4_wo_128" in argv
