@@ -1570,6 +1570,21 @@ if __name__ == "__main__":
     parser.add_argument("--no-reap", action="store_true", help="Disable REAP expert pruning stage")
     parser.add_argument("--reap-compression-ratio", type=float, default=0.25,
                         help="REAP compression ratio — fraction of experts to remove per layer")
+    parser.add_argument("--onnx", action="store_true", help="Enable ONNX (Quark INT4 AWQ + OGA) stage")
+    parser.add_argument("--no-onnx", action="store_true", help="Disable ONNX stage")
+    parser.add_argument("--onnx-quant-scheme", type=str, default="uint4_wo_128",
+                        choices=["uint4_wo_32", "uint4_wo_64", "uint4_wo_128"],
+                        help="Quark quantization scheme")
+    parser.add_argument("--onnx-quant-algo", type=str, default="awq",
+                        choices=["awq", "gptq"], help="Quark quantization algorithm")
+    parser.add_argument("--onnx-ep", type=str, default="dml", choices=["dml", "cpu"],
+                        help="OGA execution provider (dml=hybrid NPU+iGPU, cpu=NPU-only)")
+    parser.add_argument("--onnx-num-calib", type=int, default=128, help="AWQ calibration samples")
+    parser.add_argument("--onnx-seq-len", type=int, default=512, help="Calibration sequence length")
+    parser.add_argument("--onnx-calib-dataset", type=str, default="pileval_for_awq_benchmark",
+                        help="HF dataset id or local .jsonl path for calibration")
+    parser.add_argument("--no-onnx-cleanup", action="store_true",
+                        help="Keep intermediate quark_safetensors/ after build (default: delete)")
     parser.add_argument("--no-magicquant", action="store_true")
     parser.add_argument("--upload-to", type=str, help="HF repo ID")
     parser.add_argument("--llamacpp-path", type=str)
@@ -1606,6 +1621,18 @@ if __name__ == "__main__":
         cfg.reap = ReapConfig(compression_ratio=args.reap_compression_ratio)
     if args.no_reap:
         cfg.reap = None
+    if args.onnx and not args.no_onnx:
+        cfg.onnx = OnnxConfig(
+            quant_scheme=args.onnx_quant_scheme,
+            quant_algo=args.onnx_quant_algo,
+            execution_provider=args.onnx_ep,
+            num_calib_data=args.onnx_num_calib,
+            seq_len=args.onnx_seq_len,
+            calib_dataset=args.onnx_calib_dataset,
+            cleanup_intermediates=not args.no_onnx_cleanup,
+        )
+    if args.no_onnx:
+        cfg.onnx = None
     if args.no_magicquant:
         cfg.magicquant = None
     if args.upload_to:
