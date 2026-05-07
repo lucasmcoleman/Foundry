@@ -45,6 +45,7 @@ class HFUploadConfig:
     upload_lora: bool = False
     upload_merged: bool = False
     upload_dataset: bool = True
+    upload_onnx: bool = True
 
     # Model metadata (for the model card)
     base_model: str = ""
@@ -56,6 +57,7 @@ class HFUploadConfig:
     did_heretic: bool = False
     did_reap: bool = False
     did_magicquant: bool = True
+    did_onnx: bool = False
 
     # Training details (for the model card)
     lora_r: int = 32
@@ -175,6 +177,8 @@ def generate_model_card(
             parts.append("quantized using MagicQuant hybrid evolutionary per-tensor search")
         elif has_gguf:
             parts.append("exported to GGUF format")
+        if cfg.did_onnx:
+            parts.append("exported to ONNX (INT4 AWQ) for AMD NPU+iGPU via ORT-GenAI")
 
         if parts:
             actions = ", ".join(parts[:-1]) + (" and " if len(parts) > 1 else "") + parts[-1] if len(parts) > 1 else parts[0]
@@ -200,6 +204,8 @@ def generate_model_card(
         tags.extend(["abliterated", "uncensored", "heretic"])
     if cfg.did_reap:
         tags.extend(["pruned", "reap", "moe"])
+    if cfg.did_onnx:
+        tags.extend(["onnx", "int4", "amd-quark", "oga", "lemonade"])
     if not tags:
         tags = ["gguf"]
     tags_yaml = "\n".join(f"  - {t}" for t in tags)
@@ -308,6 +314,30 @@ based on the methodology by **[magiccodingman](https://github.com/magiccodingman
 - Small-row tensors and sensitivity-critical layers (embeddings, output head, router) are kept at F32/F16/BF16
 - This is NOT a uniform quantization -- each tensor group gets its own optimal type""")
 
+    # ONNX section (only if AMD Quark ONNX export was done)
+    if cfg.did_onnx:
+        body_sections.append(f"""## ONNX (INT4 AWQ — OGA Hybrid for NPU+iGPU)
+
+This model includes an ONNX export quantized with **[AMD Quark](https://quark.docs.amd.com/)** using the
+`w4a16` (INT4 AWQ) scheme, compatible with the
+**[ONNX Runtime GenAI](https://github.com/microsoft/onnxruntime-genai)** (OGA) hybrid execution
+provider targeting AMD NPU + iGPU.
+
+### Runtime: Lemonade Server
+
+The easiest way to run this model on Linux is via **[Lemonade Server](https://lemonade-server.ai/)**,
+which provides an OpenAI-compatible API backed by ORT-GenAI:
+
+```bash
+# Pull the model (downloads onnx_model/ from this repo)
+lemonade pull {cfg.repo_id}
+
+# Run the server
+lemonade run {cfg.repo_id}
+```
+
+The ONNX artifacts are located in the `onnx_model/` directory of this repository.""")
+
     # Training details (only if training was done)
     if cfg.did_training:
         dataset_link = f"[{Path(dataset_name).stem}](https://huggingface.co/datasets/{dataset_repo_id})" if dataset_repo_id else dataset_name
@@ -415,6 +445,8 @@ print(output["choices"][0]["message"]["content"])
         pipeline_parts.append("[REAP](https://github.com/CerebrasResearch/reap)")
     if cfg.did_magicquant:
         pipeline_parts.append("[MagicQuant](https://github.com/lucasmcoleman/MagicQuant)")
+    if cfg.did_onnx:
+        pipeline_parts.append("[AMD Quark](https://quark.docs.amd.com/)")
     body_sections.append("---\n*Generated with " + " + ".join(pipeline_parts or ["Foundry"]) + "*")
 
     body = "\n\n".join(body_sections)
@@ -755,6 +787,25 @@ def upload(
         except Exception as e:
             log(f"    Failed to upload {repo_path}: {e}", "error")
             return False
+
+    # Upload ONNX model directory if requested
+    if cfg.upload_onnx:
+        onnx_dir = Path(output_dir) / "onnx_model"
+        if onnx_dir.exists() and (onnx_dir / "model.onnx").exists():
+            log(f"Uploading {onnx_dir} → onnx_model/", "info")
+            try:
+                api.upload_folder(
+                    folder_path=str(onnx_dir),
+                    path_in_repo="onnx_model",
+                    repo_id=cfg.repo_id,
+                    repo_type="model",
+                    commit_message="Upload ONNX model (INT4 AWQ, OGA hybrid)",
+                )
+                log("  ONNX model uploaded", "success")
+            except Exception as e:
+                log(f"  ONNX model upload failed (continuing): {e}", "warn")
+        else:
+            log("upload_onnx=True but onnx_model/ not found — skipping", "warn")
 
     log(f"All files uploaded to https://huggingface.co/{cfg.repo_id}", "success")
     return True

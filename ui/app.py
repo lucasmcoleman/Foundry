@@ -178,6 +178,7 @@ class UploadCfg(BaseModel):
     upload_lora: bool = False
     upload_merged: bool = False
     upload_dataset: bool = True
+    upload_onnx: bool = True
 
 class RunRequest(BaseModel):
     training: TrainingCfg = TrainingCfg()
@@ -834,6 +835,7 @@ async def do_upload(cfg: RunRequest) -> bool:
         did_reap="reap" in enabled,
         did_magicquant="magicquant" in enabled,
         did_onnx="onnx" in enabled,
+        upload_onnx=uc.upload_onnx,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
         lora_dropout=tc.lora_dropout,

@@ -151,6 +151,7 @@ class UploadConfig:
     upload_lora: bool = False
     upload_merged: bool = False
     upload_gguf: bool = True
+    upload_onnx: bool = True
 
 
 @dataclass
@@ -1419,14 +1420,13 @@ def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         upload_gguf=uc.upload_gguf,
         upload_lora=uc.upload_lora,
         upload_merged=uc.upload_merged,
+        upload_onnx=uc.upload_onnx,
         base_model=uc.base_model or tc.model_name,
         dataset_name=tc.dataset_path,
         did_training="training" in _enabled,
         did_heretic="heretic" in _enabled,
         did_reap="reap" in _enabled,
         did_magicquant="magicquant" in _enabled,
-        # NOTE: HFUploadConfig.did_onnx is added in Task 7. Until then, runs
-        # combining onnx and upload will TypeError.
         did_onnx="onnx" in _enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
@@ -1469,14 +1469,13 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
         upload_gguf=uc.upload_gguf,
         upload_lora=uc.upload_lora,
         upload_merged=uc.upload_merged,
+        upload_onnx=uc.upload_onnx,
         base_model=uc.base_model or tc.model_name,
         dataset_name=tc.dataset_path,
         did_training="training" in _enabled,
         did_heretic="heretic" in _enabled,
         did_reap="reap" in _enabled,
         did_magicquant="magicquant" in _enabled,
-        # NOTE: HFUploadConfig.did_onnx is added in Task 7. Until then, runs
-        # combining onnx and upload will TypeError.
         did_onnx="onnx" in _enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
