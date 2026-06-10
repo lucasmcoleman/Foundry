@@ -1,0 +1,27 @@
+name: CI
+
+# Offline, CPU-only checks. GPU/slow tests are never run here (deselected by
+# marker AND by --ignore of the integration module).
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test deps (no heavy ML stack)
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio httpx fastapi pydantic pydantic-settings pyyaml uvicorn
+      - name: Lint (py_compile)
+        run: make lint
+      - name: Offline tests
+        run: |
+          python -m pytest tests/ \
+            --ignore=tests/test_training_integration.py \
+            -m "not slow and not gpu" -v

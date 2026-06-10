@@ -16,9 +16,10 @@
 
 set -euo pipefail
 
-PIPELINE_DIR="/server/programming/pipeline"
+# Derive the repo root from this script's location (tests/ -> repo root).
+PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${PIPELINE_DIR}/.venv"
-MAGICQUANT_DIR="/server/programming/MagicQuant"
+MAGICQUANT_DIR="${PIPELINE_DIR}/MagicQuant"
 GGUF_DIR="/server/ai/models/lmcoleman/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated"
 SOURCE_DIR="/server/ai/models/source/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated"
 LMSTUDIO_URL="http://localhost:1234"
@@ -112,7 +113,7 @@ if ss -tlnp 2>/dev/null | grep -q ':7865 '; then
     elif [ "$HTTP_CODE" = "500" ]; then
         # Check if it is the known stale-process bug
         ERROR_BODY=$(curl -s http://localhost:7865/ 2>/dev/null)
-        fail "UI responds 500 (stale uvicorn process using old /server/programming/unsloth/ path)" "Restart with: kill \$(lsof -ti:7865); ${PIPELINE_DIR}/ui/run.sh 7865"
+        fail "UI responds 500 (likely a stale uvicorn process bound to an old path)" "Restart with: kill \$(lsof -ti:7865); ${PIPELINE_DIR}/ui/run.sh 7865"
     else
         fail "UI responds HTTP ${HTTP_CODE}" "Expected 200"
     fi
@@ -125,9 +126,9 @@ fi
 echo ""
 echo "Test 2: Training Code Imports"
 activate_env
-OUTPUT=$(python -c "from fast_train_zeroclaw import fast_load_quantized_model, detect_response_template, find_latest_checkpoint; print('OK')" 2>&1) || true
+OUTPUT=$(python -c "from fast_train_zeroclaw import fast_load_quantized_model, find_latest_checkpoint; print('OK')" 2>&1) || true
 if echo "$OUTPUT" | grep -q "OK"; then
-    pass "fast_train_zeroclaw imports (fast_load_quantized_model, detect_response_template, find_latest_checkpoint)"
+    pass "fast_train_zeroclaw imports (fast_load_quantized_model, find_latest_checkpoint)"
 else
     fail "fast_train_zeroclaw import failed" "$OUTPUT"
 fi

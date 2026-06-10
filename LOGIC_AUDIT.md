@@ -1,3 +1,7 @@
+> **HISTORICAL (superseded 2026-06-09).** Predates the 2026-06-09 audit
+> corrections pass (CLI/services consolidation, completion markers, UI bind/auth
+> hardening). See `AUDIT_FIXPLAN_2026-06-09.md` for the current state.
+
 # Foundry Logic Audit
 
 Audited 2026-04-05 against core/*.py and ui/app.py.
