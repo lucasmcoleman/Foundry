@@ -17,9 +17,10 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -28,19 +29,22 @@ from typing import Callable, Optional
 class TrainingConfig:
     model_name: str = "Tesslate/OmniCoder-9B"
     datasets: list[str] = field(default_factory=lambda: ["data/zeroclaw_training_data.jsonl"])
-    max_seq_length: int = 8192
+    # NOTE: defaults reconciled with the UI's TrainingCfg so CLI and UI produce
+    # equivalent adapters from the same config (see audit H1/M-warmup).
+    max_seq_length: int = 4096
     load_in_4bit: bool = True  # Unused by fast loader (always 4-bit), kept for config compat
     lora_r: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
-    use_rslora: bool = True  # Unused by fast loader, kept for config compat
+    use_rslora: bool = True  # Applied via the shared TrainingService (LoraConfig.use_rslora)
     num_train_epochs: int = 3
     per_device_train_batch_size: int = 2
     gradient_accumulation_steps: int = 4
     learning_rate: float = 2e-4
     lr_scheduler_type: str = "cosine"
     warmup_ratio: float = 0.05
-    optim: str = "adamw_8bit"
+    packing: bool = False  # Mutually exclusive with completion_only_loss
+    optim: str = "paged_adamw_8bit"
 
     @property
     def dataset_path(self) -> str:
@@ -180,39 +184,186 @@ class Artifacts:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-LogFn = Callable[[str, str], None]
+# Shared logging helper (single source of truth — see core/log.py).
+try:
+    from log import LogFn, default_log as _default_log
+except ImportError:  # pragma: no cover - when imported as the `core` package
+    from core.log import LogFn, default_log as _default_log
 
 
-def _default_log(msg: str, level: str = "info"):
-    prefix = {"error": "ERROR", "warn": "WARN", "success": "OK", "stage": ">>>"}.get(level, "   ")
-    print(f"[{prefix}] {msg}")
-
-
-def _run(cmd: list[str], log: LogFn, env_extra: dict = None, cwd: str = None) -> int:
+def _run(cmd: list[str], log: LogFn, env_extra: dict = None, cwd: str = None,
+         timeout: Optional[float] = None) -> int:
     env = os.environ.copy()
     env.update({
         "HSA_ENABLE_SDMA": "0",
         "PYTORCH_HIP_ALLOC_CONF": "backend:native,expandable_segments:True",
+        # Mirror the UI/services preamble so CLI and UI subprocess envs match.
+        "UNSLOTH_SKIP_TORCHVISION_CHECK": "1",
         "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
         "PYTHONUNBUFFERED": "1",
     })
     if env_extra:
         env.update(env_extra)
 
+    # start_new_session=True puts the child in its own process group so we can
+    # kill the whole tree on timeout (a gfx1151 kernel hang otherwise wedges the
+    # CLI indefinitely — there is no UI stop button here).
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        env=env, cwd=cwd, text=True, bufsize=1,
+        env=env, cwd=cwd, text=True, bufsize=1, start_new_session=True,
     )
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line:
-            log(line)
-    proc.wait()
+
+    if not timeout:
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    log(line)
+        except Exception:
+            _kill_process_group(proc)
+            raise
+        proc.wait()
+        return proc.returncode
+
+    # With a timeout, drain stdout on a background thread so a silent child
+    # (no output) can still be killed when the deadline elapses.
+    import threading
+
+    def _drain():
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    log(line)
+        except Exception:
+            pass
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"Stage exceeded timeout ({timeout:.0f}s) — terminating", "error")
+        _kill_process_group(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        reader.join(timeout=5)
+        return proc.returncode if proc.returncode is not None else -1
+    reader.join(timeout=5)
     return proc.returncode
+
+
+def _kill_process_group(proc) -> None:
+    """SIGTERM then SIGKILL the child's process group; never raise."""
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, OSError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def _find_python() -> str:
     return sys.executable
+
+
+# Project root (the directory containing core/). Used by the Service classes.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Pinned llama.cpp ref for reproducible auto-install (audit L-supply-chain).
+# Bump deliberately; clone uses --branch so it pins a tag, not the default branch.
+LLAMACPP_REPO = "https://github.com/ggml-org/llama.cpp.git"
+LLAMACPP_PIN = "b4585"  # known-good release tag
+
+
+def _services():
+    """Import the shared service classes (core/services.py).
+
+    Imported lazily so importing pipeline.py for CLI parsing/tests doesn't pull
+    in the service layer. Works both when ``core`` is on sys.path and when
+    pipeline is imported as ``core.pipeline``.
+    """
+    try:
+        import services as _svc
+    except ImportError:  # pragma: no cover - package-import fallback
+        from core import services as _svc
+    return _svc
+
+
+def _markers():
+    try:
+        import markers as _m
+    except ImportError:  # pragma: no cover
+        from core import markers as _m
+    return _m
+
+
+def _run_stage_script(
+    script: str,
+    script_path: Path,
+    log: LogFn,
+    *,
+    stage: str = "",
+    stage_dir: Optional[Path] = None,
+    key_file: Optional[Path] = None,
+    cfg_hash: str = "",
+    env_extra: dict = None,
+    timeout: Optional[float] = None,
+    keep_script: bool = False,
+) -> int:
+    """Write ``script`` to ``script_path``, run it, write a completion marker on
+    success, and clean up the generated stage script (kept on failure).
+
+    Returns the subprocess exit code.
+    """
+    script_path = Path(script_path)
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(script)
+
+    rc = _run([_find_python(), "-u", str(script_path)], log,
+              env_extra=env_extra, cwd=str(PROJECT_ROOT), timeout=timeout)
+
+    if rc == 0:
+        # Record a completion marker when the key artifact is present + non-empty.
+        if stage and stage_dir is not None and key_file is not None:
+            kf = Path(key_file)
+            if kf.exists() and kf.stat().st_size > 0:
+                try:
+                    _markers().write_marker(stage_dir, stage, kf, cfg_hash)
+                except OSError as e:
+                    log(f"Could not write completion marker: {e}", "warn")
+        # Remove the generated stage script on success (keep the artifacts).
+        if not keep_script:
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
+    return rc
+
+
+def _preflight_stage(stage: str, config: PipelineConfig, log: LogFn, skip: bool = False) -> bool:
+    """Advisory GPU-memory preflight for a stage. Logs but never aborts the run
+    on its own (the caller decides); returns the check result for callers/tests.
+    """
+    try:
+        try:
+            import preflight as _pf
+        except ImportError:  # pragma: no cover
+            from core import preflight as _pf
+    except Exception:
+        return True
+    # Best-effort param estimate from the base model config if available.
+    cfg_json = Path(config.output_dir) / "merged_model" / "config.json"
+    params_b = _pf.estimate_params_b(str(cfg_json)) if cfg_json.exists() else None
+    needed = _pf.estimate_stage_gb(stage, params_b)
+    return _pf.check_gpu_memory(needed, log=log, skip=skip)
 
 
 def _find_llamacpp(hint: Optional[str] = None) -> Optional[Path]:
@@ -370,9 +521,10 @@ def ensure_llamacpp(hint: Optional[str], log: LogFn) -> Optional[Path]:
     install_dir = Path.home() / "llama.cpp"
     log("llama.cpp not found — auto-installing", "stage")
 
-    # Clone
-    log("Cloning llama.cpp from GitHub...")
-    rc = _run(["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp.git", str(install_dir)], log)
+    # Clone a pinned ref (not the default branch) for reproducibility.
+    log(f"Cloning llama.cpp from GitHub (pinned {LLAMACPP_PIN})...")
+    rc = _run(["git", "clone", "--depth", "1", "--branch", LLAMACPP_PIN,
+               LLAMACPP_REPO, str(install_dir)], log)
     if rc != 0:
         log("Failed to clone llama.cpp", "error")
         return None
@@ -403,149 +555,73 @@ def ensure_llamacpp(hint: Optional[str], log: LogFn) -> Optional[Path]:
 # quantization, and uses PEFT LoRA directly. This avoids single-threaded
 # safetensors chunking that crawls to a halt on unified memory as GTT fills.
 
-def stage_training(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
+def _training_cfg_hash(config: PipelineConfig) -> str:
+    tc = config.training
+    return _markers().config_hash({
+        "model_name": tc.model_name, "datasets": tc.datasets,
+        "max_seq_length": tc.max_seq_length, "lora_r": tc.lora_r,
+        "lora_alpha": tc.lora_alpha, "lora_dropout": tc.lora_dropout,
+        "use_rslora": tc.use_rslora, "num_train_epochs": tc.num_train_epochs,
+        "per_device_train_batch_size": tc.per_device_train_batch_size,
+        "gradient_accumulation_steps": tc.gradient_accumulation_steps,
+        "learning_rate": tc.learning_rate, "lr_scheduler_type": tc.lr_scheduler_type,
+        "warmup_ratio": tc.warmup_ratio, "optim": tc.optim, "packing": tc.packing,
+    })
+
+
+def stage_training(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+                   force: bool = False, timeout: Optional[float] = None,
+                   skip_preflight: bool = False) -> bool:
     """Run QLoRA training with completion-only loss using the custom fast loader.
 
-    Uses fast_train_zeroclaw.py's shard-by-shard loading to avoid
-    single-threaded sequential safetensors chunking on AMD APU unified memory.
+    Builds the training script via the shared TrainingService (single source of
+    truth with the UI) so CLI and UI produce equivalent adapters. Skips on a
+    valid completion marker; preflights GPU memory; cleans up the stage script.
     """
+    tc = config.training
+
+    # Completion-marker resume: skip only when a valid marker matches the config
+    # AND the key adapter file is present and non-empty (not bare existence).
+    key_file = artifacts.lora_dir / "adapter_model.safetensors"
+    cfg_hash = _training_cfg_hash(config)
+    if _markers().is_stage_complete(artifacts.lora_dir, key_file, cfg_hash, force=force):
+        log(f"Training already complete (marker matches) at {artifacts.lora_dir} — skipping", "success")
+        return True
+
     # Validate dataset(s) before committing GPU time.
     if not validate_dataset(config.training.datasets, log):
         return False
 
+    # GPU-memory preflight (advisory; overridable).
+    _preflight_stage("training", config, log, skip=skip_preflight)
+
     log("Starting QLoRA training (fast loader, completion-only loss)", "stage")
-    tc = config.training
 
-    # Use the directory containing this file as the project root (not CWD).
-    _project_root = Path(__file__).resolve().parent.parent
-
-    # Generate a training script that uses the custom fast loader.
-    # This runs as a subprocess so GPU memory is fully freed when it exits.
-    # All string config values use repr() to prevent injection / quote breakage.
-    script = f'''
-import os, re, gc, json, time
-os.environ["HSA_ENABLE_SDMA"] = "0"
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
-os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
-
-import torch
-from pathlib import Path
-from datasets import load_dataset
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer, SFTConfig
-
-# ── Fast model loading (shard-by-shard with inline BnB quantization) ──
-# Import and call the fast loader directly.
-import sys
-sys.path.insert(0, str(Path({repr(str(_project_root))}) / "core"))
-from fast_train_zeroclaw import fast_load_quantized_model, find_latest_checkpoint
-
-DEVICE = torch.device("cuda:0")
-model, tokenizer = fast_load_quantized_model({tc.model_name!r})
-
-# ── Attach LoRA adapters ──
-model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-lora_config = LoraConfig(
-    r={tc.lora_r}, lora_alpha={tc.lora_alpha}, lora_dropout={tc.lora_dropout},
-    target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-    bias="none", task_type="CAUSAL_LM",
-)
-model = get_peft_model(model, lora_config)
-
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total = sum(p.numel() for p in model.parameters())
-print(f"Trainable: {{trainable:,}} / {{total:,}} ({{100*trainable/total:.2f}}%)")
-
-# ── Load and format dataset(s) ──
-_sources = {tc.datasets!r}
-_loaded = []
-for _src in _sources:
-    _src = _src.strip()
-    if not _src:
-        continue
-    _local = Path(_src)
-    if not _local.is_absolute():
-        _local = Path({repr(str(_project_root))}) / _local
-    if _local.exists():
-        _ext = _local.suffix.lstrip(".")
-        _fmt = {{"jsonl": "json", "json": "json", "csv": "csv", "parquet": "parquet"}}.get(_ext, "json")
-        _ds = load_dataset(_fmt, data_files=str(_local), split="train")
-        print(f"Loaded local: {{_src}} ({{len(_ds)}} examples)")
-    else:
-        _split = "train"
-        _cfg_name = None
-        _clean = _src
-        if "[" in _clean and _clean.endswith("]"):
-            _clean, _split = _clean[:-1].split("[", 1)
-        if ":" in _clean and not _clean.startswith("/") and "." not in _clean.split("/")[-1]:
-            _clean, _cfg_name = _clean.rsplit(":", 1)
-        _kwargs = {{"split": _split}}
-        if _cfg_name:
-            _kwargs["name"] = _cfg_name
-        _ds = load_dataset(_clean, **_kwargs)
-        print(f"Loaded HF: {{_src}} ({{len(_ds)}} examples)")
-    _loaded.append(_ds)
-
-if len(_loaded) == 1:
-    dataset = _loaded[0]
-elif len(_loaded) > 1:
-    from datasets import concatenate_datasets
-    dataset = concatenate_datasets(_loaded).shuffle(seed=42)
-    print(f"Combined: {{len(dataset)}} examples from {{len(_loaded)}} sources")
-else:
-    raise ValueError("No datasets loaded")
-print(f"Dataset: {{len(dataset)}} examples")
-
-def fmt(ex):
-    ex["text"] = tokenizer.apply_chat_template(
-        ex["messages"], tokenize=False, add_generation_prompt=False,
+    svc = _services().TrainingService(PROJECT_ROOT, _find_python())
+    script = svc.build_script(
+        model_name=tc.model_name,
+        datasets=tc.datasets,
+        output_dir=config.output_dir,
+        max_seq_length=tc.max_seq_length,
+        lora_r=tc.lora_r,
+        lora_alpha=tc.lora_alpha,
+        lora_dropout=tc.lora_dropout,
+        use_rslora=tc.use_rslora,
+        num_train_epochs=tc.num_train_epochs,
+        per_device_train_batch_size=tc.per_device_train_batch_size,
+        gradient_accumulation_steps=tc.gradient_accumulation_steps,
+        learning_rate=tc.learning_rate,
+        lr_scheduler_type=tc.lr_scheduler_type,
+        warmup_ratio=tc.warmup_ratio,
+        optim=tc.optim,
+        packing=tc.packing,
     )
-    return ex
-dataset = dataset.map(fmt)
 
-# ── Training with completion-only loss ──
-# Only assistant turns contribute to the loss. System/user turns are masked.
-training_args = SFTConfig(
-    output_dir={config.output_dir!r},
-    num_train_epochs={tc.num_train_epochs},
-    per_device_train_batch_size={tc.per_device_train_batch_size},
-    gradient_accumulation_steps={tc.gradient_accumulation_steps},
-    learning_rate={tc.learning_rate},
-    lr_scheduler_type={tc.lr_scheduler_type!r},
-    warmup_ratio={tc.warmup_ratio},
-    optim={tc.optim!r},
-    weight_decay=0.01, max_grad_norm=1.0,
-    fp16=False, bf16=True,
-    logging_steps=1, save_strategy="epoch", seed=42,
-    gradient_checkpointing=True,
-    gradient_checkpointing_kwargs={{"use_reentrant": False}},
-    report_to="none",
-    max_length={tc.max_seq_length},
-    dataset_text_field="text",
-    completion_only_loss=True,
-)
-
-trainer = SFTTrainer(
-    model=model, processing_class=tokenizer, train_dataset=dataset,
-    args=training_args,
-)
-
-# Resume from checkpoint if one exists (e.g. after crash or OOM).
-resume_ckpt = find_latest_checkpoint({config.output_dir!r})
-stats = trainer.train(resume_from_checkpoint=resume_ckpt)
-print(f"PIPELINE_TRAINING_LOSS={{stats.training_loss:.4f}}")
-
-lora_dir = {str(artifacts.lora_dir)!r}
-model.save_pretrained(lora_dir)
-tokenizer.save_pretrained(lora_dir)
-print("PIPELINE_STAGE_COMPLETE=training")
-'''
-
-    script_path = artifacts.output_dir / "_stage_train.py"
-    script_path.parent.mkdir(parents=True, exist_ok=True)
-    script_path.write_text(script)
-
-    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(_project_root))
+    rc = _run_stage_script(
+        script, artifacts.output_dir / "_stage_train.py", log,
+        stage="training", stage_dir=artifacts.lora_dir, key_file=key_file,
+        cfg_hash=cfg_hash, timeout=timeout,
+    )
     if rc != 0:
         log(f"Training failed (exit code {rc})", "error")
         return False
@@ -564,62 +640,67 @@ print("PIPELINE_STAGE_COMPLETE=training")
 # save_pretrained_merged(), which loads the entire model into memory (~80 GB
 # for a 40B model). The streaming merge peaks at ~6 GB.
 
-def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
+def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+                 force: bool = False, timeout: Optional[float] = None,
+                 skip_preflight: bool = False) -> bool:
     """Merge LoRA adapters into base model using streaming shard-by-shard merge.
 
-    Always produces safetensors output (MagicQuant or llama.cpp handles GGUF).
-    Uses fast_export.py's streaming merge to avoid loading the full model.
+    Builds the export script via the shared ExportService (single source of truth
+    with the UI). Skips on a valid completion marker; cleans up the stage script.
     """
-    ec = config.export
-
     if not artifacts.lora_dir.exists():
         log("No LoRA adapters found — run training first", "error")
         return False
 
-    log("Merging LoRA to safetensors (streaming shard-by-shard)", "stage")
-
     # Read the adapter_config.json to find the base model ID.
-    import json as _json
     adapter_config_path = artifacts.lora_dir / "adapter_config.json"
     if adapter_config_path.exists():
         with open(adapter_config_path) as f:
-            adapter_cfg = _json.load(f)
+            adapter_cfg = json.load(f)
         base_model_id = adapter_cfg.get("base_model_name_or_path", config.training.model_name)
     else:
         base_model_id = config.training.model_name
 
-    # Use the directory containing this file as the project root (not CWD).
-    _project_root = Path(__file__).resolve().parent.parent
+    # Completion-marker resume: a merged_model dir with safetensors + a marker.
+    cfg_hash = _markers().config_hash({"base_model_id": base_model_id, "src": str(artifacts.lora_dir)})
+    existing = sorted(artifacts.merged_dir.glob("*.safetensors")) if artifacts.merged_dir.exists() else []
+    key_file = existing[0] if existing else (artifacts.merged_dir / "model.safetensors")
+    if _markers().is_stage_complete(artifacts.merged_dir, key_file, cfg_hash, force=force):
+        log(f"Export already complete (marker matches) at {artifacts.merged_dir} — skipping", "success")
+        return True
 
-    # Generate an export script that uses the custom fast merge.
-    # All string config values use repr() to prevent injection / quote breakage.
-    script = f'''
-import os, sys
-from pathlib import Path
-os.environ["HSA_ENABLE_SDMA"] = "0"
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
-os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+    _preflight_stage("export", config, log, skip=skip_preflight)
+    log("Merging LoRA to safetensors (streaming shard-by-shard)", "stage")
 
-sys.path.insert(0, str(Path({repr(str(_project_root))}) / "core"))
-from fast_export import streaming_merge
+    svc = _services().ExportService(PROJECT_ROOT, _find_python())
+    script = svc.build_script(
+        base_model_id=base_model_id,
+        lora_source=str(artifacts.lora_dir),
+        has_lora=True,
+        merged_dir=str(artifacts.merged_dir),
+    )
 
-streaming_merge(
-    model_id={base_model_id!r},
-    lora_dir={str(artifacts.lora_dir)!r},
-    merged_dir={str(artifacts.merged_dir)!r},
-)
-print("PIPELINE_STAGE_COMPLETE=export")
-'''
+    # Resolve the actual key file after the run for the marker.
+    def _resolve_key():
+        st = sorted(artifacts.merged_dir.glob("*.safetensors"))
+        return st[0] if st else key_file
 
-    script_path = artifacts.output_dir / "_stage_export.py"
-    script_path.write_text(script)
-
-    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(_project_root))
+    rc = _run_stage_script(
+        script, artifacts.output_dir / "_stage_export.py", log,
+        cfg_hash=cfg_hash, timeout=timeout,
+    )
     if rc != 0:
         log(f"Export failed (exit code {rc})", "error")
         return False
 
     if artifacts.merged_dir.exists():
+        # Write the completion marker now that the real artifact exists.
+        kf = _resolve_key()
+        if kf.exists() and kf.stat().st_size > 0:
+            try:
+                _markers().write_marker(artifacts.merged_dir, "export", kf, cfg_hash)
+            except OSError as e:
+                log(f"Could not write completion marker: {e}", "warn")
         log(f"Merged safetensors ready at {artifacts.merged_dir}", "success")
     else:
         log("Merged model directory not found after export", "error")
@@ -635,324 +716,56 @@ print("PIPELINE_STAGE_COMPLETE=export")
 # Uses heretic-llm's internal API (not the CLI) to avoid interactive prompts.
 # Runs as a subprocess so GPU memory is fully freed afterward.
 
-def stage_heretic(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
+def stage_heretic(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+                  force: bool = False, timeout: Optional[float] = None,
+                  skip_preflight: bool = False) -> bool:
     """Run heretic abliteration on the merged model.
 
-    Invokes heretic's internal API programmatically (bypassing the interactive CLI)
-    to run Optuna optimization, select the best Pareto-optimal trial, apply it,
-    and save the merged abliterated model as HF safetensors.
+    Builds the abliteration script via the shared HereticService (single source
+    of truth with the UI). Skips on a valid completion marker; cleans up the
+    stage script.
     """
-    log("Starting heretic abliteration", "stage")
-
     if not artifacts.merged_dir.exists():
-        log("No merged model found — run export first", "error")
+        log("No merged model found \u2014 run export first", "error")
         return False
 
     hc = config.heretic
     heretic_output = str(artifacts.heretic_dir)
     checkpoint_dir = str(artifacts.output_dir / "_heretic_checkpoints")
 
-    # Use the directory containing this file as the project root (not CWD).
-    _project_root = Path(__file__).resolve().parent.parent
+    cfg_hash = _markers().config_hash({
+        "src": str(artifacts.merged_dir), "n_trials": hc.n_trials,
+        "n_startup_trials": hc.n_startup_trials, "quantization": hc.quantization,
+        "kl_divergence_scale": hc.kl_divergence_scale,
+        "orthogonalize_direction": hc.orthogonalize_direction,
+        "row_normalization": hc.row_normalization,
+    })
+    existing = sorted(artifacts.heretic_dir.glob("*.safetensors")) if artifacts.heretic_dir.exists() else []
+    key_file = existing[0] if existing else (artifacts.heretic_dir / "model.safetensors")
+    if _markers().is_stage_complete(artifacts.heretic_dir, key_file, cfg_hash, force=force):
+        log(f"Heretic already complete (marker matches) at {artifacts.heretic_dir} \u2014 skipping", "success")
+        return True
 
-    # Build a self-contained script that uses heretic's internal API directly.
-    # This bypasses all questionary interactive prompts in heretic's main.py.
-    # All string config values use repr() to prevent injection / quote breakage.
-    script = f'''
-import math
-import os
-import sys
-import time
-import warnings
+    _preflight_stage("heretic", config, log, skip=skip_preflight)
+    log("Starting heretic abliteration", "stage")
 
-os.environ["HSA_ENABLE_SDMA"] = "0"
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
-os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+    svc = _services().HereticService(PROJECT_ROOT, _find_python())
+    script = svc.build_script(
+        model_path=str(artifacts.merged_dir),
+        output_path=heretic_output,
+        checkpoint_dir=checkpoint_dir,
+        n_trials=hc.n_trials,
+        n_startup_trials=hc.n_startup_trials,
+        quantization=hc.quantization,
+        kl_divergence_scale=hc.kl_divergence_scale,
+        orthogonalize_direction=hc.orthogonalize_direction,
+        row_normalization=hc.row_normalization,
+    )
 
-import torch
-import torch.nn.functional as F
-import optuna
-import transformers
-from optuna.samplers import TPESampler
-from optuna.storages import JournalStorage
-from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
-from optuna.study import StudyDirection
-from optuna.trial import TrialState
-from optuna.exceptions import ExperimentalWarning
-from optuna import Trial, TrialPruned
-from dataclasses import asdict
-
-from heretic.config import Settings, QuantizationMethod, RowNormalization
-from heretic.model import Model, AbliterationParameters
-from heretic.evaluator import Evaluator
-from heretic.utils import (
-    empty_cache,
-    format_duration,
-    get_trial_parameters,
-    load_prompts,
-    print_memory_usage,
-)
-
-# Override heretic's rich print with plain print for pipeline logging
-import builtins
-_real_print = builtins.print
-from heretic import utils as _hu
-_hu.print = _real_print
-
-torch.set_grad_enabled(False)
-torch._dynamo.config.cache_size_limit = 64
-transformers.logging.set_verbosity_error()
-optuna.logging.set_verbosity(optuna.logging.WARNING)
-warnings.filterwarnings("ignore", category=ExperimentalWarning)
-
-model_path = {str(artifacts.merged_dir)!r}
-output_path = {heretic_output!r}
-checkpoint_dir = {checkpoint_dir!r}
-
-_real_print(f"Model: {{model_path}}")
-_real_print(f"Output: {{output_path}}")
-
-os.makedirs(checkpoint_dir, exist_ok=True)
-
-# Create Settings programmatically (bypasses CLI arg parsing)
-settings = Settings(
-    model=model_path,
-    quantization={hc.quantization!r},
-    n_trials={hc.n_trials},
-    n_startup_trials={hc.n_startup_trials},
-    kl_divergence_scale={hc.kl_divergence_scale},
-    orthogonalize_direction={hc.orthogonalize_direction},
-    row_normalization={hc.row_normalization!r},
-    study_checkpoint_dir=checkpoint_dir,
-    batch_size=0,
-)
-
-model = Model(settings)
-_real_print()
-print_memory_usage()
-
-_real_print()
-_real_print(f"Loading good prompts from {{settings.good_prompts.dataset}}...")
-good_prompts = load_prompts(settings, settings.good_prompts)
-_real_print(f"  {{len(good_prompts)}} prompts loaded")
-
-_real_print()
-_real_print(f"Loading bad prompts from {{settings.bad_prompts.dataset}}...")
-bad_prompts = load_prompts(settings, settings.bad_prompts)
-_real_print(f"  {{len(bad_prompts)}} prompts loaded")
-
-# Auto batch size
-if settings.batch_size == 0:
-    _real_print()
-    _real_print("Determining optimal batch size...")
-    batch_size = 1
-    best_batch_size = -1
-    best_performance = -1
-    while batch_size <= settings.max_batch_size:
-        _real_print(f"  Trying batch size {{batch_size}}... ", end="")
-        prompts = good_prompts * math.ceil(batch_size / len(good_prompts))
-        prompts = prompts[:batch_size]
-        try:
-            model.get_responses(prompts)
-            start_time = time.perf_counter()
-            responses = model.get_responses(prompts)
-            end_time = time.perf_counter()
-        except Exception as error:
-            if batch_size == 1:
-                raise
-            _real_print(f"Failed ({{error}})")
-            break
-        response_lengths = [len(model.tokenizer.encode(r)) for r in responses]
-        performance = sum(response_lengths) / (end_time - start_time)
-        _real_print(f"Ok ({{performance:.0f}} tokens/s)")
-        if performance > best_performance:
-            best_batch_size = batch_size
-            best_performance = performance
-        batch_size *= 2
-    settings.batch_size = best_batch_size
-    _real_print(f"  Chosen batch size: {{settings.batch_size}}")
-
-# Check for common response prefix
-_real_print()
-_real_print("Checking for common response prefix...")
-from os.path import commonprefix
-responses = model.get_responses_batched(good_prompts[:100] + bad_prompts[:100])
-model.response_prefix = commonprefix(responses).rstrip(" ")
-if model.response_prefix.startswith("<think>"):
-    model.response_prefix = "<think></think>"
-elif model.response_prefix.startswith("<|channel|>analysis<|message|>"):
-    model.response_prefix = "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
-elif model.response_prefix.startswith("<thought>"):
-    model.response_prefix = "<thought></thought>"
-elif model.response_prefix.startswith("[THINK]"):
-    model.response_prefix = "[THINK][/THINK]"
-if model.response_prefix:
-    _real_print(f"  Prefix found: {{model.response_prefix!r}}")
-else:
-    _real_print("  None found")
-
-evaluator = Evaluator(settings, model)
-
-# Compute refusal directions
-_real_print()
-_real_print("Calculating per-layer refusal directions...")
-_real_print("  Obtaining residuals for good prompts...")
-good_residuals = model.get_residuals_batched(good_prompts)
-_real_print("  Obtaining residuals for bad prompts...")
-bad_residuals = model.get_residuals_batched(bad_prompts)
-
-good_means = good_residuals.mean(dim=0)
-bad_means = bad_residuals.mean(dim=0)
-refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
-
-if settings.orthogonalize_direction:
-    good_directions = F.normalize(good_means, p=2, dim=1)
-    projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
-    refusal_directions = refusal_directions - projection_vector.unsqueeze(1) * good_directions
-    refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
-
-del good_residuals, bad_residuals
-empty_cache()
-
-# Set up Optuna study
-study_checkpoint_file = os.path.join(
-    checkpoint_dir,
-    "".join([(c if (c.isalnum() or c in ["_", "-"]) else "--") for c in settings.model]) + ".jsonl",
-)
-lock_obj = JournalFileOpenLock(study_checkpoint_file)
-backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
-storage = JournalStorage(backend)
-
-trial_index = 0
-start_index = 0
-start_time = time.perf_counter()
-
-def objective(trial):
-    global trial_index
-    trial_index += 1
-    trial.set_user_attr("index", trial_index)
-
-    direction_scope = trial.suggest_categorical("direction_scope", ["global", "per layer"])
-    last_layer_index = len(model.get_layers()) - 1
-    direction_index = trial.suggest_float("direction_index", 0.4 * last_layer_index, 0.9 * last_layer_index)
-    if direction_scope == "per layer":
-        direction_index = None
-
-    parameters = {{}}
-    for component in model.get_abliterable_components():
-        max_weight = trial.suggest_float(f"{{component}}.max_weight", 0.8, 1.5)
-        max_weight_position = trial.suggest_float(f"{{component}}.max_weight_position", 0.6 * last_layer_index, 1.0 * last_layer_index)
-        min_weight = trial.suggest_float(f"{{component}}.min_weight", 0.0, 1.0)
-        min_weight_distance = trial.suggest_float(f"{{component}}.min_weight_distance", 1.0, 0.6 * last_layer_index)
-        parameters[component] = AbliterationParameters(
-            max_weight=max_weight,
-            max_weight_position=max_weight_position,
-            min_weight=(min_weight * max_weight),
-            min_weight_distance=min_weight_distance,
-        )
-
-    trial.set_user_attr("direction_index", direction_index)
-    trial.set_user_attr("parameters", {{k: asdict(v) for k, v in parameters.items()}})
-
-    _real_print(f"\\nRunning trial {{trial_index}} of {{settings.n_trials}}...")
-    _real_print("  Resetting model...")
-    model.reset_model()
-    _real_print("  Abliterating...")
-    model.abliterate(refusal_directions, direction_index, parameters)
-    _real_print("  Evaluating...")
-    score, kl_divergence, refusals = evaluator.get_score()
-
-    elapsed = time.perf_counter() - start_time
-    remaining = (elapsed / (trial_index - start_index)) * (settings.n_trials - trial_index)
-    _real_print(f"  Elapsed: {{format_duration(elapsed)}}")
-    if trial_index < settings.n_trials:
-        _real_print(f"  Estimated remaining: {{format_duration(remaining)}}")
-
-    trial.set_user_attr("kl_divergence", kl_divergence)
-    trial.set_user_attr("refusals", refusals)
-    return score
-
-def objective_wrapper(trial):
-    try:
-        return objective(trial)
-    except KeyboardInterrupt:
-        trial.study.stop()
-        raise TrialPruned()
-
-study = optuna.create_study(
-    sampler=TPESampler(n_startup_trials=settings.n_startup_trials, n_ei_candidates=128, multivariate=True),
-    directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
-    storage=storage,
-    study_name="heretic",
-    load_if_exists=True,
-)
-study.set_user_attr("settings", settings.model_dump_json())
-study.set_user_attr("finished", False)
-
-def count_completed():
-    return sum(1 for t in study.trials if t.state == TrialState.COMPLETE)
-
-start_index = trial_index = count_completed()
-if start_index > 0:
-    _real_print(f"\\nResuming existing study ({{start_index}} trials completed).")
-
-remaining_trials = settings.n_trials - count_completed()
-if remaining_trials > 0:
-    study.optimize(objective_wrapper, n_trials=remaining_trials)
-
-if count_completed() == settings.n_trials:
-    study.set_user_attr("finished", True)
-
-# Select best trial from Pareto front (lowest refusals, then lowest KL divergence)
-completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
-if not completed_trials:
-    _real_print("No completed trials — abliteration failed")
-    sys.exit(1)
-
-sorted_trials = sorted(
-    completed_trials,
-    key=lambda t: (t.user_attrs["refusals"], t.user_attrs["kl_divergence"]),
-)
-min_divergence = math.inf
-best_trials = []
-for t in sorted_trials:
-    kl = t.user_attrs["kl_divergence"]
-    if kl < min_divergence:
-        min_divergence = kl
-        best_trials.append(t)
-
-# Pick the trial with fewest refusals and acceptable KL divergence
-best = best_trials[0]
-_real_print(f"\\nSelected trial {{best.user_attrs['index']}}: "
-            f"refusals={{best.user_attrs['refusals']}}, "
-            f"KL divergence={{best.user_attrs['kl_divergence']:.4f}}")
-
-# Apply the best trial
-_real_print("Resetting model...")
-model.reset_model()
-_real_print("Abliterating with best parameters...")
-model.abliterate(
-    refusal_directions,
-    best.user_attrs["direction_index"],
-    {{k: AbliterationParameters(**v) for k, v in best.user_attrs["parameters"].items()}},
-)
-
-# Save the merged model
-_real_print("Saving merged abliterated model...")
-merged_model = model.get_merged_model()
-merged_model.save_pretrained(output_path)
-del merged_model
-empty_cache()
-model.tokenizer.save_pretrained(output_path)
-
-_real_print(f"Abliterated model saved to {{output_path}}")
-_real_print("PIPELINE_STAGE_COMPLETE=heretic")
-'''
-
-    script_path = artifacts.output_dir / "_stage_heretic.py"
-    script_path.write_text(script)
-
-    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(_project_root))
+    rc = _run_stage_script(
+        script, artifacts.output_dir / "_stage_heretic.py", log,
+        cfg_hash=cfg_hash, timeout=timeout,
+    )
     if rc != 0:
         log(f"Heretic failed (exit code {rc})", "error")
         return False
@@ -960,6 +773,14 @@ _real_print("PIPELINE_STAGE_COMPLETE=heretic")
     if not artifacts.heretic_dir.exists():
         log("Heretic output directory not found", "error")
         return False
+
+    st = sorted(artifacts.heretic_dir.glob("*.safetensors"))
+    kf = st[0] if st else key_file
+    if kf.exists() and kf.stat().st_size > 0:
+        try:
+            _markers().write_marker(artifacts.heretic_dir, "heretic", kf, cfg_hash)
+        except OSError as e:
+            log(f"Could not write completion marker: {e}", "warn")
 
     log(f"Abliterated model saved to {artifacts.heretic_dir}", "success")
     return True
@@ -973,42 +794,25 @@ _real_print("PIPELINE_STAGE_COMPLETE=heretic")
 # silently with a warning so the rest of the pipeline can continue.
 
 # Architectures supported by reap.model_util.MODEL_ATTRS (mirrors that dict).
-REAP_SUPPORTED_ARCHS = {
-    "Qwen3MoeForCausalLM",
-    "Qwen3-Coder-30B-A3B-Instruct",
-    "NonUniformQwen3MoeForCausalLM",
-    "Llama4ForCausalLM",
-    "MixtralForCausalLM",
-    "DeepseekV2ForCausalLM",
-    "Ernie4_5_MoEForCausalLM",
-    "Ernie4_5_MoeForCausalLM",
-    "gpt-oss-20b",
-    "Glm4MoeForCausalLM",
-}
+# REAP-supported architectures and arch detection live in the shared
+# reap_common module so the CLI and UI agree (audit L-source-dup / L-reap-archlist).
+try:
+    from reap_common import (
+        REAP_SUPPORTED_ARCHS, detect_model_arch as _detect_model_arch,
+    )
+except ImportError:  # pragma: no cover - package-import fallback
+    from core.reap_common import (
+        REAP_SUPPORTED_ARCHS, detect_model_arch as _detect_model_arch,
+    )
 
 
-def _detect_model_arch(model_path: Path) -> Optional[str]:
-    """Read config.json and return the first entry in architectures list, or None."""
-    cfg_path = model_path / "config.json"
-    if not cfg_path.exists():
-        return None
-    try:
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        archs = cfg.get("architectures") or []
-        if archs and isinstance(archs, list):
-            return archs[0]
-    except (json.JSONDecodeError, OSError):
-        pass
-    return None
-
-
-def stage_reap(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
+def stage_reap(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+               force: bool = False, timeout: Optional[float] = None,
+               skip_preflight: bool = False) -> bool:
     """Run REAP expert pruning on the merged or abliterated model.
 
-    Reads from ``heretic_dir`` (preferred) or ``merged_dir`` and writes to
-    ``reap_dir``. Silently skips (returns True) when the model architecture
-    is not supported by REAP.
+    Builds the pruning script via the shared ReapService. Skips on a valid
+    completion marker; silently skips (returns True) for unsupported archs.
     """
     log("Starting REAP expert pruning", "stage")
 
@@ -1020,155 +824,52 @@ def stage_reap(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool
         source_path = artifacts.merged_dir
         log(f"Source: merged safetensors at {source_path}")
     else:
-        log("No merged or abliterated model found — run export first", "error")
+        log("No merged or abliterated model found \u2014 run export first", "error")
         return False
 
-    # Skip if REAP output already exists.
-    if artifacts.reap_dir.exists() and any(artifacts.reap_dir.glob("*.safetensors")):
-        log(f"REAP output already exists at {artifacts.reap_dir} — skipping", "success")
+    rc = config.reap
+    cfg_hash = _markers().config_hash({
+        "src": str(source_path), "compression_ratio": rc.compression_ratio,
+        "prune_method": rc.prune_method, "samples_per_category": rc.samples_per_category,
+        "model_max_length": rc.model_max_length, "dataset_name": rc.dataset_name,
+        "seed": rc.seed,
+    })
+    existing = sorted(artifacts.reap_dir.glob("*.safetensors")) if artifacts.reap_dir.exists() else []
+    key_file = existing[0] if existing else (artifacts.reap_dir / "model.safetensors")
+    if _markers().is_stage_complete(artifacts.reap_dir, key_file, cfg_hash, force=force):
+        log(f"REAP already complete (marker matches) at {artifacts.reap_dir} \u2014 skipping", "success")
         return True
 
     # Check architecture support before launching a subprocess.
     arch = _detect_model_arch(source_path)
     if arch is None:
-        log(f"Could not detect model architecture from {source_path}/config.json — skipping REAP", "warn")
+        log(f"Could not detect model architecture from {source_path}/config.json \u2014 skipping REAP", "warn")
         return True
     if arch not in REAP_SUPPORTED_ARCHS:
-        log(f"Architecture '{arch}' is not supported by REAP — skipping stage", "warn")
+        log(f"Architecture '{arch}' is not supported by REAP \u2014 skipping stage", "warn")
         log(f"  REAP supports: {sorted(REAP_SUPPORTED_ARCHS)}")
         return True
     log(f"Detected supported architecture: {arch}")
 
-    rc = config.reap
-    output_dir = artifacts.output_dir.resolve()
-    source_abs = source_path.resolve()
-    reap_dir_abs = artifacts.reap_dir.resolve()
+    _preflight_stage("reap", config, log, skip=skip_preflight)
 
-    # Use the directory containing this file as the project root (not CWD).
-    _project_root = Path(__file__).resolve().parent.parent
+    svc = _services().ReapService(PROJECT_ROOT, _find_python())
+    script = svc.build_script(
+        input_dir=str(source_path.resolve()),
+        output_dir=str(artifacts.reap_dir.resolve()),
+        cwd_dir=str(artifacts.output_dir.resolve()),
+        compression_ratio=rc.compression_ratio,
+        prune_method=rc.prune_method,
+        samples_per_category=rc.samples_per_category,
+        model_max_length=rc.model_max_length,
+        dataset_name=rc.dataset_name,
+        seed=rc.seed,
+    )
 
-    # Generate a subprocess script. This uses the verified stub block to
-    # avoid importing vllm / lm_eval / evalplus / etc. whose pinned versions
-    # would break Foundry's ROCm torch stack if actually installed. We only
-    # exercise reap.prune, which does not need those runtime deps.
-    script = f'''
-import os, sys, shutil
-os.environ["HSA_ENABLE_SDMA"] = "0"
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
-os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
-
-# ── Stub out heavy optional REAP dependencies ──
-import types, importlib.machinery
-
-def _stub(name):
-    m = types.ModuleType(name)
-    m.__spec__ = importlib.machinery.ModuleSpec(name, None)
-    sys.modules[name] = m
-    return m
-
-for _name in ['vllm', 'vllm.entrypoints', 'vllm.entrypoints.openai',
-              'vllm.entrypoints.openai.api_server', 'vllm.engine',
-              'vllm.engine.arg_utils', 'vllm.model_executor',
-              'vllm.model_executor.models', 'lm_eval', 'lm_eval.utils',
-              'evalplus', 'evalplus.evaluate', 'lcb_runner', 'lcb_runner.runner',
-              'lcb_runner.runner.main', 'crfm_helm', 'evalscope', 'uvloop',
-              'deepspeed', 'wandb']:
-    _stub(_name)
-
-sys.modules['vllm'].TokensPrompt = type('TokensPrompt', (), {{}})
-sys.modules['vllm.entrypoints.openai.api_server'].run_server = lambda *a, **k: None
-sys.modules['vllm.engine.arg_utils'].AsyncEngineArgs = type('AsyncEngineArgs', (), {{}})
-sys.modules['vllm.model_executor.models'].ModelRegistry = type('ModelRegistry', (), {{}})
-sys.modules['lm_eval'].evaluator = type('evaluator', (), {{}})
-sys.modules['lm_eval.utils'].make_table = lambda *a, **k: None
-sys.modules['evalplus.evaluate'].evaluate = lambda *a, **k: None
-
-sys.path.insert(0, '/server/programming/reap/src')
-
-from pathlib import Path
-
-_source = {str(source_abs)!r}
-_output_dir = {str(output_dir)!r}
-_reap_dir = {str(reap_dir_abs)!r}
-
-print(f"[reap] source: {{_source}}")
-print(f"[reap] output_dir (cwd): {{_output_dir}}")
-print(f"[reap] final dest: {{_reap_dir}}")
-
-# REAP writes to a relative ./artifacts/<model>/<dataset>/pruned_models/<name>/
-# path. We chdir into output_dir so that relative path lands inside our run.
-os.makedirs(_output_dir, exist_ok=True)
-os.chdir(_output_dir)
-
-# Clear any stale reap artifacts directory from a previous run so we can
-# reliably locate the new pruned_models/ output after main() finishes.
-_artifacts_root = Path(_output_dir) / 'artifacts'
-if _artifacts_root.exists():
-    print(f"[reap] removing stale artifacts dir: {{_artifacts_root}}")
-    shutil.rmtree(_artifacts_root, ignore_errors=True)
-
-# Inject CLI args as if running `python -m reap.prune`.
-sys.argv = [
-    'reap-prune',
-    '--model-name', _source,
-    '--compression-ratio', {str(rc.compression_ratio)!r},
-    '--prune-method', {rc.prune_method!r},
-    '--samples_per_category', {str(rc.samples_per_category)!r},
-    '--model_max_length', {str(rc.model_max_length)!r},
-    '--seed', {str(rc.seed)!r},
-    '--dataset-name', {rc.dataset_name!r},
-    '--do-eval', 'false',
-    '--profile', 'false',
-    '--smoke_test', 'false',
-    '--record_pruning_metrics_only', 'true',
-    '--overwrite_observations', 'false',
-    '--plot_clusters', 'false',
-]
-
-print(f"[reap] invoking reap.prune.main() with argv: {{sys.argv[1:]}}")
-from reap.prune import main as _reap_main
-_reap_main()
-
-# Locate the pruned_models/<something>/ directory that REAP just wrote.
-print(f"[reap] searching for pruned model under {{_artifacts_root}}")
-_candidates = list(_artifacts_root.rglob('pruned_models/*'))
-_pruned = [c for c in _candidates if c.is_dir() and any(c.glob('*.safetensors'))]
-if not _pruned:
-    print(f"[reap] ERROR: no pruned model directory with safetensors found under {{_artifacts_root}}")
-    # Show what we did find for debugging
-    for _p in sorted(_artifacts_root.rglob('*'))[:50]:
-        print(f"  {{_p}}")
-    sys.exit(1)
-
-# Pick the most-recently-modified candidate (in case of multiple).
-_pruned.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-_src = _pruned[0]
-print(f"[reap] pruned model at: {{_src}}")
-
-# Move into reap_dir. Use os.replace on individual files to handle the case
-# where reap_dir already exists (we checked for stale artifacts, but the
-# parent may still be there).
-_dest = Path(_reap_dir)
-if _dest.exists():
-    shutil.rmtree(_dest)
-_dest.parent.mkdir(parents=True, exist_ok=True)
-shutil.move(str(_src), str(_dest))
-print(f"[reap] moved pruned model to: {{_dest}}")
-
-# Cleanup: remove the now-empty artifacts/ tree so we don't leave junk.
-try:
-    shutil.rmtree(_artifacts_root)
-    print(f"[reap] cleaned up {{_artifacts_root}}")
-except Exception as _e:
-    print(f"[reap] warning: cleanup of {{_artifacts_root}} failed: {{_e}}")
-
-print("PIPELINE_STAGE_COMPLETE=reap")
-'''
-
-    script_path = artifacts.output_dir / "_stage_reap.py"
-    script_path.write_text(script)
-
-    rc_code = _run([_find_python(), "-u", str(script_path)], log, cwd=str(_project_root))
+    rc_code = _run_stage_script(
+        script, artifacts.output_dir / "_stage_reap.py", log,
+        cfg_hash=cfg_hash, timeout=timeout,
+    )
     if rc_code != 0:
         log(f"REAP failed (exit code {rc_code})", "error")
         return False
@@ -1177,85 +878,92 @@ print("PIPELINE_STAGE_COMPLETE=reap")
         log("REAP output directory not found", "error")
         return False
 
+    st = sorted(artifacts.reap_dir.glob("*.safetensors"))
+    kf = st[0] if st else key_file
+    if kf.exists() and kf.stat().st_size > 0:
+        try:
+            _markers().write_marker(artifacts.reap_dir, "reap", kf, cfg_hash)
+        except OSError as e:
+            log(f"Could not write completion marker: {e}", "warn")
+
     log(f"Pruned model saved to {artifacts.reap_dir}", "success")
     return True
 
 
 # ── Stage: MagicQuant ────────────────────────────────────────────────────────
 
-def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
+def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+                     force: bool = False, timeout: Optional[float] = None,
+                     skip_preflight: bool = False) -> bool:
     """Run MagicQuant evolutionary search and generate hybrid GGUFs.
 
-    Reads from merged safetensors (preferred) or BF16 GGUF (fallback).
+    Builds the quantization script via the shared MagicQuantService (single
+    source of truth with the UI). Skips on a valid completion marker.
     """
     log("Starting MagicQuant evolutionary quantization", "stage")
 
-    # Determine source: prefer REAP output, then heretic, then merged, fall back to GGUF
-    if artifacts.reap_dir.exists() and any(artifacts.reap_dir.glob("*.safetensors")):
-        source_path = str(artifacts.reap_dir)
-        log(f"Source: REAP-pruned model at {source_path}")
-    elif artifacts.heretic_dir.exists():
-        source_path = str(artifacts.heretic_dir)
-        log(f"Source: abliterated model at {source_path}")
-    elif artifacts.merged_dir.exists():
-        source_path = str(artifacts.merged_dir)
-        log(f"Source: merged safetensors at {source_path}")
-    elif artifacts.bf16_gguf.exists():
-        source_path = str(artifacts.bf16_gguf)
-        log(f"Source: BF16 GGUF at {source_path}")
-    else:
+    # Determine source via the shared artifact-priority resolver
+    # (reap > heretic > merged > bf16 gguf). Pass it to the service as an
+    # explicit override so the in-subprocess resolution lands on the same model.
+    try:
+        from reap_common import resolve_artifact_source
+    except ImportError:  # pragma: no cover
+        from core.reap_common import resolve_artifact_source
+    source = resolve_artifact_source(artifacts.output_dir, require_safetensors=False)
+    if source is None:
         log("No merged model or BF16 GGUF found — run export first", "error")
         return False
+    log(f"Source: {source}")
 
     mc = config.magicquant
 
-    # Improvement #4: auto-install llama.cpp if needed
-    llamacpp = ensure_llamacpp(mc.llamacpp_path, log)
-
-    try:
-        from magicquant.orchestrator import MagicQuantOrchestrator
-
-        orch = MagicQuantOrchestrator(
-            source_model_path=source_path,
-            output_dir=str(artifacts.magicquant_dir),
-            llamacpp_path=str(llamacpp) if llamacpp else None,
-        )
-
-        log(f"Search: generations={mc.generations}, population={mc.population_size}, base={mc.target_base_quant}")
-
-        best_configs, tiered = orch.run_full_search(
-            target_base_quant=mc.target_base_quant,
-            max_generations=mc.generations,
-            population_size=mc.population_size,
-            verbose=True,
-        )
-
-        if not tiered:
-            log("Evolutionary search produced no viable configurations", "error")
-            return False
-
-        log(f"Search complete — tiers: {list(tiered.keys())}")
-
-        model_name = config.training.model_name.split("/")[-1]
-        paths = orch.generate_tiered_models(
-            tiered=tiered,
-            model_name_prefix=model_name,
-            tiers=mc.tiers,
-            verify=mc.verify,
-        )
-
-        valid_paths = [p for p in paths if p]
-        for p in valid_paths:
-            size_gb = Path(p).stat().st_size / 1e9
-            log(f"  {Path(p).name} ({size_gb:.1f} GB)")
-        log(f"Generated {len(valid_paths)} hybrid GGUF files", "success")
+    cfg_hash = _markers().config_hash({
+        "src": str(source), "generations": mc.generations,
+        "population_size": mc.population_size, "target_base_quant": mc.target_base_quant,
+        "tiers": mc.tiers, "verify": mc.verify,
+    })
+    existing = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
+    key_file = existing[0] if existing else (artifacts.magicquant_dir / "_placeholder.gguf")
+    if _markers().is_stage_complete(artifacts.magicquant_dir, key_file, cfg_hash, force=force):
+        log(f"MagicQuant already complete (marker matches) at {artifacts.magicquant_dir} — skipping", "success")
         return True
 
-    except Exception as e:
-        log(f"MagicQuant error: {e}", "error")
-        import traceback
-        log(traceback.format_exc(), "error")
+    model_name = config.training.model_name.split("/")[-1]
+    import json as _json
+    svc = _services().MagicQuantService(PROJECT_ROOT, _find_python())
+    script = svc.build_script(
+        llamacpp_hint=mc.llamacpp_path or "",
+        pipeline_root_str=str(PROJECT_ROOT),
+        mq_source_override=str(source),
+        out_abs_str=str(artifacts.output_dir.resolve()),
+        generations=mc.generations,
+        population_size=mc.population_size,
+        target_base_quant=mc.target_base_quant,
+        tiers_json=_json.dumps(mc.tiers),
+        model_name=model_name,
+        verify=mc.verify,
+    )
+
+    rc = _run_stage_script(
+        script, artifacts.output_dir / "_stage_magicquant.py", log,
+        cfg_hash=cfg_hash, timeout=timeout,
+    )
+    if rc != 0:
+        log(f"MagicQuant failed (exit code {rc})", "error")
         return False
+
+    ggufs = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
+    if not ggufs:
+        log("No GGUF files produced by MagicQuant", "error")
+        return False
+    for p in ggufs:
+        log(f"  {p.name} ({p.stat().st_size / 1e9:.1f} GB)")
+    try:
+        _markers().write_marker(artifacts.magicquant_dir, "magicquant", ggufs[0], cfg_hash)
+    except OSError as e:
+        log(f"Could not write completion marker: {e}", "warn")
+    log(f"Generated {len(ggufs)} hybrid GGUF files", "success")
+    return True
 
 
 # ── Stage: Upload ────────────────────────────────────────────────────────────
@@ -1384,8 +1092,15 @@ STAGES = [
 ]
 
 
-def run_pipeline(config: PipelineConfig, log: LogFn = _default_log) -> dict[str, bool]:
-    """Run the full pipeline. Returns {stage_name: success/None(skipped)}."""
+def run_pipeline(config: PipelineConfig, log: LogFn = _default_log,
+                 force: bool = False, stage_timeout: Optional[float] = None,
+                 skip_preflight: bool = False) -> dict[str, bool]:
+    """Run the full pipeline. Returns {stage_name: success/None(skipped)}.
+
+    ``force`` re-runs every stage even when a completion marker matches.
+    ``stage_timeout`` (seconds) kills a wedged stage subprocess (advisory).
+    ``skip_preflight`` disables the GPU-memory preflight check.
+    """
     artifacts = Artifacts(config.output_dir)
     results = {}
 
@@ -1405,6 +1120,8 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log) -> dict[str,
 
     log(f"Pipeline: {' → '.join(s for s, _ in STAGES if s in enabled)}", "stage")
 
+    _stage_kwargs = {"force": force, "timeout": stage_timeout, "skip_preflight": skip_preflight}
+
     for stage_name, stage_fn in STAGES:
         if stage_name not in enabled:
             log(f"Skipping {stage_name}")
@@ -1416,7 +1133,7 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log) -> dict[str,
         if stage_name == "upload":
             ok = stage_fn(config, artifacts, log, enabled=enabled)
         else:
-            ok = stage_fn(config, artifacts, log)
+            ok = stage_fn(config, artifacts, log, **_stage_kwargs)
         results[stage_name] = ok
         if not ok:
             log(f"Pipeline stopped at {stage_name}", "error")
@@ -1425,9 +1142,77 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log) -> dict[str,
     return results
 
 
+# ── Config loading ───────────────────────────────────────────────────────────
+
+# Mapping of YAML section name -> (config attribute on PipelineConfig, dataclass).
+# Used to populate every section from a YAML file, not just `training`.
+_CONFIG_SECTIONS = {
+    "training": ("training", TrainingConfig),
+    "export": ("export", ExportConfig),
+    "heretic": ("heretic", HereticConfig),
+    "reap": ("reap", ReapConfig),
+    "magicquant": ("magicquant", MagicQuantConfig),
+    "upload": ("upload", UploadConfig),
+}
+
+
+def _set_known_fields(obj, values: dict) -> None:
+    """Set only attributes that already exist on the dataclass instance.
+
+    Unknown YAML keys (e.g. flat-file extras like target_modules, load_in_4bit,
+    save_strategy) are ignored rather than raising, so legacy flat configs load.
+    """
+    for k, v in values.items():
+        if hasattr(obj, k):
+            setattr(obj, k, v)
+
+
+def load_yaml_into_config(config_path: str, cfg: "PipelineConfig") -> "PipelineConfig":
+    """Populate a PipelineConfig from a YAML file.
+
+    Accepts both layouts:
+      - Nested: top-level ``training:``/``export:``/... sections (bf16-zeroclaw.yaml).
+      - Flat: top-level training keys with no ``training:`` wrapper (default.yaml).
+        In the flat case, all recognized training-section keys are applied to
+        ``cfg.training`` so ``--config configs/default.yaml`` is no longer a no-op.
+
+    Only fields that exist on the matching dataclass are set; unknown keys are
+    ignored. For optional sections (export/heretic/reap/magicquant/upload) that
+    are currently ``None`` on ``cfg``, the section is instantiated when present
+    in the YAML so its values are honored.
+    """
+    import yaml
+
+    with open(config_path) as f:
+        data = yaml.safe_load(f) or {}
+
+    # Detect nested layout: any top-level key matches a known section name.
+    has_sections = any(k in data for k in _CONFIG_SECTIONS)
+
+    if has_sections:
+        for section, (attr, dc_cls) in _CONFIG_SECTIONS.items():
+            if section not in data or not isinstance(data[section], dict):
+                continue
+            current = getattr(cfg, attr, None)
+            if current is None:
+                current = dc_cls()
+                setattr(cfg, attr, current)
+            _set_known_fields(current, data[section])
+    else:
+        # Flat layout: treat all top-level keys as training-section keys.
+        _set_known_fields(cfg.training, data)
+
+    return cfg
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main(argv: Optional[list[str]] = None) -> int:
+    """Entry point for the `foundry` console script and `python core/pipeline.py`.
+
+    Parses CLI arguments, builds a PipelineConfig, and either runs a dry-run
+    upload validation or the full pipeline. Returns a process exit code.
+    """
     import argparse
 
     parser = argparse.ArgumentParser(description="Training + Quantization Pipeline")
@@ -1451,17 +1236,18 @@ if __name__ == "__main__":
     parser.add_argument("--llamacpp-path", type=str)
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate upload credentials and show what would be uploaded (no actual upload)")
-    args = parser.parse_args()
+    parser.add_argument("--force", action="store_true",
+                        help="Re-run every stage even if a completion marker matches")
+    parser.add_argument("--stage-timeout", type=float, default=None,
+                        help="Per-stage subprocess timeout in seconds (kills a wedged stage)")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Skip the advisory GPU-memory preflight check")
+    args = parser.parse_args(argv)
 
     cfg = PipelineConfig(output_dir=args.output_dir)
 
     if args.config:
-        import yaml
-        with open(args.config) as f:
-            data = yaml.safe_load(f)
-        if "training" in data:
-            for k, v in data["training"].items():
-                setattr(cfg.training, k, v)
+        load_yaml_into_config(args.config, cfg)
 
     if args.model:
         cfg.training.model_name = args.model
@@ -1496,7 +1282,7 @@ if __name__ == "__main__":
                 cfg.upload = UploadConfig(repo_id=args.upload_to)
             else:
                 print("ERROR: --dry-run requires --upload-to <repo_id>")
-                sys.exit(1)
+                return 1
         artifacts = Artifacts(cfg.output_dir)
         # Build the enabled set from config presence (same logic as run_pipeline).
         _dry_enabled = set()
@@ -1513,12 +1299,22 @@ if __name__ == "__main__":
         if cfg.upload is not None:
             _dry_enabled.add("upload")
         report = stage_upload_dry_run(cfg, artifacts, _default_log, enabled=_dry_enabled)
-        sys.exit(0 if report and report.ok else 1)
+        return 0 if report and report.ok else 1
 
-    results = run_pipeline(cfg)
+    results = run_pipeline(
+        cfg, force=args.force, stage_timeout=args.stage_timeout,
+        skip_preflight=args.skip_preflight,
+    )
 
     print("\n" + "=" * 50)
     print("Pipeline Results:")
     for stage, ok in results.items():
         sym = "+" if ok else ("-" if ok is None else "X")
         print(f"  {sym} {stage}")
+
+    # Non-zero exit if any enabled stage failed (None == skipped is fine).
+    return 0 if all(ok is not False for ok in results.values()) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

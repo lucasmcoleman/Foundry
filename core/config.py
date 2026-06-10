@@ -68,7 +68,9 @@ class FoundrySettings(BaseSettings):
 
     # -- UI --
     ui_port: int = 7865
+    ui_host: str = "127.0.0.1"  # loopback by default; set FOUNDRY_UI_HOST=0.0.0.0 (+ key) to expose
     api_key: str = ""  # Set FOUNDRY_API_KEY env var to enable auth
+    require_auth: bool = False  # FOUNDRY_REQUIRE_AUTH=1 fails closed even with an empty key
 
     # -- ROCm --
     device: str = "cuda:0"

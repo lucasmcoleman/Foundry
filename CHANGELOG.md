@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
+
+### Changed (behavior)
+- **CLI/UI consolidation (H1):** `core/pipeline.py` stage functions now build their
+  subprocess scripts via the shared `core/services.py` Service classes — one source
+  of truth per stage. CLI and UI now generate equivalent training scripts for the
+  same config (proven by `tests/test_script_equivalence.py`). This changes the
+  CLI's produced adapters (manual norm-upcast kbit instead of
+  `prepare_model_for_kbit_training`, `use_rslora`, unified warmup).
+- **Warmup unified (M-warmup):** both CLI and UI use `warmup_ratio` (default 0.05);
+  the UI no longer silently forces `warmup_steps=10`. `warmup_steps` remains an
+  optional override.
+- **Completion-marker resume (M-skip-marker):** stages skip on a
+  `_stage_complete.json` marker that matches the config hash AND a present,
+  non-empty key artifact — replacing existence-based skips that false-passed on
+  partially written outputs. `--force` re-runs anyway.
+- **UI secure by default (H3/M-rce):** binds `127.0.0.1`; a non-loopback bind
+  (`FOUNDRY_UI_HOST=0.0.0.0`) is refused unless `FOUNDRY_API_KEY` is set.
+  `FOUNDRY_REQUIRE_AUTH=1` fails closed even on loopback. API-key comparisons use
+  `hmac.compare_digest` (L-timing-compare).
+- **HF token scoped to upload (L-hf-token-scope):** the token is only injected into
+  the upload subprocess by default (opt in for all stages with
+  `FOUNDRY_HF_TOKEN_ALL_STAGES=1`).
+- Reconciled CLI training defaults with the UI (max_seq_length 4096, optim
+  `paged_adamw_8bit`).
+
+### Fixed
+- **Broken `foundry` entrypoint (M-entrypoint):** `core.pipeline:main` now exists.
+- **Config loader (L-config-fragmentation):** `--config configs/default.yaml` is no
+  longer a no-op — the loader accepts flat and nested YAML and populates all
+  sections.
+- **REAP arch list (L-reap-archlist):** repo-id strings replaced with `*ForCausalLM`
+  class names (adds `GptOssForCausalLM`); shared once via `core/reap_common.py`.
+- `tests/test_pipeline.sh` no longer hardcodes a dead `/server/programming/pipeline`
+  path (derives from the script dir).
+- Dockerfile healthcheck now hits `/health` (was the now-authenticated `/api/state`).
+- Simplified the dead Heretic selection loop to `sorted_trials[0]` (L-heretic-deadloop).
+
+### Added
+- `core/markers.py` (completion markers), `core/preflight.py` (GPU-memory preflight,
+  M-gpu-preflight), `core/reap_common.py` (shared REAP arch list / stub block /
+  configurable `FOUNDRY_REAP_SRC` path / source-priority resolver), `core/log.py`
+  (shared `_default_log`).
+- CLI flags: `--force`, `--stage-timeout`, `--skip-preflight`. `_run` now supports a
+  per-stage timeout and kills wedged subprocess groups (L-cli-timeout).
+- Pinned llama.cpp auto-install ref (L-supply-chain); transformers/accelerate
+  version guard for the fast_load hack (L-fast-load-hack); `POST /api/config`
+  validated against a `UIConfig` (extra='forbid', L-config-post).
+- Offline pytest suite under `tests/` (no GPU/network): script equivalence, UI
+  security, skip markers, config load, preflight, REAP arch, source resolution,
+  token scope, run timeout, version guard, stage cleanup.
+
+### Removed
+- `core/logging_config.py` (dead structlog module) and the `structlog` dependency;
+  `detect_response_template` (dead) and its test callers; the `datagen` optional
+  extras (no tracked source); stale `pipeline.egg-info`.
+
+### Notes
+- Out of scope for this code-corrections pass (need a real GPU / multi-GB model /
+  long compute): the pre-upload quality-gate stage (M-quality-gate) and the
+  FLM/Q4NX pipeline stage. The ONNX/Quark items (M-onnx-skip) live only on the
+  gitignored `feat/quark-onnx-stage` worktree and are folded in when that branch
+  lands.
+
 ## [0.2.0] - 2026-04-03 — API Key Authentication
 
 ### Added

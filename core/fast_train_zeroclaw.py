@@ -21,7 +21,6 @@ Then trains with PEFT LoRA + TRL SFTTrainer with completion-only loss masking
 import gc
 import json
 import os
-import re
 import time
 
 # ROCm environment variables — must be set before importing torch.
@@ -47,6 +46,53 @@ def get_device() -> torch.device:
 
 
 DEVICE = get_device()
+
+# Validated version range for the transformers/accelerate internals that the
+# fast_load device-map / is_quantized hack depends on (audit L-fast-load-hack).
+# Outside this range, the hack may silently break — warn loudly so an upgrade
+# points here instead of failing deep inside the trainer.
+VALIDATED_TRANSFORMERS = ("4.40.0", "5.0.0")  # [min, max)
+VALIDATED_ACCELERATE = ("0.30.0", "2.0.0")    # [min, max)
+
+
+def _parse_version(v: str):
+    nums = []
+    for part in v.split(".")[:3]:
+        digits = "".join(ch for ch in part if ch.isdigit())
+        nums.append(int(digits) if digits else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums)
+
+
+def check_internals_versions(transformers_version: str, accelerate_version: str):
+    """Return a list of warning strings for out-of-range internals versions.
+
+    Pure string logic (no imports) so it is unit-testable. Empty list == OK.
+    """
+    warnings = []
+    for name, ver, (lo, hi) in (
+        ("transformers", transformers_version, VALIDATED_TRANSFORMERS),
+        ("accelerate", accelerate_version, VALIDATED_ACCELERATE),
+    ):
+        pv = _parse_version(ver)
+        if not (_parse_version(lo) <= pv < _parse_version(hi)):
+            warnings.append(
+                f"{name} {ver} is outside the validated range "
+                f"[{lo}, {hi}); the fast_load device-map/is_quantized hack in "
+                "core/fast_train_zeroclaw.py may need updating."
+            )
+    return warnings
+
+
+def _warn_if_unvalidated_internals():
+    try:
+        import transformers as _t
+        import accelerate as _a
+    except ImportError:
+        return
+    for w in check_internals_versions(_t.__version__, _a.__version__):
+        print(f"WARNING: {w}")
 
 
 def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
@@ -293,54 +339,12 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
     # True, which skips Accelerate's .to(device) in prepare_model().
     # is_quantized must stay False to avoid validate_quantization_for_training()
     # trying to access model.hf_quantizer (which doesn't exist for manual BnB).
+    _warn_if_unvalidated_internals()
     model.quantization_method = "bitsandbytes"
     model.is_quantized = False
     model.hf_device_map = {"": 0, "_dummy": 0}  # >1 entry triggers skip
 
     return model, tokenizer
-
-
-def detect_response_template(tokenizer):
-    """Auto-detect the assistant response template from the tokenizer's chat template.
-
-    For completion-only loss masking, we need to identify the token sequence that
-    marks the start of assistant responses. This is model-specific:
-    - Qwen3.5: "<|im_start|>assistant\n"
-    - Llama 3: "<|start_header_id|>assistant<|end_header_id|>\n\n"
-
-    We render a minimal two-turn conversation and find the text between the last
-    end-of-turn marker and the assistant's content. This works for any model with
-    a standard chat template.
-    """
-    probe = tokenizer.apply_chat_template(
-        [{"role": "user", "content": "X"}, {"role": "assistant", "content": "Y"}],
-        tokenize=False, add_generation_prompt=False,
-    )
-
-    y_pos = probe.rfind("Y")
-    before_y = probe[:y_pos]
-
-    # Strip <think>...</think> blocks that some models inject (e.g. Qwen3.5 thinking mode).
-    before_y_clean = re.sub(r"<think>.*?</think>\s*", "", before_y, flags=re.DOTALL)
-
-    # Find the last end-of-turn marker before the assistant content.
-    end_markers = ["<|im_end|>", "<|eot_id|>", "<end_of_turn>", "</s>"]
-    last_end = -1
-    marker_len = 0
-    for em in end_markers:
-        p = before_y_clean.rfind(em)
-        if p > last_end:
-            last_end = p
-            marker_len = len(em)
-
-    if last_end >= 0:
-        response_template = before_y_clean[last_end + marker_len:].lstrip("\n")
-    else:
-        # Fallback: use the last line before assistant content.
-        response_template = before_y_clean.split("\n")[-1]
-
-    print(f"Auto-detected response template: {repr(response_template)}")
-    return response_template
 
 
 def find_latest_checkpoint(output_dir: str):

@@ -1,3 +1,9 @@
+> **HISTORICAL (superseded 2026-06-09).** This document predates the
+> 2026-06-09 audit corrections pass. Its three flagged CRITICALs (repr/!r
+> injection, always-true validate_dataset, did_training flag) were already fixed
+> at HEAD before that pass. The authoritative, current plan is
+> `AUDIT_FIXPLAN_2026-06-09.md`. Kept for history only.
+
 # Pipeline Audit Report
 
 **Date:** 2026-04-03

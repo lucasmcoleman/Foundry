@@ -5,10 +5,15 @@ services:
       dockerfile: Dockerfile
       args:
         BASE_IMAGE: python:3.12-slim
+    # SECURITY: the container binds 0.0.0.0 internally (the container is the
+    # boundary). The published port below is reachable on the host LAN — set
+    # FOUNDRY_API_KEY (and/or bind the published port to 127.0.0.1) before
+    # exposing it. Running the pipeline grants shell-equivalent access.
     ports:
       - "${FOUNDRY_UI_PORT:-7865}:7865"
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
+      - FOUNDRY_API_KEY=${FOUNDRY_API_KEY:-}
       - FOUNDRY_OUTPUT_DIR=/app/output
       - FOUNDRY_UI_PORT=7865
       - HSA_ENABLE_SDMA=0

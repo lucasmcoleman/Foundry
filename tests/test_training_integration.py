@@ -41,6 +41,15 @@ sys.path.insert(0, os.path.join(PIPELINE_ROOT, "core"))
 
 import torch
 
+# These tests need a GPU + a multi-GB model download. Mark the whole module so
+# the offline/CI suite deselects it with `-m 'not slow'` / `-m 'not gpu'`.
+# (make test additionally passes --ignore for this module.)
+try:
+    import pytest as _pytest
+    pytestmark = [_pytest.mark.slow, _pytest.mark.gpu]
+except ImportError:  # running as a plain script
+    pass
+
 # Test configuration — use the 9B model for manageable test times.
 TEST_MODEL_ID = "huihui-ai/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated"
 DATASET_PATH = os.path.join(PIPELINE_ROOT, "data", "zeroclaw_training_data.jsonl")
@@ -95,25 +104,6 @@ def test_lora_attachment(model):
     print(f"  Trainable: {trainable:,} / {total_params:,} ({pct:.2f}%)")
     assert pct < 5, f"Trainable percentage too high ({pct:.2f}%), LoRA may not be working"
     return model
-
-
-def test_response_template(tokenizer):
-    """Test that response template auto-detection works for Qwen3.5."""
-    print("\n=== Test 3: Response Template Detection ===")
-    from fast_train_zeroclaw import detect_response_template
-
-    template = detect_response_template(tokenizer)
-    assert template, "Response template is empty"
-    assert len(template) > 0, "Response template has zero length"
-
-    # For Qwen3.5 models, we expect something like "<|im_start|>assistant\n"
-    print(f"  Detected template: {repr(template)}")
-
-    # Verify it tokenizes to a non-empty sequence.
-    ids = tokenizer.encode(template, add_special_tokens=False)
-    assert len(ids) > 0, "Response template tokenizes to empty sequence"
-    print(f"  Template token IDs: {ids}")
-    return template
 
 
 def test_training_one_epoch(model, tokenizer):
@@ -275,14 +265,6 @@ def run_all_tests():
         errors.append(("LoRA Attachment", traceback.format_exc()))
         print(f"  FAILED: {e}")
         return passed, failed, errors
-
-    try:
-        test_response_template(tokenizer)
-        passed += 1
-    except Exception as e:
-        failed += 1
-        errors.append(("Response Template", traceback.format_exc()))
-        print(f"  FAILED: {e}")
 
     try:
         model, tokenizer = test_training_one_epoch(model, tokenizer)

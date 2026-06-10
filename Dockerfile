@@ -58,7 +58,12 @@ USER foundry
 
 EXPOSE 7865
 
+# Health check hits /health (unauthenticated); /api/state is behind the API key
+# and would 401 when FOUNDRY_API_KEY is set, falsely marking the container unhealthy.
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD python -c "import requests; r=requests.get('http://localhost:7865/api/state'); r.raise_for_status()" 2>/dev/null || exit 1
+    CMD python -c "import requests; r=requests.get('http://localhost:7865/health'); r.raise_for_status()" 2>/dev/null || exit 1
 
+# The container is the security boundary; it binds 0.0.0.0 inside the container.
+# When publishing the port, access-control it and set FOUNDRY_API_KEY — running
+# the pipeline grants shell-equivalent access inside the container.
 CMD ["uvicorn", "ui.app:app", "--host", "0.0.0.0", "--port", "7865"]

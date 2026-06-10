@@ -19,5 +19,14 @@ export PYTORCH_HIP_ALLOC_CONF="backend:native,expandable_segments:True"
 export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-echo "Starting Pipeline UI on http://localhost:${PORT}"
-exec "$VENV/uvicorn" app:app --host 0.0.0.0 --port "$PORT" --app-dir "$SCRIPT_DIR"
+# Default to loopback. To expose on the LAN set FOUNDRY_UI_HOST=0.0.0.0 AND
+# FOUNDRY_API_KEY=... — running the pipeline grants shell-equivalent host access.
+HOST="${FOUNDRY_UI_HOST:-127.0.0.1}"
+if [ "$HOST" != "127.0.0.1" ] && [ "$HOST" != "localhost" ] && [ "$HOST" != "::1" ] && [ -z "${FOUNDRY_API_KEY:-}" ]; then
+    echo "ERROR: refusing to bind ${HOST} without FOUNDRY_API_KEY set (unauthenticated, shell-equivalent access)."
+    echo "Set FOUNDRY_API_KEY, or bind 127.0.0.1."
+    exit 1
+fi
+
+echo "Starting Pipeline UI on http://${HOST}:${PORT}"
+exec "$VENV/uvicorn" app:app --host "$HOST" --port "$PORT" --app-dir "$SCRIPT_DIR"

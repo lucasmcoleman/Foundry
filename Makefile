@@ -4,16 +4,20 @@ install:
 	pip install -e ".[dev]"
 
 test:
-	python -m pytest tests/ -v --ignore=tests/test_training_integration.py
+	python -m pytest tests/ -v --ignore=tests/test_training_integration.py -m "not slow and not gpu"
 
 test-integration:
 	python -m pytest tests/test_training_integration.py -v
 
 lint:
 	python -m py_compile core/pipeline.py
+	python -m py_compile core/services.py
 	python -m py_compile core/fast_train_zeroclaw.py
 	python -m py_compile core/fast_export.py
 	python -m py_compile core/hf_upload.py
+	python -m py_compile core/markers.py
+	python -m py_compile core/preflight.py
+	python -m py_compile core/reap_common.py
 	python -m py_compile ui/app.py
 
 format:

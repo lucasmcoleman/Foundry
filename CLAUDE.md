@@ -17,16 +17,23 @@ core/                     # Main library modules
   fast_train_zeroclaw.py  # Shard-by-shard BnB 4-bit quantized loading + QLoRA training
   fast_export.py          # Streaming LoRA merge at ~6 GB peak
   hf_upload.py            # HuggingFace Hub upload with model card generation
+  services.py             # Shared per-stage script builders (one source of truth for CLI + UI)
+  markers.py              # _stage_complete.json completion markers (resume/skip)
+  preflight.py            # GPU-memory preflight checks
+  reap_common.py          # Shared REAP arch list / stub block / source-priority resolver
+  log.py                  # Shared print/WebSocket-callback logger
 configs/                  # YAML training configs
 data/                     # Training data (JSONL)
 scripts/                  # Convenience scripts (run_magicquant_upload.py, patch_gguf_metadata.py)
 legacy/                   # Deprecated Unsloth-based scripts (train.py, train_zeroclaw.py)
-datagen/                  # ZeroClaw tool-call data generation
-gardener/                 # NC gardening data generation (Claude API)
 MagicQuant/               # Evolutionary per-tensor hybrid quantization (subproject)
 ui/                       # FastAPI + WebSocket live log streaming UI
-tests/                    # Integration tests
+tests/                    # Offline pytest suite + GPU integration test (gpu/slow markers)
 ```
+
+> NOTE: `datagen/` and `gardener/` have no tracked source (only stale
+> `__pycache__`/logs on disk); their optional `datagen` extras were removed from
+> `pyproject.toml`. Restore from git history if you need them.
 
 ## Environment Setup
 

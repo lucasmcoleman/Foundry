@@ -13,7 +13,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 import requests
 from tenacity import (
@@ -23,12 +23,11 @@ from tenacity import (
     wait_exponential,
 )
 
-LogFn = Callable[[str, str], None]
-
-
-def _default_log(msg: str, level: str = "info"):
-    prefix = {"error": "ERROR", "warn": "WARN", "success": "OK", "stage": ">>>"}.get(level, "   ")
-    print(f"[{prefix}] {msg}")
+# Shared logging helper (single source of truth — see core/log.py).
+try:
+    from log import LogFn, default_log as _default_log
+except ImportError:  # pragma: no cover - when imported as the `core` package
+    from core.log import LogFn, default_log as _default_log
 
 
 # ── Configuration ────────────────────────────────────────────────────────────

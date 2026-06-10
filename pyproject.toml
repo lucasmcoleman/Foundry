@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "foundry"
-version = "0.1.0"
+version = "0.3.0"
 description = "ML fine-tuning and hybrid quantization pipeline for AMD ROCm"
 readme = "README.md"
 license = {text = "MIT"}
@@ -35,7 +35,6 @@ dependencies = [
     "pydantic-settings>=2.0.0",
 
     # Configuration and logging
-    "structlog>=24.0.0",
     "tenacity>=8.2.0",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0",
@@ -54,12 +53,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-datagen = [
-    "anthropic>=0.20.0",
-    "ebooklib>=0.18",
-    "beautifulsoup4>=4.12.0",
-    "lxml>=4.9.0",
-]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.23.0",
@@ -80,3 +73,7 @@ include = ["core*", "ui*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow (heavy compute; deselect with -m 'not slow')",
+    "gpu: marks tests that require a GPU / ROCm runtime (not run in CI)",
+]

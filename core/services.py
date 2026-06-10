@@ -86,11 +86,24 @@ class TrainingService:
         gradient_accumulation_steps: int,
         learning_rate: float,
         lr_scheduler_type: str,
-        warmup_steps: int,
+        warmup_steps: Optional[int] = None,
+        warmup_ratio: Optional[float] = None,
         optim: str,
         packing: bool = False,
     ) -> str:
-        """Generate the training subprocess script text."""
+        """Generate the training subprocess script text.
+
+        Warmup: pass ``warmup_ratio`` (preferred, used by both CLI and UI) and/or
+        ``warmup_steps``. When ``warmup_ratio`` is set it is emitted as
+        ``warmup_ratio=`` and takes precedence; ``warmup_steps`` is emitted only
+        when it is the sole warmup parameter. At least one must be provided.
+        """
+        if warmup_ratio is None and warmup_steps is None:
+            raise ValueError("TrainingService.build_script requires warmup_ratio or warmup_steps")
+        if warmup_ratio is not None:
+            warmup_line = f"        warmup_ratio={warmup_ratio}, "
+        else:
+            warmup_line = f"        warmup_steps={warmup_steps}, "
         core_path = repr(str(self.pipeline_root / "core"))
         pipeline_root_str = repr(str(self.pipeline_root))
 
@@ -242,7 +255,7 @@ class TrainingService:
             f"{gradient_accumulation_steps},\n"
             f"        learning_rate={learning_rate},\n"
             f"        lr_scheduler_type={repr(lr_scheduler_type)},\n"
-            f"        warmup_steps={warmup_steps}, "
+            f"{warmup_line}"
             f"optim={repr(optim)},\n"
             f"        weight_decay=0.01, max_grad_norm=1.0, "
             f"fp16=False, bf16=True,\n"
@@ -436,6 +449,8 @@ class HereticService:
             f"model.response_prefix = commonprefix(responses).rstrip(' ')\n"
             f"if model.response_prefix.startswith('<think>'):\n"
             f"    model.response_prefix = '<think></think>'\n"
+            f"elif model.response_prefix.startswith('<|channel|>analysis<|message|>'):\n"
+            f"    model.response_prefix = '<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>'\n"
             f"elif model.response_prefix.startswith('<thought>'):\n"
             f"    model.response_prefix = '<thought></thought>'\n"
             f"elif model.response_prefix.startswith('[THINK]'):\n"
@@ -541,15 +556,9 @@ class HereticService:
             f"if not completed:\n"
             f"    _print('No completed trials')\n"
             f"    sys.exit(1)\n"
+            f"# Best = fewest refusals, tie-broken by lowest KL divergence (Pareto-min).\n"
             f"sorted_trials = sorted(completed, key=lambda t: (t.user_attrs['refusals'], t.user_attrs['kl_divergence']))\n"
-            f"min_div = math.inf\n"
-            f"best_trials = []\n"
-            f"for t in sorted_trials:\n"
-            f"    kl = t.user_attrs['kl_divergence']\n"
-            f"    if kl < min_div:\n"
-            f"        min_div = kl\n"
-            f"        best_trials.append(t)\n"
-            f"best = best_trials[0]\n"
+            f"best = sorted_trials[0]\n"
             f"_print(f'\\nSelected trial {{best.user_attrs[\"index\"]}}: '\n"
             f"       f'refusals={{best.user_attrs[\"refusals\"]}}, '\n"
             f"       f'KL={{best.user_attrs[\"kl_divergence\"]:.4f}}')\n"
@@ -610,6 +619,13 @@ class ReapService:
         seed: int,
     ) -> str:
         """Generate the REAP pruning subprocess script text."""
+        # Heavy-dep stub block + configurable REAP src path come from the shared
+        # reap_common module (single source of truth — audit L-source-dup /
+        # L-reap-path-hardcoded). reap_stub_block() reads FOUNDRY_REAP_SRC.
+        try:
+            from reap_common import reap_stub_block
+        except ImportError:  # pragma: no cover - package-import fallback
+            from core.reap_common import reap_stub_block
         script = (
             "import os, sys, shutil\n"
             'os.environ["HSA_ENABLE_SDMA"] = "0"\n'
@@ -617,34 +633,9 @@ class ReapService:
             '"backend:native,expandable_segments:True"\n'
             'os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"\n'
             "\n"
-            "# ── Stub out heavy optional REAP dependencies ──\n"
-            "import types, importlib.machinery\n"
-            "\n"
-            "def _stub(name):\n"
-            "    m = types.ModuleType(name)\n"
-            "    m.__spec__ = importlib.machinery.ModuleSpec(name, None)\n"
-            "    sys.modules[name] = m\n"
-            "    return m\n"
-            "\n"
-            "for _name in ['vllm', 'vllm.entrypoints', 'vllm.entrypoints.openai',\n"
-            "              'vllm.entrypoints.openai.api_server', 'vllm.engine',\n"
-            "              'vllm.engine.arg_utils', 'vllm.model_executor',\n"
-            "              'vllm.model_executor.models', 'lm_eval', 'lm_eval.utils',\n"
-            "              'evalplus', 'evalplus.evaluate', 'lcb_runner', 'lcb_runner.runner',\n"
-            "              'lcb_runner.runner.main', 'crfm_helm', 'evalscope', 'uvloop',\n"
-            "              'deepspeed', 'wandb']:\n"
-            "    _stub(_name)\n"
-            "\n"
-            "sys.modules['vllm'].TokensPrompt = type('TokensPrompt', (), {})\n"
-            "sys.modules['vllm.entrypoints.openai.api_server'].run_server = lambda *a, **k: None\n"
-            "sys.modules['vllm.engine.arg_utils'].AsyncEngineArgs = type('AsyncEngineArgs', (), {})\n"
-            "sys.modules['vllm.model_executor.models'].ModelRegistry = type('ModelRegistry', (), {})\n"
-            "sys.modules['lm_eval'].evaluator = type('evaluator', (), {})\n"
-            "sys.modules['lm_eval.utils'].make_table = lambda *a, **k: None\n"
-            "sys.modules['evalplus.evaluate'].evaluate = lambda *a, **k: None\n"
-            "\n"
-            "sys.path.insert(0, '/server/programming/reap/src')\n"
-            "\n"
+            "# ── Stub heavy optional REAP deps + set REAP src path ──\n"
+            + reap_stub_block()
+            + "\n"
             "from pathlib import Path\n"
             "\n"
             f"_source = {repr(input_dir)}\n"
@@ -742,6 +733,7 @@ class MagicQuantService:
         target_base_quant: str,
         tiers_json: str,
         model_name: str,
+        verify: bool = False,
     ) -> str:
         """Generate the MagicQuant subprocess script text."""
         script = (
@@ -765,6 +757,7 @@ class MagicQuantService:
             f'    install_dir = Path.home() / "llama.cpp"\n'
             f'    print("llama.cpp not found — auto-installing...")\n'
             f'    rc = subprocess.run(["git", "clone", "--depth", "1",\n'
+            f'                         "--branch", "b4585",\n'
             f'                         '
             f'"https://github.com/ggml-org/llama.cpp.git", '
             f"str(install_dir)]).returncode\n"
@@ -863,7 +856,7 @@ class MagicQuantService:
             f"tiers = json.loads({repr(tiers_json)})\n"
             f"paths = orch.generate_tiered_models(\n"
             f"    tiered=tiered, model_name_prefix={repr(model_name)}, "
-            f"tiers=tiers, verify=False,\n"
+            f"tiers=tiers, verify={verify},\n"
             f")\n"
             f"valid = [p for p in paths if p]\n"
             f"for p in valid:\n"

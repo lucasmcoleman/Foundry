@@ -2,14 +2,19 @@
 """
 Foundry UI — FastAPI backend.
 
-Orchestrates a 4-stage LLM fine-tuning pipeline:
-  Training → Export GGUF → MagicQuant → Upload
+Orchestrates a 6-stage LLM fine-tuning pipeline (Heretic and REAP optional):
+  Training → Export → Heretic → REAP → MagicQuant → Upload
 
-Uses WebSocket for real-time log streaming to the browser.
-Port defaults to 7865 (configurable via FOUNDRY_UI_PORT env var).
+Stage scripts are built by the shared service layer (core/services.py), the same
+source of truth the CLI (core/pipeline.py) uses.
+
+Uses WebSocket for real-time log streaming to the browser. Binds 127.0.0.1 by
+default (set FOUNDRY_UI_HOST=0.0.0.0 + FOUNDRY_API_KEY to expose). Port defaults
+to 7865 (configurable via FOUNDRY_UI_PORT).
 """
 
 import asyncio
+import hmac
 import json
 import os
 import re
@@ -22,10 +27,12 @@ from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Header, Query
 from fastapi.responses import HTMLResponse, FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+import markers
 from config import settings as foundry_settings
+from reap_common import REAP_SUPPORTED_ARCHS, detect_model_arch as _detect_model_arch
 from services import (
     TrainingService,
     ExportService,
@@ -35,13 +42,37 @@ from services import (
     UploadService,
 )
 
+
+def _training_marker_hash(tc) -> str:
+    """Config hash for the training completion marker (mirrors the CLI)."""
+    return markers.config_hash({
+        "model_name": tc.model_name, "datasets": tc.datasets,
+        "max_seq_length": tc.max_seq_length, "lora_r": tc.lora_r,
+        "lora_alpha": tc.lora_alpha, "lora_dropout": tc.lora_dropout,
+        "use_rslora": tc.use_rslora, "num_train_epochs": tc.num_train_epochs,
+        "per_device_train_batch_size": tc.per_device_train_batch_size,
+        "gradient_accumulation_steps": tc.gradient_accumulation_steps,
+        "learning_rate": tc.learning_rate, "lr_scheduler_type": tc.lr_scheduler_type,
+        "warmup_ratio": tc.warmup_ratio, "optim": tc.optim, "packing": tc.packing,
+    })
+
 API_KEY = os.environ.get("FOUNDRY_API_KEY", "")
+# When set (FOUNDRY_REQUIRE_AUTH=1), every protected endpoint requires a key even
+# if API_KEY is empty — fails closed instead of open.
+REQUIRE_AUTH = os.environ.get("FOUNDRY_REQUIRE_AUTH", "0") not in ("", "0", "false", "False")
+
 
 async def verify_api_key(authorization: str = Header(default="")):
-    """Check Bearer token in the Authorization header. No-op when API_KEY is unset."""
+    """Check Bearer token in the Authorization header.
+
+    No-op when API_KEY is unset AND auth is not required. Uses a constant-time
+    comparison (hmac.compare_digest) to avoid timing side channels.
+    """
     if not API_KEY:
+        if REQUIRE_AUTH:
+            raise HTTPException(status_code=401, detail="Authentication required but no API key configured")
         return
-    if authorization != f"Bearer {API_KEY}":
+    if not hmac.compare_digest(authorization, f"Bearer {API_KEY}"):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 app = FastAPI(title="Foundry")
@@ -124,7 +155,8 @@ class TrainingCfg(BaseModel):
     gradient_accumulation_steps: int = 4
     learning_rate: float = 2e-4
     lr_scheduler_type: str = "cosine"
-    warmup_steps: int = 10
+    warmup_ratio: float = 0.05  # preferred; same as CLI. Logs the effective steps.
+    warmup_steps: Optional[int] = None  # optional override; ratio wins when both set
     optim: str = "paged_adamw_8bit"
     packing: bool = False
     output_dir: str = "./output"
@@ -167,6 +199,15 @@ class UploadCfg(BaseModel):
     upload_merged: bool = False
     upload_dataset: bool = True
 
+class UIConfig(BaseModel):
+    """Persisted UI config (ui/config.json). Only known keys are accepted; any
+    unexpected key is rejected (extra='forbid') so POST /api/config can't write
+    arbitrary attacker-controlled data into the file.
+    """
+    model_config = {"extra": "forbid"}
+    hf_username: str = ""
+
+
 class RunRequest(BaseModel):
     training: TrainingCfg = TrainingCfg()
     export: Optional[ExportCfg] = ExportCfg()
@@ -179,8 +220,14 @@ class RunRequest(BaseModel):
 
 # ── Subprocess helper ────────────────────────────────────────────────────────
 
-async def run_script(script: str, output_dir: str) -> int:
-    """Write a Python script to disk and execute it in the venv, streaming stdout to WebSocket clients."""
+async def run_script(script: str, output_dir: str, inject_hf_token: bool = False) -> int:
+    """Write a Python script to disk and execute it in the venv, streaming stdout to WebSocket clients.
+
+    ``inject_hf_token`` is False by default: the HF token is only loaded into the
+    subprocess env for the upload stage (and for any stage when
+    FOUNDRY_HF_TOKEN_ALL_STAGES=1 is set, e.g. gated base models at train time).
+    This narrows the blast radius vs. injecting it into every stage.
+    """
     # Resolve relative paths against the project root, not uvicorn's CWD
     out_path = Path(output_dir)
     if not out_path.is_absolute():
@@ -197,11 +244,18 @@ async def run_script(script: str, output_dir: str) -> int:
         "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
         "PYTHONUNBUFFERED": "1",
     })
-    # Auto-load HF token from cache if not in environment
-    if "HF_TOKEN" not in env:
-        token_path = Path.home() / ".cache" / "huggingface" / "token"
-        if token_path.exists():
-            env["HF_TOKEN"] = token_path.read_text().strip()
+    # Scope the HF token to stages that need it (upload), or opt in globally via
+    # FOUNDRY_HF_TOKEN_ALL_STAGES=1 (e.g. gated base models at train time).
+    token_all_stages = os.environ.get("FOUNDRY_HF_TOKEN_ALL_STAGES", "0") not in ("", "0", "false", "False")
+    token_wanted = inject_hf_token or token_all_stages
+    if token_wanted:
+        if "HF_TOKEN" not in env:
+            token_path = Path.home() / ".cache" / "huggingface" / "token"
+            if token_path.exists():
+                env["HF_TOKEN"] = token_path.read_text().strip()
+    else:
+        # Do not leak an inherited token into non-upload stage subprocesses.
+        env.pop("HF_TOKEN", None)
 
     log_path = script_path.with_suffix(".log")
     log_file = open(log_path, "w")
@@ -385,14 +439,15 @@ async def do_training(cfg: RunRequest) -> bool:
     tc = cfg.training
     out = _resolve_out(tc.output_dir)
 
-    # Skip if LoRA adapters already exist.
-    # NOTE: This only checks for artifact existence, not that they match the
-    # current run config (same model, same dataset, same hyperparameters).
-    # A previous run's output for a different config would cause a false skip.
-    # A full fix would hash the config and store it alongside the artifacts.
-    adapter_cfg = out / "lora_adapters" / "adapter_config.json"
-    if adapter_cfg.exists():
-        await state.log(f"LoRA adapters already exist at {out / 'lora_adapters'} — skipping training", "success")
+    # Completion-marker resume: skip only when a valid marker matches the config
+    # AND the key adapter file (adapter_model.safetensors) is present and
+    # non-empty. PEFT writes adapter_config.json early, so existence alone is not
+    # proof the stage finished (audit M-skip-marker).
+    lora_dir = out / "lora_adapters"
+    key_file = lora_dir / "adapter_model.safetensors"
+    cfg_hash = _training_marker_hash(tc)
+    if markers.is_stage_complete(lora_dir, key_file, cfg_hash):
+        await state.log(f"Training already complete (marker matches) at {lora_dir} — skipping", "success")
         await state.set_stage("training", StageStatus.COMPLETE)
         await state.set_progress(100)
         return True
@@ -420,12 +475,18 @@ async def do_training(cfg: RunRequest) -> bool:
         gradient_accumulation_steps=tc.gradient_accumulation_steps,
         learning_rate=tc.learning_rate,
         lr_scheduler_type=tc.lr_scheduler_type,
+        warmup_ratio=tc.warmup_ratio,
         warmup_steps=tc.warmup_steps,
         optim=tc.optim,
         packing=tc.packing,
     )
     rc = await run_script(script, tc.output_dir)
     ok = rc == 0
+    if ok and key_file.exists() and key_file.stat().st_size > 0:
+        try:
+            markers.write_marker(lora_dir, "training", key_file, cfg_hash)
+        except OSError:
+            pass
     await state.set_stage("training", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
@@ -440,26 +501,21 @@ async def do_export(cfg: RunRequest) -> bool:
     training_enabled = "training" in cfg.enabled_stages
     mq_enabled = "magicquant" in cfg.enabled_stages
 
-    # Skip if expected artifacts already exist.
-    # NOTE: This only checks for artifact existence, not that they match the
-    # current run config. Artifacts from a different model/config would cause
-    # a false skip. A full fix would hash the config and compare.
-    if mq_enabled:
-        merged = out_abs / "merged_model"
-        has_safetensors = merged.exists() and any(merged.glob("*.safetensors"))
-        if has_safetensors:
-            await state.log(f"Merged safetensors already exist at {merged} — skipping export", "success")
-            await state.set_stage("export", StageStatus.COMPLETE)
-            await state.set_progress(100)
-            return True
-    else:
-        gguf = out_abs / "model-bf16.gguf"
-        if gguf.exists():
-            size = gguf.stat().st_size / 1e9
-            await state.log(f"GGUF already exists at {gguf} ({size:.1f} GB) — skipping export", "success")
-            await state.set_stage("export", StageStatus.COMPLETE)
-            await state.set_progress(100)
-            return True
+    # Completion-marker resume (audit M-skip-marker): skip only when a valid
+    # marker matches AND the key artifact is present + non-empty.
+    merged = out_abs / "merged_model"
+    export_hash = markers.config_hash({
+        "model_name": cfg.training.model_name,
+        "source_model": cfg.export.source_model if cfg.export else "",
+        "training_enabled": training_enabled,
+    })
+    existing_st = sorted(merged.glob("*.safetensors")) if merged.exists() else []
+    export_key = existing_st[0] if existing_st else (merged / "model.safetensors")
+    if markers.is_stage_complete(merged, export_key, export_hash):
+        await state.log(f"Export already complete (marker matches) at {merged} — skipping export", "success")
+        await state.set_stage("export", StageStatus.COMPLETE)
+        await state.set_progress(100)
+        return True
 
     await state.set_stage("export", StageStatus.RUNNING)
     await state.set_progress(0)
@@ -510,6 +566,14 @@ async def do_export(cfg: RunRequest) -> bool:
     )
     rc = await run_script(script, out)
     ok = rc == 0
+    if ok and merged.exists():
+        st = sorted(merged.glob("*.safetensors"))
+        kf = st[0] if st else export_key
+        if kf.exists() and kf.stat().st_size > 0:
+            try:
+                markers.write_marker(merged, "export", kf, export_hash)
+            except OSError:
+                pass
     await state.set_stage("export", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
@@ -522,12 +586,18 @@ async def do_heretic(cfg: RunRequest) -> bool:
     out_abs = _resolve_out(out)
     hc = cfg.heretic
 
-    # Skip if heretic output already exists.
-    # NOTE: No config-match check -- stale artifacts from a different run
-    # would cause a false skip. See do_training() for the same limitation.
+    # Completion-marker resume (audit M-skip-marker).
     heretic_dir = out_abs / "heretic_model"
-    if heretic_dir.exists() and any(heretic_dir.glob("*.safetensors")):
-        await state.log(f"Abliterated model already exists at {heretic_dir} -- skipping heretic", "success")
+    heretic_hash = markers.config_hash({
+        "n_trials": hc.n_trials, "n_startup_trials": hc.n_startup_trials,
+        "quantization": hc.quantization, "kl_divergence_scale": hc.kl_divergence_scale,
+        "orthogonalize_direction": hc.orthogonalize_direction,
+        "row_normalization": hc.row_normalization,
+    })
+    existing_h = sorted(heretic_dir.glob("*.safetensors")) if heretic_dir.exists() else []
+    heretic_key = existing_h[0] if existing_h else (heretic_dir / "model.safetensors")
+    if markers.is_stage_complete(heretic_dir, heretic_key, heretic_hash):
+        await state.log(f"Heretic already complete (marker matches) at {heretic_dir} -- skipping heretic", "success")
         await state.set_stage("heretic", StageStatus.COMPLETE)
         await state.set_progress(100)
         return True
@@ -559,39 +629,22 @@ async def do_heretic(cfg: RunRequest) -> bool:
     )
     rc = await run_script(script, out)
     ok = rc == 0
+    if ok and heretic_dir.exists():
+        st = sorted(heretic_dir.glob("*.safetensors"))
+        kf = st[0] if st else heretic_key
+        if kf.exists() and kf.stat().st_size > 0:
+            try:
+                markers.write_marker(heretic_dir, "heretic", kf, heretic_hash)
+            except OSError:
+                pass
     await state.set_stage("heretic", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
     return ok
 
 
-REAP_SUPPORTED_ARCHS = {
-    "Qwen3MoeForCausalLM",
-    "Qwen3-Coder-30B-A3B-Instruct",
-    "NonUniformQwen3MoeForCausalLM",
-    "Llama4ForCausalLM",
-    "MixtralForCausalLM",
-    "DeepseekV2ForCausalLM",
-    "Ernie4_5_MoEForCausalLM",
-    "Ernie4_5_MoeForCausalLM",
-    "gpt-oss-20b",
-    "Glm4MoeForCausalLM",
-}
-
-
-def _detect_model_arch(model_path: Path) -> Optional[str]:
-    """Read config.json and return the first entry in architectures list, or None."""
-    cfg_path = model_path / "config.json"
-    if not cfg_path.exists():
-        return None
-    try:
-        data = json.loads(cfg_path.read_text())
-        archs = data.get("architectures") or []
-        if archs and isinstance(archs, list):
-            return archs[0]
-    except (json.JSONDecodeError, OSError):
-        pass
-    return None
+# REAP_SUPPORTED_ARCHS and _detect_model_arch are imported from reap_common
+# (single source of truth shared with the CLI — audit L-source-dup/L-reap-archlist).
 
 
 async def do_reap(cfg: RunRequest) -> bool:
@@ -605,10 +658,18 @@ async def do_reap(cfg: RunRequest) -> bool:
     out_abs = _resolve_out(out)
     rc = cfg.reap
 
-    # Skip if REAP output already exists.
+    # Completion-marker resume (audit M-skip-marker).
     reap_dir = out_abs / "reap_model"
-    if reap_dir.exists() and any(reap_dir.glob("*.safetensors")):
-        await state.log(f"Pruned model already exists at {reap_dir} — skipping REAP", "success")
+    reap_hash = markers.config_hash({
+        "compression_ratio": rc.compression_ratio, "prune_method": rc.prune_method,
+        "samples_per_category": rc.samples_per_category,
+        "model_max_length": rc.model_max_length, "dataset_name": rc.dataset_name,
+        "seed": rc.seed,
+    })
+    existing_r = sorted(reap_dir.glob("*.safetensors")) if reap_dir.exists() else []
+    reap_key = existing_r[0] if existing_r else (reap_dir / "model.safetensors")
+    if markers.is_stage_complete(reap_dir, reap_key, reap_hash):
+        await state.log(f"REAP already complete (marker matches) at {reap_dir} — skipping REAP", "success")
         await state.set_stage("reap", StageStatus.COMPLETE)
         await state.set_progress(100)
         return True
@@ -664,6 +725,14 @@ async def do_reap(cfg: RunRequest) -> bool:
     )
     rc_code = await run_script(script, out)
     ok = rc_code == 0
+    if ok and reap_dir.exists():
+        st = sorted(reap_dir.glob("*.safetensors"))
+        kf = st[0] if st else reap_key
+        if kf.exists() and kf.stat().st_size > 0:
+            try:
+                markers.write_marker(reap_dir, "reap", kf, reap_hash)
+            except OSError:
+                pass
     await state.set_stage("reap", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
@@ -677,18 +746,20 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     mc = cfg.magicquant
     export_enabled = "export" in cfg.enabled_stages
 
-    # Skip if MagicQuant GGUFs already exist.
-    # NOTE: No config-match check -- stale artifacts from a different run
-    # would cause a false skip. See do_training() for the same limitation.
+    # Completion-marker resume (audit M-skip-marker).
     mq_dir = out_abs / "magicquant"
-    if mq_dir.exists():
-        existing_ggufs = list(mq_dir.glob("*.gguf"))
-        if existing_ggufs:
-            names = ", ".join(f.name for f in existing_ggufs)
-            await state.log(f"MagicQuant GGUFs already exist ({names}) — skipping", "success")
-            await state.set_stage("magicquant", StageStatus.COMPLETE)
-            await state.set_progress(100)
-            return True
+    mq_hash = markers.config_hash({
+        "generations": mc.generations, "population_size": mc.population_size,
+        "target_base_quant": mc.target_base_quant, "tiers": mc.tiers,
+        "source_model": mc.source_model,
+    })
+    existing_ggufs = sorted(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
+    mq_key = existing_ggufs[0] if existing_ggufs else (mq_dir / "_placeholder.gguf")
+    if markers.is_stage_complete(mq_dir, mq_key, mq_hash):
+        await state.log(f"MagicQuant already complete (marker matches) at {mq_dir} — skipping", "success")
+        await state.set_stage("magicquant", StageStatus.COMPLETE)
+        await state.set_progress(100)
+        return True
 
     await state.set_stage("magicquant", StageStatus.RUNNING)
     await state.set_progress(0)
@@ -711,9 +782,17 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         target_base_quant=mc.target_base_quant,
         tiers_json=tiers_json,
         model_name=model_name,
+        verify=False,
     )
     rc = await run_script(script, out)
     ok = rc == 0
+    if ok and mq_dir.exists():
+        ggufs = sorted(mq_dir.glob("*.gguf"))
+        if ggufs:
+            try:
+                markers.write_marker(mq_dir, "magicquant", ggufs[0], mq_hash)
+            except OSError:
+                pass
     await state.set_stage("magicquant", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
@@ -786,7 +865,7 @@ async def do_upload(cfg: RunRequest) -> bool:
         lr_scheduler=tc.lr_scheduler_type,
         out_abs=str(out_abs),
     )
-    rc = await run_script(script, out)
+    rc = await run_script(script, out, inject_hf_token=True)
     ok = rc == 0
     await state.set_stage("upload", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
@@ -991,9 +1070,18 @@ async def get_config():
 
 @app.post("/api/config", dependencies=[Depends(verify_api_key)])
 async def set_config(body: dict):
-    """Merge and persist UI configuration values. Returns the updated config."""
+    """Merge and persist UI configuration values. Returns the updated config.
+
+    The incoming body is validated against UIConfig (extra='forbid'), so only
+    known keys are persisted and unexpected keys are rejected with 422.
+    """
+    try:
+        validated = UIConfig(**body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
     cfg = load_config()
-    cfg.update(body)
+    # Only persist fields explicitly provided in the request.
+    cfg.update(validated.model_dump(exclude_unset=True))
     save_config(cfg)
     return cfg
 
@@ -1183,8 +1271,11 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(default="")):
 
     Authentication is via the ``token`` query parameter (e.g. ``/ws?token=...``).
     """
-    if API_KEY and token != API_KEY:
+    if API_KEY and not hmac.compare_digest(token, API_KEY):
         await ws.close(code=4001, reason="Invalid API key")
+        return
+    if not API_KEY and REQUIRE_AUTH:
+        await ws.close(code=4001, reason="Authentication required")
         return
     await ws.accept()
     state.ws_clients.append(ws)
@@ -1196,7 +1287,32 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(default="")):
             state.ws_clients.remove(ws)
 
 
+def select_host(requested: Optional[str], api_key: str, require_auth: bool = False):
+    """Decide the uvicorn bind host.
+
+    Default is loopback (127.0.0.1). Binding to a non-loopback address (e.g.
+    0.0.0.0) is only allowed when an API key is set (or auth is otherwise
+    required); otherwise we refuse to expose an unauthenticated, shell-equivalent
+    endpoint on the network. Returns the host string.
+
+    Raises SystemExit when a non-loopback bind is requested without auth.
+    """
+    host = requested or "127.0.0.1"
+    loopback = host in ("127.0.0.1", "::1", "localhost")
+    if not loopback and not (api_key or require_auth):
+        raise SystemExit(
+            f"Refusing to bind {host} without authentication: running the "
+            "pipeline grants shell-equivalent host access. Set FOUNDRY_API_KEY "
+            "(and optionally FOUNDRY_REQUIRE_AUTH=1), or bind 127.0.0.1."
+        )
+    return host
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("FOUNDRY_UI_PORT", foundry_settings.ui_port))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    host = select_host(os.environ.get("FOUNDRY_UI_HOST"), API_KEY, REQUIRE_AUTH)
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        print(f"WARNING: binding {host} — the pipeline grants shell-equivalent host access; "
+              "ensure the API key and network access are controlled.")
+    uvicorn.run(app, host=host, port=port)

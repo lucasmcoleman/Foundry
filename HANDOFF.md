@@ -1,3 +1,6 @@
+> **HISTORICAL (superseded 2026-06-09).** Predates the 2026-06-09 audit
+> corrections pass. See `AUDIT_FIXPLAN_2026-06-09.md` for the current state.
+
 # HANDOFF.md
 
 ## Current State

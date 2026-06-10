@@ -1,3 +1,7 @@
+> **HISTORICAL (superseded 2026-06-09).** Predates the 2026-06-09 audit
+> corrections pass. The GPU-OOM preflight item is now implemented in
+> `core/preflight.py`. See `AUDIT_FIXPLAN_2026-06-09.md` for the current state.
+
 # Open Questions
 
 Items that could not be automatically resolved during the production hardening pass.
