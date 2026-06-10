@@ -16,6 +16,20 @@ Verified against current code by an independent pass (every audit finding re-con
 **Risk:** High regression surface: script generation is the core of the program. Changing CLI kbit/warmup will change produced adapters (intended). Long heretic/reap scripts make porting typos latent bugs. Mitigate by landing the equivalence test before refactoring.
 
 
+### [H2-codegen-as-strings] HIGH — RESOLVED (2026-06-09)
+Each stage body was extracted into an importable `core/_<stage>_entry.py`
+exposing `run(cfg.json)` (train/export/heretic/reap/magicquant/upload). Each
+`Service.build_script` now emits a ~10-line config-driven shim that writes JSON
+and calls the entry module (`import _<stage>_entry; _<stage>_entry.run(...)`).
+Heavy imports (torch/transformers/optuna/reap) are deferred into `run()` so the
+modules import GPU-free; config parsing and the pure helpers
+(`dataset_format.normalize_*`, `_heretic_entry.select_best_trial` /
+`normalize_response_prefix`, `_reap_entry.build_argv`,
+`_magicquant_entry.resolve_source`) are unit-tested in
+`tests/test_stage_entries.py` (+ relocated assertions in
+`test_script_equivalence.py` / `test_reap_service.py`). Original behavior was
+transcribed verbatim (anchor-checked against HEAD services.py).
+
 ### [H2-codegen-as-strings] HIGH — CONFIRMED
 **Claim:** Stage bodies are Python emitted as escaped f-strings/concatenated strings; no IDE/lint/type support; tracebacks point at anonymous temp files.
 
@@ -303,6 +317,14 @@ Verified against current code by an independent pass (every audit finding re-con
 
 **Risk:** Too-short timeout kills long stages (40B training runs hours); default to none/generous, opt-in via --stage-timeout.
 
+
+### [L-dataset-format] LOW — RESOLVED (2026-06-09)
+`core/dataset_format.py` adds auto-detecting normalization (messages / {text} /
+{prompt,completion} / alpaca {instruction,input,output}) to one importable
+module; the training entry (`core/_train_entry.py`) calls
+`normalize_dataset` + `messages_to_text` so every input shape yields the same
+chat structure. `{text}` rows are emitted verbatim (no template); heterogeneous
+sources fail loudly. Covered by `tests/test_dataset_format.py` (22 tests).
 
 ### [L-dataset-format] LOW — CONFIRMED
 **Claim:** Training supports only the chat 'messages' dataset format; no alpaca/{text}/{prompt,completion} branch.
