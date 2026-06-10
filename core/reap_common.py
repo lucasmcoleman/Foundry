@@ -102,6 +102,38 @@ def reap_stub_block(src_path: Optional[str] = None) -> str:
     )
 
 
+def install_reap_stubs(src_path: Optional[str] = None) -> None:
+    """Stub REAP's heavy optional deps and put the REAP src tree on sys.path.
+
+    The programmatic equivalent of :func:`reap_stub_block` — used by the
+    importable ``core/_reap_entry.py`` (audit H2) so the stage no longer relies
+    on exec'ing a generated string. Must run before ``import reap.prune``.
+    """
+    import importlib.machinery
+    import sys
+    import types
+
+    def _stub(name: str):
+        m = types.ModuleType(name)
+        m.__spec__ = importlib.machinery.ModuleSpec(name, None)
+        sys.modules[name] = m
+        return m
+
+    for name in REAP_STUB_MODULES:
+        _stub(name)
+
+    sys.modules["vllm"].TokensPrompt = type("TokensPrompt", (), {})
+    sys.modules["vllm.entrypoints.openai.api_server"].run_server = lambda *a, **k: None
+    sys.modules["vllm.engine.arg_utils"].AsyncEngineArgs = type("AsyncEngineArgs", (), {})
+    sys.modules["vllm.model_executor.models"].ModelRegistry = type("ModelRegistry", (), {})
+    sys.modules["lm_eval"].evaluator = type("evaluator", (), {})
+    sys.modules["lm_eval.utils"].make_table = lambda *a, **k: None
+    sys.modules["evalplus.evaluate"].evaluate = lambda *a, **k: None
+
+    path = src_path if src_path is not None else reap_src_path()
+    sys.path.insert(0, path)
+
+
 def resolve_artifact_source(output_dir: Path, *, require_safetensors: bool = True):
     """Return the highest-priority existing model artifact under ``output_dir``.
 

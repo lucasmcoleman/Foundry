@@ -15,6 +15,11 @@ import os
 from pathlib import Path
 from typing import Callable, Awaitable, Optional
 
+# Stages whose body has been extracted into an importable core/_<stage>_entry.py
+# module (audit H2). The Service.build_script for these emits a thin shim that
+# writes a JSON config and invokes the entry module's run().
+ENTRY_MODULES = ("_train_entry",)
+
 # Type alias for the async subprocess runner used by the UI.
 # Signature: (script_text, output_dir) -> exit_code
 RunScriptFn = Callable[[str, str], Awaitable[int]]
@@ -62,6 +67,28 @@ def _hf_cache_check(model_id_repr: str) -> str:
     )
 
 
+def _entry_shim(entry_module: str, cfg: dict, pipeline_root: Path) -> str:
+    """Return a small shim that writes ``cfg`` as JSON and calls an entry module.
+
+    The shim is intentionally tiny and config-driven: the CLI and the UI produce
+    a byte-identical shim for the same module, and all stage logic lives in the
+    importable ``core/<entry_module>.py`` (audit H2). The JSON config is embedded
+    as a repr'd string and written next to the running script, then passed to
+    ``run()``.
+    """
+    core_path = repr(str(Path(pipeline_root) / "core"))
+    cfg_json = repr(json.dumps(cfg, indent=2, sort_keys=True))
+    return (
+        "import sys, json, os\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {core_path})\n"
+        f"_cfg_path = Path(__file__).with_name({repr(entry_module + '.cfg.json')})\n"
+        f"_cfg_path.write_text({cfg_json})\n"
+        f"import {entry_module}\n"
+        f"{entry_module}.run(str(_cfg_path))\n"
+    )
+
+
 class TrainingService:
     """Orchestrates the QLoRA training subprocess."""
 
@@ -69,7 +96,7 @@ class TrainingService:
         self.pipeline_root = pipeline_root
         self.venv_python = venv_python
 
-    def build_script(
+    def build_config(
         self,
         *,
         model_name: str,
@@ -90,196 +117,51 @@ class TrainingService:
         warmup_ratio: Optional[float] = None,
         optim: str,
         packing: bool = False,
-    ) -> str:
-        """Generate the training subprocess script text.
+    ) -> dict:
+        """Build the JSON-serializable config consumed by core/_train_entry.py.
 
         Warmup: pass ``warmup_ratio`` (preferred, used by both CLI and UI) and/or
-        ``warmup_steps``. When ``warmup_ratio`` is set it is emitted as
-        ``warmup_ratio=`` and takes precedence; ``warmup_steps`` is emitted only
-        when it is the sole warmup parameter. At least one must be provided.
+        ``warmup_steps``. When ``warmup_ratio`` is set it takes precedence and
+        ``warmup_steps`` is dropped; at least one must be provided (audit
+        M-warmup). The same config from CLI and UI yields the same entry-module
+        invocation, so produced adapters match.
         """
         if warmup_ratio is None and warmup_steps is None:
-            raise ValueError("TrainingService.build_script requires warmup_ratio or warmup_steps")
-        if warmup_ratio is not None:
-            warmup_line = f"        warmup_ratio={warmup_ratio}, "
-        else:
-            warmup_line = f"        warmup_steps={warmup_steps}, "
-        core_path = repr(str(self.pipeline_root / "core"))
-        pipeline_root_str = repr(str(self.pipeline_root))
+            raise ValueError("TrainingService.build_config requires warmup_ratio or warmup_steps")
+        sources = datasets if datasets else ([dataset_path] if dataset_path else None)
+        return {
+            "pipeline_root": str(self.pipeline_root),
+            "model_name": model_name,
+            "datasets": list(sources) if sources else None,
+            "output_dir": output_dir,
+            "max_seq_length": max_seq_length,
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "use_rslora": use_rslora,
+            "num_train_epochs": num_train_epochs,
+            "per_device_train_batch_size": per_device_train_batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "learning_rate": learning_rate,
+            "lr_scheduler_type": lr_scheduler_type,
+            # Ratio wins: drop warmup_steps entirely when a ratio is given.
+            "warmup_ratio": warmup_ratio,
+            "warmup_steps": None if warmup_ratio is not None else warmup_steps,
+            "optim": optim,
+            "packing": packing,
+        }
 
-        # Resolve datasets list: prefer new 'datasets' param, fall back to 'dataset_path'
-        sources = datasets if datasets else ([dataset_path] if dataset_path else ["data/zeroclaw_training_data.jsonl"])
-        sources_repr = repr(sources)
+    def build_script(self, **kwargs) -> str:
+        """Generate the training subprocess shim.
 
-        script = _env_preamble()
-        script += _hf_cache_check(repr(model_name))
-        script += (
-            f"\nimport sys, torch\n"
-            f"sys.path.insert(0, str(_P({core_path})))\n"
-            f"\n"
-            f"from fast_train_zeroclaw import "
-            f"fast_load_quantized_model, find_latest_checkpoint\n"
-            f"from datasets import load_dataset\n"
-            f"from trl import SFTTrainer, SFTConfig\n"
-            f"from peft import LoraConfig, get_peft_model\n"
-            f"\n"
-            f"DEVICE = torch.device('cuda:0')\n"
-            f"model, tokenizer = fast_load_quantized_model({repr(model_name)})\n"
-            f"\n"
-            "# Ensure tokenizer has a chat template (some models like Gemma4 don't ship one)\n"
-            "if not getattr(tokenizer, 'chat_template', None):\n"
-            "    print('WARNING: tokenizer has no chat_template — applying ChatML default')\n"
-            "    tokenizer.chat_template = "
-            "\"{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}\"\n"
-            f"\n"
-            f"# Manual kbit prep — avoids fp32 upcast of MoE experts\n"
-            f"for param in model.parameters():\n"
-            f"    param.requires_grad = False\n"
-            f"for name, module in model.named_modules():\n"
-            f'    if "norm" in name.lower() or "layernorm" in name.lower():\n'
-            f"        module.to(torch.float32)\n"
-            f"model.gradient_checkpointing_enable("
-            f'gradient_checkpointing_kwargs={{"use_reentrant": False}})\n'
-            f"model.enable_input_require_grads()\n"
-            f'print(f"After manual kbit prep: '
-            f'{{torch.cuda.memory_allocated()/1e9:.1f}} GB")\n'
-            f"\n"
-            f"lora_config = LoraConfig(\n"
-            f"    r={lora_r}, lora_alpha={lora_alpha}, "
-            f"lora_dropout={lora_dropout},\n"
-            f'    target_modules=["q_proj","k_proj","v_proj","o_proj",'
-            f'"gate_proj","up_proj","down_proj"],\n'
-            f"    use_rslora={use_rslora}, task_type=\"CAUSAL_LM\",\n"
-            f")\n"
-            f"model = get_peft_model(model, lora_config)\n"
-            f"\n"
-            f"trainable = sum(p.numel() for p in model.parameters() "
-            f"if p.requires_grad)\n"
-            f"total = sum(p.numel() for p in model.parameters())\n"
-            f'print(f"Trainable: {{trainable:,}} / {{total:,}} '
-            f'({{100*trainable/total:.2f}}%)")\n'
-            f"\n"
-            f"_sources = {sources_repr}\n"
-            f"_loaded = []\n"
-            f"for _src in _sources:\n"
-            f"    _src = _src.strip()\n"
-            f"    if not _src:\n"
-            f"        continue\n"
-            f"    _local = _P(_src)\n"
-            f"    if not _local.is_absolute():\n"
-            f"        _local = _P({pipeline_root_str}) / _local\n"
-            f"    if _local.exists():\n"
-            f"        _ext = _local.suffix.lstrip('.')\n"
-            f"        _fmt = {{'jsonl':'json','json':'json','csv':'csv','parquet':'parquet'}}.get(_ext,'json')\n"
-            f"        _ds = load_dataset(_fmt, data_files=str(_local), split='train')\n"
-            f'        print(f"Loaded local: {{_src}} ({{len(_ds)}} examples)")\n'
-            f"    else:\n"
-            f"        _split = 'train'\n"
-            f"        _cfg_name = None\n"
-            f"        _clean = _src\n"
-            f"        if '[' in _clean and _clean.endswith(']'):\n"
-            f"            _clean, _split = _clean[:-1].split('[', 1)\n"
-            f"        if ':' in _clean and not _clean.startswith('/') and '.' not in _clean.split('/')[-1]:\n"
-            f"            _clean, _cfg_name = _clean.rsplit(':', 1)\n"
-            f"        _kwargs = {{'split': _split}}\n"
-            f"        if _cfg_name:\n"
-            f"            _kwargs['name'] = _cfg_name\n"
-            f"        _ds = load_dataset(_clean, **_kwargs)\n"
-            f'        print(f"Loaded HF: {{_src}} ({{len(_ds)}} examples)")\n'
-            f"    # Normalize: extract only 'messages' and ensure consistent schema.\n"
-            f"    # HF datasets may store messages as List(Json/string) or with extra columns.\n"
-            f"    # Rebuild from Python dicts so Arrow schema is always List(struct{{role,content}}).\n"
-            f"    if 'messages' not in _ds.column_names:\n"
-            f"        raise ValueError(f'Dataset {{_src}} has no messages column: {{_ds.column_names}}')\n"
-            f"    import json as _json\n"
-            f"    from datasets import Dataset as _Dataset\n"
-            f"    _rows = []\n"
-            f"    for _ex in _ds:\n"
-            f"        _msgs = _ex['messages']\n"
-            f"        if _msgs and isinstance(_msgs[0], str):\n"
-            f"            _msgs = [_json.loads(m) for m in _msgs]\n"
-            f"        # Keep only role + content from each message\n"
-            f"        _rows.append({{'messages': [{{'role': m.get('role',''), 'content': m.get('content','')}} for m in _msgs]}})\n"
-            f"    _ds = _Dataset.from_list(_rows)\n"
-            f"    _loaded.append(_ds)\n"
-            f"\n"
-            f"if len(_loaded) == 1:\n"
-            f"    dataset = _loaded[0]\n"
-            f"elif len(_loaded) > 1:\n"
-            f"    from datasets import concatenate_datasets\n"
-            f"    dataset = concatenate_datasets(_loaded).shuffle(seed=42)\n"
-            f'    print(f"Combined: {{len(dataset)}} examples from {{len(_loaded)}} sources")\n'
-            f"else:\n"
-            f"    raise ValueError('No datasets loaded')\n"
-            f'print(f"Dataset: {{len(dataset)}} examples")\n'
-            f"\n"
-            f"def fmt(ex):\n"
-            f'    ex["text"] = tokenizer.apply_chat_template('
-            f'ex["messages"], tokenize=False, '
-            f"add_generation_prompt=False)\n"
-            f"    return ex\n"
-            f"dataset = dataset.map(fmt)\n"
-            f"\n"
-            f"# Analyze token lengths to help tune max_length\n"
-            f"_lengths = [len(tokenizer.encode(ex['text'])) for ex in dataset]\n"
-            f"_lengths.sort()\n"
-            f"_p50 = _lengths[len(_lengths)//2]\n"
-            f"_p90 = _lengths[int(len(_lengths)*0.9)]\n"
-            f"_p99 = _lengths[int(len(_lengths)*0.99)]\n"
-            f"_max = _lengths[-1]\n"
-            f"print(f'Token lengths ({{len(_lengths)}} examples):')\n"
-            f"print(f'  Median: {{_p50}} tokens')\n"
-            f"print(f'  90% of examples are under: {{_p90}} tokens')\n"
-            f"print(f'  99% of examples are under: {{_p99}} tokens')\n"
-            f"print(f'  Longest example: {{_max}} tokens')\n"
-            f"print(f'  Current max_length: {max_seq_length} tokens')\n"
-            f"if _p90 < {max_seq_length} // 2:\n"
-            f"    print(f'  Tip: 90% of examples fit in {{_p90}} tokens — lowering max_length to ~{{int(_p90*1.1)}} would save memory and speed up training')\n"
-            f"_over = sum(1 for l in _lengths if l > {max_seq_length})\n"
-            f"if _over:\n"
-            f"    print(f'  Warning: {{_over}} examples ({{100*_over/len(_lengths):.1f}}%) are longer than max_length and will be truncated')\n"
-            f"\n"
-            f"resume_ckpt = find_latest_checkpoint({repr(output_dir)})\n"
-            f"if resume_ckpt:\n"
-            f'    print(f"Resuming from checkpoint: {{resume_ckpt}}")\n'
-            f"\n"
-            f"trainer = SFTTrainer(\n"
-            f"    model=model, processing_class=tokenizer, "
-            f"train_dataset=dataset,\n"
-            f"    args=SFTConfig(\n"
-            f"        output_dir={repr(output_dir)},\n"
-            f"        num_train_epochs={num_train_epochs},\n"
-            f"        per_device_train_batch_size="
-            f"{per_device_train_batch_size},\n"
-            f"        gradient_accumulation_steps="
-            f"{gradient_accumulation_steps},\n"
-            f"        learning_rate={learning_rate},\n"
-            f"        lr_scheduler_type={repr(lr_scheduler_type)},\n"
-            f"{warmup_line}"
-            f"optim={repr(optim)},\n"
-            f"        weight_decay=0.01, max_grad_norm=1.0, "
-            f"fp16=False, bf16=True,\n"
-            f"        logging_steps=1, save_strategy=\"epoch\", "
-            f"seed=42,\n"
-            f"        gradient_checkpointing=True,\n"
-            f"        gradient_checkpointing_kwargs="
-            f'{{\"use_reentrant\": False}},\n'
-            f'        report_to="none",\n'
-            f"        max_length={max_seq_length},\n"
-            f'        dataset_text_field="text",\n'
-            f"        packing={packing},\n"
-            f"        completion_only_loss={not packing},\n"
-            f"    ),\n"
-            f")\n"
-            f"stats = trainer.train(resume_from_checkpoint=resume_ckpt)\n"
-            f'print(f"Final loss: {{stats.training_loss:.4f}}")\n'
-            f"\n"
-            f"lora_dir = {repr(output_dir + '/lora_adapters')}\n"
-            f"model.save_pretrained(lora_dir)\n"
-            f"tokenizer.save_pretrained(lora_dir)\n"
-            f'print("PIPELINE_STAGE_COMPLETE=training")\n'
-        )
-        return script
+        The shim writes the JSON config (built by :meth:`build_config`) next to
+        itself and invokes the importable entry module ``core/_train_entry.py``.
+        All real logic — dataset format normalization, kbit prep, LoRA setup,
+        SFTConfig construction — lives in that module so it is IDE/lint/type
+        friendly and unit-testable without a GPU (audit H2).
+        """
+        cfg = self.build_config(**kwargs)
+        return _entry_shim("_train_entry", cfg, self.pipeline_root)
 
 
 class ExportService:
@@ -289,31 +171,27 @@ class ExportService:
         self.pipeline_root = pipeline_root
         self.venv_python = venv_python
 
-    def build_script(
+    def build_config(
         self,
         *,
         base_model_id: str,
         lora_source: Optional[str],
         has_lora: bool,
         merged_dir: str,
-    ) -> str:
-        """Generate the export subprocess script text."""
-        core_path = repr(str(self.pipeline_root / "core"))
+    ) -> dict:
+        """Build the JSON config consumed by core/_export_entry.py."""
+        return {
+            "pipeline_root": str(self.pipeline_root),
+            "base_model_id": base_model_id,
+            "lora_source": lora_source,
+            "has_lora": has_lora,
+            "merged_dir": merged_dir,
+        }
 
-        script = _env_preamble()
-        script += _hf_cache_check(repr(base_model_id))
-        script += (
-            f"\nimport sys\n"
-            f"sys.path.insert(0, str(_P({core_path})))\n"
-            f"from fast_export import streaming_merge\n"
-            f"streaming_merge(\n"
-            f"    model_id={repr(base_model_id)},\n"
-            f"    lora_dir={repr(lora_source)} if {has_lora} else None,\n"
-            f"    merged_dir={repr(merged_dir)},\n"
-            f")\n"
-            f'print("PIPELINE_STAGE_COMPLETE=export")\n'
-        )
-        return script
+    def build_script(self, **kwargs) -> str:
+        """Generate the export subprocess shim (calls core/_export_entry.py)."""
+        cfg = self.build_config(**kwargs)
+        return _entry_shim("_export_entry", cfg, self.pipeline_root)
 
 
 class HereticService:
@@ -323,7 +201,7 @@ class HereticService:
         self.pipeline_root = pipeline_root
         self.venv_python = venv_python
 
-    def build_script(
+    def build_config(
         self,
         *,
         model_path: str,
@@ -335,253 +213,26 @@ class HereticService:
         kl_divergence_scale: float,
         orthogonalize_direction: bool,
         row_normalization: str,
-    ) -> str:
-        """Generate the heretic abliteration subprocess script text.
+    ) -> dict:
+        """Build the JSON config consumed by core/_heretic_entry.py."""
+        return {
+            "pipeline_root": str(self.pipeline_root),
+            "model_path": model_path,
+            "output_path": output_path,
+            "checkpoint_dir": checkpoint_dir,
+            "n_trials": n_trials,
+            "n_startup_trials": n_startup_trials,
+            "quantization": quantization,
+            "kl_divergence_scale": kl_divergence_scale,
+            "orthogonalize_direction": orthogonalize_direction,
+            "row_normalization": row_normalization,
+        }
 
-        Uses heretic's internal API directly (Model, Evaluator, Optuna study)
-        to bypass the interactive CLI prompts (questionary).
-        """
-        script = _env_preamble()
-        script += (
-            f"\nimport math, os, sys, time, warnings\n"
-            f"import torch\n"
-            f"import torch.nn.functional as F\n"
-            f"import optuna\n"
-            f"import transformers\n"
-            f"from optuna.samplers import TPESampler\n"
-            f"from optuna.storages import JournalStorage\n"
-            f"from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock\n"
-            f"from optuna.study import StudyDirection\n"
-            f"from optuna.trial import TrialState\n"
-            f"from optuna.exceptions import ExperimentalWarning\n"
-            f"from optuna import Trial, TrialPruned\n"
-            f"from dataclasses import asdict\n"
-            f"from os.path import commonprefix\n"
-            f"\n"
-            f"from heretic.config import Settings\n"
-            f"from heretic.model import Model, AbliterationParameters\n"
-            f"from heretic.evaluator import Evaluator\n"
-            f"from heretic.utils import (\n"
-            f"    empty_cache, format_duration, get_trial_parameters,\n"
-            f"    load_prompts, print_memory_usage,\n"
-            f")\n"
-            f"\n"
-            f"# Use plain print for pipeline logging\n"
-            f"import builtins\n"
-            f"_print = builtins.print\n"
-            f"from heretic import utils as _hu\n"
-            f"_hu.print = _print\n"
-            f"\n"
-            f"torch.set_grad_enabled(False)\n"
-            f"torch._dynamo.config.cache_size_limit = 64\n"
-            f"transformers.logging.set_verbosity_error()\n"
-            f"optuna.logging.set_verbosity(optuna.logging.WARNING)\n"
-            f"warnings.filterwarnings('ignore', category=ExperimentalWarning)\n"
-            f"\n"
-            f"model_path = {repr(model_path)}\n"
-            f"output_path = {repr(output_path)}\n"
-            f"checkpoint_dir = {repr(checkpoint_dir)}\n"
-            f"os.makedirs(checkpoint_dir, exist_ok=True)\n"
-            f"\n"
-            f"_print(f'Model: {{model_path}}')\n"
-            f"_print(f'Output: {{output_path}}')\n"
-            f"\n"
-            f"settings = Settings(\n"
-            f"    model=model_path,\n"
-            f"    quantization={repr(quantization)},\n"
-            f"    n_trials={n_trials},\n"
-            f"    n_startup_trials={n_startup_trials},\n"
-            f"    kl_divergence_scale={kl_divergence_scale},\n"
-            f"    orthogonalize_direction={orthogonalize_direction},\n"
-            f"    row_normalization={repr(row_normalization)},\n"
-            f"    study_checkpoint_dir=checkpoint_dir,\n"
-            f"    batch_size=0,\n"
-            f")\n"
-            f"\n"
-            f"model = Model(settings)\n"
-            f"_print()\n"
-            f"print_memory_usage()\n"
-            f"\n"
-            f"_print()\n"
-            f"_print(f'Loading good prompts from {{settings.good_prompts.dataset}}...')\n"
-            f"good_prompts = load_prompts(settings, settings.good_prompts)\n"
-            f"_print(f'  {{len(good_prompts)}} prompts loaded')\n"
-            f"\n"
-            f"_print()\n"
-            f"_print(f'Loading bad prompts from {{settings.bad_prompts.dataset}}...')\n"
-            f"bad_prompts = load_prompts(settings, settings.bad_prompts)\n"
-            f"_print(f'  {{len(bad_prompts)}} prompts loaded')\n"
-            f"\n"
-            f"# Auto batch size\n"
-            f"if settings.batch_size == 0:\n"
-            f"    _print()\n"
-            f"    _print('Determining optimal batch size...')\n"
-            f"    batch_size = 1\n"
-            f"    best_batch_size = -1\n"
-            f"    best_performance = -1\n"
-            f"    while batch_size <= settings.max_batch_size:\n"
-            f"        _print(f'  Trying batch size {{batch_size}}... ', end='')\n"
-            f"        prompts = good_prompts * math.ceil(batch_size / len(good_prompts))\n"
-            f"        prompts = prompts[:batch_size]\n"
-            f"        try:\n"
-            f"            model.get_responses(prompts)\n"
-            f"            st = time.perf_counter()\n"
-            f"            responses = model.get_responses(prompts)\n"
-            f"            et = time.perf_counter()\n"
-            f"        except Exception as error:\n"
-            f"            if batch_size == 1: raise\n"
-            f"            _print(f'Failed ({{error}})')\n"
-            f"            break\n"
-            f"        rl = [len(model.tokenizer.encode(r)) for r in responses]\n"
-            f"        perf = sum(rl) / (et - st)\n"
-            f"        _print(f'Ok ({{perf:.0f}} tokens/s)')\n"
-            f"        if perf > best_performance:\n"
-            f"            best_batch_size = batch_size\n"
-            f"            best_performance = perf\n"
-            f"        batch_size *= 2\n"
-            f"    settings.batch_size = best_batch_size\n"
-            f"    _print(f'  Chosen batch size: {{settings.batch_size}}')\n"
-            f"\n"
-            f"# Check for common response prefix\n"
-            f"_print()\n"
-            f"_print('Checking for common response prefix...')\n"
-            f"responses = model.get_responses_batched(good_prompts[:100] + bad_prompts[:100])\n"
-            f"model.response_prefix = commonprefix(responses).rstrip(' ')\n"
-            f"if model.response_prefix.startswith('<think>'):\n"
-            f"    model.response_prefix = '<think></think>'\n"
-            f"elif model.response_prefix.startswith('<|channel|>analysis<|message|>'):\n"
-            f"    model.response_prefix = '<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>'\n"
-            f"elif model.response_prefix.startswith('<thought>'):\n"
-            f"    model.response_prefix = '<thought></thought>'\n"
-            f"elif model.response_prefix.startswith('[THINK]'):\n"
-            f"    model.response_prefix = '[THINK][/THINK]'\n"
-            f"if model.response_prefix:\n"
-            f"    _print(f'  Prefix found: {{model.response_prefix!r}}')\n"
-            f"else:\n"
-            f"    _print('  None found')\n"
-            f"\n"
-            f"evaluator = Evaluator(settings, model)\n"
-            f"\n"
-            f"# Compute refusal directions\n"
-            f"_print()\n"
-            f"_print('Calculating per-layer refusal directions...')\n"
-            f"_print('  Obtaining residuals for good prompts...')\n"
-            f"good_residuals = model.get_residuals_batched(good_prompts)\n"
-            f"_print('  Obtaining residuals for bad prompts...')\n"
-            f"bad_residuals = model.get_residuals_batched(bad_prompts)\n"
-            f"good_means = good_residuals.mean(dim=0)\n"
-            f"bad_means = bad_residuals.mean(dim=0)\n"
-            f"refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)\n"
-            f"if settings.orthogonalize_direction:\n"
-            f"    good_directions = F.normalize(good_means, p=2, dim=1)\n"
-            f"    proj = torch.sum(refusal_directions * good_directions, dim=1)\n"
-            f"    refusal_directions = refusal_directions - proj.unsqueeze(1) * good_directions\n"
-            f"    refusal_directions = F.normalize(refusal_directions, p=2, dim=1)\n"
-            f"del good_residuals, bad_residuals\n"
-            f"empty_cache()\n"
-            f"\n"
-            f"# Set up Optuna study\n"
-            f"study_file = os.path.join(\n"
-            f"    checkpoint_dir,\n"
-            f"    ''.join([(c if (c.isalnum() or c in ['_', '-']) else '--') for c in settings.model]) + '.jsonl',\n"
-            f")\n"
-            f"lock_obj = JournalFileOpenLock(study_file)\n"
-            f"backend = JournalFileBackend(study_file, lock_obj=lock_obj)\n"
-            f"storage = JournalStorage(backend)\n"
-            f"\n"
-            f"trial_index = 0\n"
-            f"start_index = 0\n"
-            f"start_time = time.perf_counter()\n"
-            f"\n"
-            f"def objective(trial):\n"
-            f"    global trial_index\n"
-            f"    trial_index += 1\n"
-            f"    trial.set_user_attr('index', trial_index)\n"
-            f"    direction_scope = trial.suggest_categorical('direction_scope', ['global', 'per layer'])\n"
-            f"    last_layer = len(model.get_layers()) - 1\n"
-            f"    direction_index = trial.suggest_float('direction_index', 0.4 * last_layer, 0.9 * last_layer)\n"
-            f"    if direction_scope == 'per layer': direction_index = None\n"
-            f"    parameters = {{}}\n"
-            f"    for comp in model.get_abliterable_components():\n"
-            f"        mw = trial.suggest_float(f'{{comp}}.max_weight', 0.8, 1.5)\n"
-            f"        mwp = trial.suggest_float(f'{{comp}}.max_weight_position', 0.6 * last_layer, 1.0 * last_layer)\n"
-            f"        mnw = trial.suggest_float(f'{{comp}}.min_weight', 0.0, 1.0)\n"
-            f"        mwd = trial.suggest_float(f'{{comp}}.min_weight_distance', 1.0, 0.6 * last_layer)\n"
-            f"        parameters[comp] = AbliterationParameters(\n"
-            f"            max_weight=mw, max_weight_position=mwp,\n"
-            f"            min_weight=(mnw * mw), min_weight_distance=mwd,\n"
-            f"        )\n"
-            f"    trial.set_user_attr('direction_index', direction_index)\n"
-            f"    trial.set_user_attr('parameters', {{k: asdict(v) for k, v in parameters.items()}})\n"
-            f"    _print(f'\\nRunning trial {{trial_index}} of {{settings.n_trials}}...')\n"
-            f"    model.reset_model()\n"
-            f"    model.abliterate(refusal_directions, direction_index, parameters)\n"
-            f"    score, kl_div, refusals = evaluator.get_score()\n"
-            f"    elapsed = time.perf_counter() - start_time\n"
-            f"    remaining = (elapsed / (trial_index - start_index)) * (settings.n_trials - trial_index)\n"
-            f"    _print(f'  Elapsed: {{format_duration(elapsed)}}')\n"
-            f"    if trial_index < settings.n_trials:\n"
-            f"        _print(f'  Estimated remaining: {{format_duration(remaining)}}')\n"
-            f"    trial.set_user_attr('kl_divergence', kl_div)\n"
-            f"    trial.set_user_attr('refusals', refusals)\n"
-            f"    return score\n"
-            f"\n"
-            f"def objective_wrapper(trial):\n"
-            f"    try: return objective(trial)\n"
-            f"    except KeyboardInterrupt:\n"
-            f"        trial.study.stop()\n"
-            f"        raise TrialPruned()\n"
-            f"\n"
-            f"study = optuna.create_study(\n"
-            f"    sampler=TPESampler(n_startup_trials=settings.n_startup_trials, n_ei_candidates=128, multivariate=True),\n"
-            f"    directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],\n"
-            f"    storage=storage, study_name='heretic', load_if_exists=True,\n"
-            f")\n"
-            f"study.set_user_attr('settings', settings.model_dump_json())\n"
-            f"study.set_user_attr('finished', False)\n"
-            f"\n"
-            f"def count_done(): return sum(1 for t in study.trials if t.state == TrialState.COMPLETE)\n"
-            f"\n"
-            f"start_index = trial_index = count_done()\n"
-            f"if start_index > 0:\n"
-            f"    _print(f'\\nResuming existing study ({{start_index}} trials completed).')\n"
-            f"remaining = settings.n_trials - count_done()\n"
-            f"if remaining > 0:\n"
-            f"    study.optimize(objective_wrapper, n_trials=remaining)\n"
-            f"if count_done() == settings.n_trials:\n"
-            f"    study.set_user_attr('finished', True)\n"
-            f"\n"
-            f"# Select best trial from Pareto front\n"
-            f"completed = [t for t in study.trials if t.state == TrialState.COMPLETE]\n"
-            f"if not completed:\n"
-            f"    _print('No completed trials')\n"
-            f"    sys.exit(1)\n"
-            f"# Best = fewest refusals, tie-broken by lowest KL divergence (Pareto-min).\n"
-            f"sorted_trials = sorted(completed, key=lambda t: (t.user_attrs['refusals'], t.user_attrs['kl_divergence']))\n"
-            f"best = sorted_trials[0]\n"
-            f"_print(f'\\nSelected trial {{best.user_attrs[\"index\"]}}: '\n"
-            f"       f'refusals={{best.user_attrs[\"refusals\"]}}, '\n"
-            f"       f'KL={{best.user_attrs[\"kl_divergence\"]:.4f}}')\n"
-            f"\n"
-            f"# Apply best trial and save\n"
-            f"_print('Resetting model...')\n"
-            f"model.reset_model()\n"
-            f"_print('Abliterating with best parameters...')\n"
-            f"model.abliterate(\n"
-            f"    refusal_directions,\n"
-            f"    best.user_attrs['direction_index'],\n"
-            f"    {{k: AbliterationParameters(**v) for k, v in best.user_attrs['parameters'].items()}},\n"
-            f")\n"
-            f"_print('Saving merged abliterated model...')\n"
-            f"merged_model = model.get_merged_model()\n"
-            f"merged_model.save_pretrained(output_path)\n"
-            f"del merged_model\n"
-            f"empty_cache()\n"
-            f"model.tokenizer.save_pretrained(output_path)\n"
-            f"_print(f'Abliterated model saved to {{output_path}}')\n"
-            f"_print('PIPELINE_STAGE_COMPLETE=heretic')\n"
-        )
-        return script
+    def build_script(self, **kwargs) -> str:
+        """Generate the heretic subprocess shim (calls core/_heretic_entry.py)."""
+        cfg = self.build_config(**kwargs)
+        return _entry_shim("_heretic_entry", cfg, self.pipeline_root)
+
 
 
 class ReapService:
@@ -605,7 +256,7 @@ class ReapService:
         self.pipeline_root = pipeline_root
         self.venv_python = venv_python
 
-    def build_script(
+    def build_config(
         self,
         *,
         input_dir: str,     # heretic_model or merged_model path (absolute)
@@ -617,101 +268,26 @@ class ReapService:
         model_max_length: int,
         dataset_name: str,
         seed: int,
-    ) -> str:
-        """Generate the REAP pruning subprocess script text."""
-        # Heavy-dep stub block + configurable REAP src path come from the shared
-        # reap_common module (single source of truth — audit L-source-dup /
-        # L-reap-path-hardcoded). reap_stub_block() reads FOUNDRY_REAP_SRC.
-        try:
-            from reap_common import reap_stub_block
-        except ImportError:  # pragma: no cover - package-import fallback
-            from core.reap_common import reap_stub_block
-        script = (
-            "import os, sys, shutil\n"
-            'os.environ["HSA_ENABLE_SDMA"] = "0"\n'
-            'os.environ["PYTORCH_HIP_ALLOC_CONF"] = '
-            '"backend:native,expandable_segments:True"\n'
-            'os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"\n'
-            "\n"
-            "# ── Stub heavy optional REAP deps + set REAP src path ──\n"
-            + reap_stub_block()
-            + "\n"
-            "from pathlib import Path\n"
-            "\n"
-            f"_source = {repr(input_dir)}\n"
-            f"_cwd = {repr(cwd_dir)}\n"
-            f"_reap_dir = {repr(output_dir)}\n"
-            "\n"
-            "print(f'[reap] source: {_source}')\n"
-            "print(f'[reap] cwd: {_cwd}')\n"
-            "print(f'[reap] final dest: {_reap_dir}')\n"
-            "\n"
-            "# REAP writes to a relative ./artifacts/<model>/<dataset>/pruned_models/<name>/\n"
-            "# path. Chdir into cwd_dir so that relative path lands inside the Foundry run.\n"
-            "os.makedirs(_cwd, exist_ok=True)\n"
-            "os.chdir(_cwd)\n"
-            "\n"
-            "# Clear stale reap artifacts dir from a previous run so we can reliably\n"
-            "# locate the new pruned_models/ output after main() finishes.\n"
-            "_artifacts_root = Path(_cwd) / 'artifacts'\n"
-            "if _artifacts_root.exists():\n"
-            "    print(f'[reap] removing stale artifacts dir: {_artifacts_root}')\n"
-            "    shutil.rmtree(_artifacts_root, ignore_errors=True)\n"
-            "\n"
-            "# Inject CLI args as if running `python -m reap.prune`.\n"
-            "sys.argv = [\n"
-            "    'reap-prune',\n"
-            "    '--model-name', _source,\n"
-            f"    '--compression-ratio', {repr(str(compression_ratio))},\n"
-            f"    '--prune-method', {repr(prune_method)},\n"
-            f"    '--samples_per_category', {repr(str(samples_per_category))},\n"
-            f"    '--model_max_length', {repr(str(model_max_length))},\n"
-            f"    '--seed', {repr(str(seed))},\n"
-            f"    '--dataset-name', {repr(dataset_name)},\n"
-            "    '--do-eval', 'false',\n"
-            "    '--profile', 'false',\n"
-            "    '--smoke_test', 'false',\n"
-            "    '--record_pruning_metrics_only', 'true',\n"
-            "    '--overwrite_observations', 'false',\n"
-            "    '--plot_clusters', 'false',\n"
-            "]\n"
-            "\n"
-            "print(f'[reap] invoking reap.prune.main() with argv: {sys.argv[1:]}')\n"
-            "from reap.prune import main as _reap_main\n"
-            "_reap_main()\n"
-            "\n"
-            "# Locate the pruned_models/<something>/ directory that REAP just wrote.\n"
-            "print(f'[reap] searching for pruned model under {_artifacts_root}')\n"
-            "_candidates = list(_artifacts_root.rglob('pruned_models/*'))\n"
-            "_pruned = [c for c in _candidates if c.is_dir() and any(c.glob('*.safetensors'))]\n"
-            "if not _pruned:\n"
-            "    print(f'[reap] ERROR: no pruned model directory with safetensors found under {_artifacts_root}')\n"
-            "    for _p in sorted(_artifacts_root.rglob('*'))[:50]:\n"
-            "        print(f'  {_p}')\n"
-            "    sys.exit(1)\n"
-            "\n"
-            "_pruned.sort(key=lambda p: p.stat().st_mtime, reverse=True)\n"
-            "_src = _pruned[0]\n"
-            "print(f'[reap] pruned model at: {_src}')\n"
-            "\n"
-            "# Move the pruned output into reap_dir.\n"
-            "_dest = Path(_reap_dir)\n"
-            "if _dest.exists():\n"
-            "    shutil.rmtree(_dest)\n"
-            "_dest.parent.mkdir(parents=True, exist_ok=True)\n"
-            "shutil.move(str(_src), str(_dest))\n"
-            "print(f'[reap] moved pruned model to: {_dest}')\n"
-            "\n"
-            "# Cleanup: remove the now-empty artifacts/ tree.\n"
-            "try:\n"
-            "    shutil.rmtree(_artifacts_root)\n"
-            "    print(f'[reap] cleaned up {_artifacts_root}')\n"
-            "except Exception as _e:\n"
-            "    print(f'[reap] warning: cleanup of {_artifacts_root} failed: {_e}')\n"
-            "\n"
-            "print('PIPELINE_STAGE_COMPLETE=reap')\n"
-        )
-        return script
+    ) -> dict:
+        """Build the JSON config consumed by core/_reap_entry.py."""
+        return {
+            "pipeline_root": str(self.pipeline_root),
+            "input_dir": input_dir,
+            "output_dir": output_dir,
+            "cwd_dir": cwd_dir,
+            "compression_ratio": compression_ratio,
+            "prune_method": prune_method,
+            "samples_per_category": samples_per_category,
+            "model_max_length": model_max_length,
+            "dataset_name": dataset_name,
+            "seed": seed,
+        }
+
+    def build_script(self, **kwargs) -> str:
+        """Generate the REAP subprocess shim (calls core/_reap_entry.py)."""
+        cfg = self.build_config(**kwargs)
+        return _entry_shim("_reap_entry", cfg, self.pipeline_root)
+
 
 
 class MagicQuantService:
@@ -721,7 +297,7 @@ class MagicQuantService:
         self.pipeline_root = pipeline_root
         self.venv_python = venv_python
 
-    def build_script(
+    def build_config(
         self,
         *,
         llamacpp_hint: str,
@@ -734,138 +310,26 @@ class MagicQuantService:
         tiers_json: str,
         model_name: str,
         verify: bool = False,
-    ) -> str:
-        """Generate the MagicQuant subprocess script text."""
-        script = (
-            "import sys, os, subprocess, multiprocessing\n"
-            "from pathlib import Path\n"
-            "\n"
-            "def find_llamacpp():\n"
-            f"    for p in [{repr(llamacpp_hint)}, "
-            f'os.environ.get("LLAMACPP_PATH",""),\n'
-            f'              str(Path.home()/"llama.cpp"), '
-            f'"./llama.cpp", "/usr/local"]:\n'
-            f"        if not p: continue\n"
-            f"        pp = Path(p)\n"
-            f'        for sub in [pp/"convert_hf_to_gguf.py", '
-            f'pp/"build"/"bin"/"llama-quantize"]:\n'
-            f"            if sub.exists(): return str(pp)\n"
-            f"    return None\n"
-            f"\n"
-            f"llamacpp = find_llamacpp()\n"
-            f"if not llamacpp:\n"
-            f'    install_dir = Path.home() / "llama.cpp"\n'
-            f'    print("llama.cpp not found — auto-installing...")\n'
-            f'    rc = subprocess.run(["git", "clone", "--depth", "1",\n'
-            f'                         "--branch", "b4585",\n'
-            f'                         '
-            f'"https://github.com/ggml-org/llama.cpp.git", '
-            f"str(install_dir)]).returncode\n"
-            f"    if rc == 0:\n"
-            f'        build_dir = install_dir / "build"\n'
-            f'        rc = subprocess.run(["cmake", "-B", '
-            f'str(build_dir), "-DCMAKE_BUILD_TYPE=Release",\n'
-            f"                             "
-            f"str(install_dir)]).returncode\n"
-            f"        if rc == 0:\n"
-            f"            jobs = str(multiprocessing.cpu_count())\n"
-            f'            rc = subprocess.run(["cmake", "--build", '
-            f'str(build_dir), "-j", jobs]).returncode\n'
-            f"    if rc == 0:\n"
-            f"        llamacpp = str(install_dir)\n"
-            f'        print(f"llama.cpp installed: {{llamacpp}}")\n'
-            f"    else:\n"
-            f'        print("Warning: llama.cpp install failed, '
-            f'using heuristic probing")\n'
-            f"        llamacpp = None\n"
-            f"\n"
-            f"print(f\"llama.cpp: "
-            f"{{llamacpp or 'not found (heuristic mode)'}}\")\n"
-            f"\n"
-            f"from magicquant.orchestrator import "
-            f"MagicQuantOrchestrator\n"
-            f"import json\n"
-            f"\n"
-            f"override = {repr(mq_source_override)}\n"
-            f"out_dir = Path({repr(out_abs_str)})\n"
-            f"\n"
-            f"def _resolve_source(override, out_dir):\n"
-            f"    candidates = []\n"
-            f"    if override:\n"
-            f"        p = Path(override)\n"
-            f"        if not p.is_absolute():\n"
-            f"            candidates = [out_dir / override, "
-            f"Path({repr(pipeline_root_str)}) / override]\n"
-            f"        else:\n"
-            f"            candidates = [p]\n"
-            f"    if not candidates:\n"
-            f"        candidates = [out_dir]\n"
-            f"    for c in candidates:\n"
-            f"        if c.is_dir():\n"
-            f'            reap = c / "reap_model"\n'
-            f"            if reap.exists() and "
-            f'any(reap.glob("*.safetensors")):\n'
-            f"                return str(reap)\n"
-            f'            heretic = c / "heretic_model"\n'
-            f"            if heretic.exists() and "
-            f'any(heretic.glob("*.safetensors")):\n'
-            f"                return str(heretic)\n"
-            f'            merged = c / "merged_model"\n'
-            f"            if merged.exists() and "
-            f'any(merged.glob("*.safetensors")):\n'
-            f"                return str(merged)\n"
-            f'            if any(c.glob("*.safetensors")):\n'
-            f"                return str(c)\n"
-            f'            gguf = c / "model-bf16.gguf"\n'
-            f"            if gguf.exists():\n"
-            f"                return str(gguf)\n"
-            f"        elif c.is_file():\n"
-            f"            return str(c)\n"
-            f"    return None\n"
-            f"\n"
-            f"source = _resolve_source(override, out_dir)\n"
-            f"if not source:\n"
-            f'    print("Error: no source model found. Enable Export '
-            f'or set a Source Model path in MagicQuant config.")\n'
-            f"    sys.exit(1)\n"
-            f'print(f"MagicQuant source: {{source}}")\n'
-            f"\n"
-            f"orch = MagicQuantOrchestrator(\n"
-            f"    source_model_path=source,\n"
-            f'    output_dir=str(out_dir / "magicquant"),\n'
-            f"    llamacpp_path=llamacpp,\n"
-            f")\n"
-            f"\n"
-            f'print(f"Search: generations={generations}, '
-            f"population={population_size}, "
-            f'base={target_base_quant}")\n'
-            f"\n"
-            f"best_configs, tiered = orch.run_full_search(\n"
-            f"    target_base_quant={repr(target_base_quant)},\n"
-            f"    max_generations={generations},\n"
-            f"    population_size={population_size},\n"
-            f"    verbose=True,\n"
-            f")\n"
-            f"\n"
-            f"if not tiered:\n"
-            f'    print("Error: no viable configurations found")\n'
-            f"    sys.exit(1)\n"
-            f"\n"
-            f'print(f"Tiers found: {{list(tiered.keys())}}")\n'
-            f"\n"
-            f"tiers = json.loads({repr(tiers_json)})\n"
-            f"paths = orch.generate_tiered_models(\n"
-            f"    tiered=tiered, model_name_prefix={repr(model_name)}, "
-            f"tiers=tiers, verify={verify},\n"
-            f")\n"
-            f"valid = [p for p in paths if p]\n"
-            f"for p in valid:\n"
-            f"    size = os.path.getsize(p) / 1e9\n"
-            f'    print(f"  {{Path(p).name}} ({{size:.1f}} GB)")\n'
-            f'print(f"Generated {{len(valid)}} hybrid GGUF files")\n'
-            f'print("PIPELINE_STAGE_COMPLETE=magicquant")\n'
-        )
-        return script
+    ) -> dict:
+        """Build the JSON config consumed by core/_magicquant_entry.py."""
+        return {
+            "pipeline_root": str(self.pipeline_root),
+            "llamacpp_hint": llamacpp_hint,
+            "pipeline_root_str": pipeline_root_str,
+            "mq_source_override": mq_source_override,
+            "out_abs_str": out_abs_str,
+            "generations": generations,
+            "population_size": population_size,
+            "target_base_quant": target_base_quant,
+            "tiers_json": tiers_json,
+            "model_name": model_name,
+            "verify": verify,
+        }
+
+    def build_script(self, **kwargs) -> str:
+        """Generate the MagicQuant subprocess shim (calls _magicquant_entry.py)."""
+        cfg = self.build_config(**kwargs)
+        return _entry_shim("_magicquant_entry", cfg, self.pipeline_root)
 
 
 class UploadService:
@@ -875,7 +339,7 @@ class UploadService:
         self.pipeline_root = pipeline_root
         self.venv_python = venv_python
 
-    def build_script(
+    def build_config(
         self,
         *,
         repo_id: str,
@@ -902,43 +366,40 @@ class UploadService:
         optimizer: str,
         lr_scheduler: str,
         out_abs: str,
-    ) -> str:
-        """Generate the upload subprocess script text."""
-        script = (
-            "import sys\n"
-            'sys.path.insert(0, "core")\n'
-            "from hf_upload import HFUploadConfig, upload\n"
-            "\n"
-            "cfg = HFUploadConfig(\n"
-            f"    repo_id={repr(repo_id)},\n"
-            f"    private={private},\n"
-            f"    license={repr(license_id)},\n"
-            f"    upload_gguf={upload_gguf},\n"
-            f"    upload_lora={upload_lora},\n"
-            f"    upload_merged={upload_merged},\n"
-            f"    upload_dataset={upload_dataset},\n"
-            f"    base_model={repr(base_model)},\n"
-            f"    dataset_name={repr(dataset_name)},\n"
-            f"    did_training={did_training},\n"
-            f"    did_heretic={did_heretic},\n"
-            f"    did_reap={did_reap},\n"
-            f"    did_magicquant={did_magicquant},\n"
-            f"    lora_r={lora_r},\n"
-            f"    lora_alpha={lora_alpha},\n"
-            f"    lora_dropout={lora_dropout},\n"
-            f"    num_epochs={num_epochs},\n"
-            f"    learning_rate={learning_rate},\n"
-            f"    max_seq_length={max_seq_length},\n"
-            f"    batch_size={batch_size},\n"
-            f"    gradient_accumulation={gradient_accumulation},\n"
-            f"    optimizer={repr(optimizer)},\n"
-            f"    lr_scheduler={repr(lr_scheduler)},\n"
-            f")\n"
-            f"\n"
-            f"ok = upload(cfg, {repr(out_abs)})\n"
-            f"if ok:\n"
-            f'    print("PIPELINE_STAGE_COMPLETE=upload")\n'
-            f"else:\n"
-            f"    sys.exit(1)\n"
-        )
-        return script
+    ) -> dict:
+        """Build the JSON config consumed by core/_upload_entry.py.
+
+        ``license_id`` maps to the HFUploadConfig ``license`` field.
+        """
+        return {
+            "pipeline_root": str(self.pipeline_root),
+            "repo_id": repo_id,
+            "private": private,
+            "license": license_id,
+            "upload_gguf": upload_gguf,
+            "upload_lora": upload_lora,
+            "upload_merged": upload_merged,
+            "upload_dataset": upload_dataset,
+            "base_model": base_model,
+            "dataset_name": dataset_name,
+            "did_training": did_training,
+            "did_heretic": did_heretic,
+            "did_reap": did_reap,
+            "did_magicquant": did_magicquant,
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "num_epochs": num_epochs,
+            "learning_rate": learning_rate,
+            "max_seq_length": max_seq_length,
+            "batch_size": batch_size,
+            "gradient_accumulation": gradient_accumulation,
+            "optimizer": optimizer,
+            "lr_scheduler": lr_scheduler,
+            "out_abs": out_abs,
+        }
+
+    def build_script(self, **kwargs) -> str:
+        """Generate the upload subprocess shim (calls core/_upload_entry.py)."""
+        cfg = self.build_config(**kwargs)
+        return _entry_shim("_upload_entry", cfg, self.pipeline_root)

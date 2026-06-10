@@ -17,7 +17,14 @@ core/                     # Main library modules
   fast_train_zeroclaw.py  # Shard-by-shard BnB 4-bit quantized loading + QLoRA training
   fast_export.py          # Streaming LoRA merge at ~6 GB peak
   hf_upload.py            # HuggingFace Hub upload with model card generation
-  services.py             # Shared per-stage script builders (one source of truth for CLI + UI)
+  services.py             # Shared per-stage builders: build_config(JSON) + thin shim (one source of truth for CLI + UI)
+  _train_entry.py         # Importable training stage body (run(cfg.json)) — shim target
+  _export_entry.py        # Importable export (streaming LoRA merge) stage body
+  _heretic_entry.py       # Importable heretic abliteration stage body (Optuna search)
+  _reap_entry.py          # Importable REAP expert-pruning stage body
+  _magicquant_entry.py    # Importable MagicQuant evolutionary-quant stage body
+  _upload_entry.py        # Importable HF-upload stage body
+  dataset_format.py       # Normalize messages / {text} / {prompt,completion} / alpaca → one chat schema
   markers.py              # _stage_complete.json completion markers (resume/skip)
   preflight.py            # GPU-memory preflight checks
   reap_common.py          # Shared REAP arch list / stub block / source-priority resolver
@@ -100,6 +107,15 @@ Standard HF chat template JSONL:
 ```json
 {"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 ```
+
+`core/dataset_format.py` also auto-detects and normalizes these alternative
+shapes to the same chat structure before training (priority: messages > alpaca >
+prompt/completion > text):
+- `{"text": "..."}` — used verbatim (no chat template applied)
+- `{"prompt": "...", "completion": "..."}` — user/assistant turns
+- alpaca `{"instruction": "...", "input": "...", "output": "..."}` — instruction(+input) → user, output → assistant
+
+A source whose rows disagree on shape fails loudly rather than training on a mix.
 
 Training data generators in `datagen/` (ZeroClaw tool-calls) and `gardener/` (NC gardening, uses Claude API).
 

@@ -57,7 +57,9 @@ def test_llamacpp_clone_is_pinned():
     src = Path(pipeline.__file__).read_text()
     assert "LLAMACPP_PIN" in src
     assert "--branch" in src
-    # Service-side clone also pinned.
+    # The MagicQuant entry module's clone (audit H2: moved out of services.py
+    # into core/_magicquant_entry.py) is also pinned.
     from pathlib import Path as _P
-    svc_src = (_P(pipeline.__file__).parent / "services.py").read_text()
-    assert "--branch" in svc_src
+    entry_src = (_P(pipeline.__file__).parent / "_magicquant_entry.py").read_text()
+    assert "LLAMACPP_PIN" in entry_src
+    assert "--branch" in entry_src
