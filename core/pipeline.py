@@ -104,6 +104,26 @@ class MagicQuantConfig:
     llamacpp_path: Optional[str] = None
 
 
+@dataclass
+class QATConfig:
+    """QAT-LoRA: train adapters robust to a per-group hybrid quant config.
+
+    The hybrid config is read from a prior MagicQuant search's
+    ``search_results.json`` (``config_source`` + ``tier``); when empty it
+    auto-resolves to ``<output>/magicquant/search_results.json``. Optional stage,
+    gated off by default (``--qat`` to enable).
+    """
+    config_source: str = ""  # path to search_results.json; empty = auto-detect
+    tier: str = "Q4"
+    dataset: str = ""
+    lora_r: int = 32
+    lora_alpha: float = 64.0
+    epochs: float = 1.0
+    max_steps: int = -1
+    lr: float = 2e-4
+    max_seq_len: int = 512
+
+
 def detect_license(model_id: str) -> str:
     """Fetch the license from a HuggingFace model's metadata.
 
@@ -146,6 +166,7 @@ class PipelineConfig:
     export: Optional[ExportConfig] = field(default_factory=ExportConfig)
     heretic: Optional[HereticConfig] = None
     reap: Optional[ReapConfig] = None
+    qat: Optional[QATConfig] = None  # optional; gated off by default (--qat)
     magicquant: Optional[MagicQuantConfig] = field(default_factory=MagicQuantConfig)
     upload: Optional[UploadConfig] = None
 
@@ -180,6 +201,10 @@ class Artifacts:
     @property
     def magicquant_dir(self) -> Path:
         return self.output_dir / "magicquant"
+
+    @property
+    def qat_dir(self) -> Path:
+        return self.output_dir / "qat_adapters"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -890,6 +915,107 @@ def stage_reap(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     return True
 
 
+# ── Stage: QAT (quantization-aware LoRA) ─────────────────────────────────────
+#
+# Trains LoRA adapters robust to MagicQuant's per-group hybrid quant config.
+# The per-group config is read from a prior MagicQuant search's
+# search_results.json (config_source, or auto-detected in the output's
+# magicquant/ dir). Optional stage, gated off by default (--qat).
+
+
+def _resolve_qat_config_source(qc: "QATConfig", artifacts: "Artifacts") -> Optional[Path]:
+    """Return the search_results.json the QAT stage should target, or None.
+
+    Explicit ``config_source`` wins (resolved relative to the output dir / project
+    root if not absolute); otherwise auto-detect ``<output>/magicquant/search_results.json``.
+    """
+    if qc.config_source:
+        p = Path(qc.config_source)
+        if p.is_absolute():
+            return p if p.exists() else None
+        for base in (artifacts.output_dir, PROJECT_ROOT):
+            cand = base / qc.config_source
+            if cand.exists():
+                return cand
+        return None
+    auto = artifacts.magicquant_dir / "search_results.json"
+    return auto if auto.exists() else None
+
+
+def stage_qat(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+              force: bool = False, timeout: Optional[float] = None,
+              skip_preflight: bool = False) -> bool:
+    """Run QAT-LoRA fine-tuning against the per-group hybrid config.
+
+    Builds the QAT script via the shared QATService (single source of truth with
+    the UI). Skips on a valid completion marker.
+    """
+    log("Starting QAT-LoRA", "stage")
+
+    qc = config.qat
+    source_model = config.training.model_name
+
+    config_source = _resolve_qat_config_source(qc, artifacts)
+    if config_source is None:
+        log(
+            "No search_results.json found for QAT (set QAT config_source or run "
+            "a MagicQuant search first)",
+            "error",
+        )
+        return False
+    log(f"Hybrid config: {config_source} (tier {qc.tier})")
+
+    if not qc.dataset:
+        log("No QAT dataset configured — set a chat JSONL dataset path", "error")
+        return False
+
+    cfg_hash = _markers().config_hash({
+        "model": source_model, "config": str(config_source), "tier": qc.tier,
+        "dataset": qc.dataset, "lora_r": qc.lora_r, "lora_alpha": qc.lora_alpha,
+        "epochs": qc.epochs, "max_steps": qc.max_steps, "lr": qc.lr,
+        "max_seq_len": qc.max_seq_len,
+    })
+    key_file = artifacts.qat_dir / "qat_meta.json"
+    if _markers().is_stage_complete(artifacts.qat_dir, key_file, cfg_hash, force=force):
+        log(f"QAT already complete (marker matches) at {artifacts.qat_dir} — skipping", "success")
+        return True
+
+    _preflight_stage("qat", config, log, skip=skip_preflight)
+
+    svc = _services().QATService(PROJECT_ROOT, _find_python())
+    script = svc.build_script(
+        model=source_model,
+        config_path=str(config_source),
+        tier=qc.tier,
+        dataset=qc.dataset,
+        out=str(artifacts.qat_dir.resolve()),
+        lora_r=qc.lora_r,
+        lora_alpha=qc.lora_alpha,
+        epochs=qc.epochs,
+        max_steps=qc.max_steps,
+        lr=qc.lr,
+        max_seq_len=qc.max_seq_len,
+    )
+
+    rc = _run_stage_script(
+        script, artifacts.output_dir / "_stage_qat.py", log,
+        cfg_hash=cfg_hash, timeout=timeout,
+    )
+    if rc != 0:
+        log(f"QAT failed (exit code {rc})", "error")
+        return False
+
+    if not key_file.exists():
+        log("QAT output (qat_meta.json) not found after run", "error")
+        return False
+    try:
+        _markers().write_marker(artifacts.qat_dir, "qat", key_file, cfg_hash)
+    except OSError as e:
+        log(f"Could not write completion marker: {e}", "warn")
+    log(f"QAT adapters saved to {artifacts.qat_dir}", "success")
+    return True
+
+
 # ── Stage: MagicQuant ────────────────────────────────────────────────────────
 
 def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
@@ -1087,6 +1213,7 @@ STAGES = [
     ("export",     stage_export),
     ("heretic",    stage_heretic),
     ("reap",       stage_reap),
+    ("qat",        stage_qat),
     ("magicquant", stage_magicquant),
     ("upload",     stage_upload),
 ]
@@ -1113,6 +1240,8 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log,
         enabled.add("heretic")
     if config.reap is not None:
         enabled.add("reap")
+    if config.qat is not None:
+        enabled.add("qat")
     if config.magicquant is not None:
         enabled.add("magicquant")
     if config.upload is not None:
@@ -1151,6 +1280,7 @@ _CONFIG_SECTIONS = {
     "export": ("export", ExportConfig),
     "heretic": ("heretic", HereticConfig),
     "reap": ("reap", ReapConfig),
+    "qat": ("qat", QATConfig),
     "magicquant": ("magicquant", MagicQuantConfig),
     "upload": ("upload", UploadConfig),
 }
@@ -1231,6 +1361,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--no-reap", action="store_true", help="Disable REAP expert pruning stage")
     parser.add_argument("--reap-compression-ratio", type=float, default=0.25,
                         help="REAP compression ratio — fraction of experts to remove per layer")
+    parser.add_argument("--qat", action="store_true",
+                        help="Enable QAT-LoRA stage (quant-aware fine-tune; default off)")
+    parser.add_argument("--no-qat", action="store_true",
+                        help="Disable the QAT-LoRA stage")
+    parser.add_argument("--qat-dataset", type=str, default="",
+                        help="Chat JSONL dataset for QAT (required when --qat)")
+    parser.add_argument("--qat-config-source", type=str, default="",
+                        help="Path to a prior search_results.json for QAT "
+                             "(default: auto-detect <output>/magicquant/search_results.json)")
+    parser.add_argument("--qat-tier", type=str, default="Q4",
+                        help="Tier within search_results.json to target for QAT (default: Q4)")
     parser.add_argument("--no-magicquant", action="store_true")
     parser.add_argument("--upload-to", type=str, help="HF repo ID")
     parser.add_argument("--llamacpp-path", type=str)
@@ -1268,6 +1409,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         cfg.reap = ReapConfig(compression_ratio=args.reap_compression_ratio)
     if args.no_reap:
         cfg.reap = None
+    if args.qat and not args.no_qat:
+        cfg.qat = QATConfig(
+            config_source=args.qat_config_source,
+            tier=args.qat_tier,
+            dataset=args.qat_dataset,
+        )
+    if args.no_qat:
+        cfg.qat = None
     if args.no_magicquant:
         cfg.magicquant = None
     if args.upload_to:
@@ -1294,6 +1443,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             _dry_enabled.add("heretic")
         if cfg.reap is not None:
             _dry_enabled.add("reap")
+        if cfg.qat is not None:
+            _dry_enabled.add("qat")
         if cfg.magicquant is not None:
             _dry_enabled.add("magicquant")
         if cfg.upload is not None:

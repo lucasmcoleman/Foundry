@@ -332,6 +332,62 @@ class MagicQuantService:
         return _entry_shim("_magicquant_entry", cfg, self.pipeline_root)
 
 
+class QATService:
+    """Orchestrates the QAT-LoRA subprocess.
+
+    Quantization-Aware Training fine-tunes LoRA adapters that are robust to
+    MagicQuant's per-group hybrid quant config (read from a prior search's
+    ``search_results.json``). The heavy work lives in MagicQuant's
+    ``magicquant.qat.run_qat``; this service builds the JSON config that the
+    importable ``core/_qat_entry.py`` consumes — one source of truth for CLI + UI.
+    """
+
+    def __init__(self, pipeline_root: Path, venv_python: str) -> None:
+        self.pipeline_root = pipeline_root
+        self.venv_python = venv_python
+
+    def build_config(
+        self,
+        *,
+        model: str,
+        config_path: str,   # path to the prior search's search_results.json
+        tier: str,
+        dataset: str,
+        out: str,
+        lora_r: int,
+        lora_alpha: float,
+        epochs: float,
+        max_steps: int,
+        lr: float,
+        max_seq_len: int,
+    ) -> dict:
+        """Build the JSON config consumed by core/_qat_entry.py.
+
+        The keys mirror ``magicquant.qat.run_qat``'s contract exactly (model,
+        config + tier, dataset, out, and the LoRA/training hyperparams); the entry
+        module strips ``pipeline_root`` before dispatch.
+        """
+        return {
+            "pipeline_root": str(self.pipeline_root),
+            "model": model,
+            "config": config_path,
+            "tier": tier,
+            "dataset": dataset,
+            "out": out,
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "epochs": epochs,
+            "max_steps": max_steps,
+            "lr": lr,
+            "max_seq_len": max_seq_len,
+        }
+
+    def build_script(self, **kwargs) -> str:
+        """Generate the QAT subprocess shim (calls core/_qat_entry.py)."""
+        cfg = self.build_config(**kwargs)
+        return _entry_shim("_qat_entry", cfg, self.pipeline_root)
+
+
 class UploadService:
     """Orchestrates the HuggingFace upload subprocess."""
 

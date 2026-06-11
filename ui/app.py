@@ -190,6 +190,23 @@ class MagicQuantCfg(BaseModel):
     llamacpp_path: str = ""
     source_model: str = ""  # when export is skipped: path to GGUF or merged model dir
 
+class QATCfg(BaseModel):
+    """QAT-LoRA stage config.
+
+    The hybrid quant config comes from a prior MagicQuant search's
+    ``search_results.json`` (``config_source`` + ``tier``); when empty it
+    auto-resolves to ``<output>/<model>/magicquant/search_results.json``.
+    """
+    config_source: str = ""  # path to search_results.json; empty = auto-detect
+    tier: str = "Q4"
+    dataset: str = ""
+    lora_r: int = 32
+    lora_alpha: float = 64.0
+    epochs: float = 1.0
+    max_steps: int = -1
+    lr: float = 2e-4
+    max_seq_len: int = 512
+
 class UploadCfg(BaseModel):
     repo_id: str = ""
     private: bool = True
@@ -206,6 +223,15 @@ class UIConfig(BaseModel):
     """
     model_config = {"extra": "forbid"}
     hf_username: str = ""
+    # QAT stage persisted fields (T10). extra='forbid' still applies to anything
+    # not listed here, so POST /api/config can only write known keys.
+    qat_enabled: bool = False
+    qat_dataset: str = ""
+    qat_tier: str = "Q4"
+    qat_lora_r: int = 32
+    qat_lora_alpha: float = 64.0
+    qat_epochs: float = 1.0
+    qat_lr: float = 2e-4
 
 
 class RunRequest(BaseModel):
