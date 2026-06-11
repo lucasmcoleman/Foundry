@@ -38,6 +38,7 @@ from services import (
     ExportService,
     HereticService,
     ReapService,
+    QATService,
     MagicQuantService,
     UploadService,
 )
@@ -100,7 +101,7 @@ class StageStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
 
-ALL_STAGES = ["training", "export", "heretic", "reap", "magicquant", "upload"]
+ALL_STAGES = ["training", "export", "heretic", "reap", "qat", "magicquant", "upload"]
 
 class PipelineState:
     """Shared mutable state for the running pipeline, including WebSocket fan-out."""
@@ -239,6 +240,7 @@ class RunRequest(BaseModel):
     export: Optional[ExportCfg] = ExportCfg()
     heretic: Optional[HereticCfg] = None
     reap: Optional[ReapCfg] = None
+    qat: Optional[QATCfg] = None
     magicquant: Optional[MagicQuantCfg] = None
     upload: Optional[UploadCfg] = None
     enabled_stages: list[str] = ["training", "export"]
@@ -765,6 +767,97 @@ async def do_reap(cfg: RunRequest) -> bool:
     return ok
 
 
+def _resolve_qat_config_source(qc: "QATCfg", out_abs: Path) -> Optional[Path]:
+    """Resolve the search_results.json the QAT stage targets, or None.
+
+    Explicit ``config_source`` wins (relative paths resolve against the output
+    dir / project root); otherwise auto-detect ``<output>/magicquant/search_results.json``.
+    """
+    if qc.config_source:
+        p = Path(qc.config_source)
+        if p.is_absolute():
+            return p if p.exists() else None
+        for base in (out_abs, FOUNDRY_ROOT):
+            cand = base / qc.config_source
+            if cand.exists():
+                return cand
+        return None
+    auto = out_abs / "magicquant" / "search_results.json"
+    return auto if auto.exists() else None
+
+
+async def do_qat(cfg: RunRequest) -> bool:
+    """Run QAT-LoRA: fine-tune adapters robust to the per-group hybrid config."""
+    out = cfg.training.output_dir
+    out_abs = _resolve_out(out)
+    qc = cfg.qat
+
+    if qc is None:
+        await state.log("QAT stage enabled but no QAT config provided", "error")
+        await state.set_stage("qat", StageStatus.FAILED)
+        return False
+
+    config_source = _resolve_qat_config_source(qc, out_abs)
+    if config_source is None:
+        await state.log(
+            "No search_results.json found for QAT. Set a Hybrid Config Source, or "
+            "run a MagicQuant search first so its search_results.json exists.",
+            "error",
+        )
+        await state.set_stage("qat", StageStatus.FAILED)
+        return False
+
+    if not qc.dataset:
+        await state.log("No QAT dataset configured — set a chat JSONL dataset path", "error")
+        await state.set_stage("qat", StageStatus.FAILED)
+        return False
+
+    # Completion-marker resume (mirrors the other stages).
+    qat_dir = out_abs / "qat_adapters"
+    qat_hash = markers.config_hash({
+        "model": cfg.training.model_name, "config": str(config_source),
+        "tier": qc.tier, "dataset": qc.dataset, "lora_r": qc.lora_r,
+        "lora_alpha": qc.lora_alpha, "epochs": qc.epochs, "max_steps": qc.max_steps,
+        "lr": qc.lr, "max_seq_len": qc.max_seq_len,
+    })
+    qat_key = qat_dir / "qat_meta.json"
+    if markers.is_stage_complete(qat_dir, qat_key, qat_hash):
+        await state.log(f"QAT already complete (marker matches) at {qat_dir} — skipping", "success")
+        await state.set_stage("qat", StageStatus.COMPLETE)
+        await state.set_progress(100)
+        return True
+
+    await state.set_stage("qat", StageStatus.RUNNING)
+    await state.set_progress(0)
+    await state.log(f"Starting QAT-LoRA (hybrid config: {config_source}, tier {qc.tier})", "stage")
+
+    svc = QATService(FOUNDRY_ROOT, VENV_PYTHON)
+    script = svc.build_script(
+        model=cfg.training.model_name,
+        config_path=str(config_source),
+        tier=qc.tier,
+        dataset=qc.dataset,
+        out=str(qat_dir),
+        lora_r=qc.lora_r,
+        lora_alpha=qc.lora_alpha,
+        epochs=qc.epochs,
+        max_steps=qc.max_steps,
+        lr=qc.lr,
+        max_seq_len=qc.max_seq_len,
+    )
+    rc = await run_script(script, out)
+    ok = rc == 0 and qat_key.exists()
+    if ok:
+        try:
+            markers.write_marker(qat_dir, "qat", qat_key, qat_hash)
+        except OSError:
+            pass
+    await state.set_stage("qat", StageStatus.COMPLETE if ok else StageStatus.FAILED)
+    if ok:
+        await state.set_progress(100)
+    return ok
+
+
 async def do_magicquant(cfg: RunRequest) -> bool:
     """Run MagicQuant evolutionary search and generate tiered hybrid GGUFs."""
     out = cfg.training.output_dir
@@ -906,6 +999,7 @@ STAGE_RUNNERS = {
     "export":     do_export,
     "heretic":    do_heretic,
     "reap":       do_reap,
+    "qat":        do_qat,
     "magicquant": do_magicquant,
     "upload":     do_upload,
 }

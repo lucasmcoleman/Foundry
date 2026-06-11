@@ -202,3 +202,50 @@ def test_qatcfg_model_defaults():
     assert qc.tier == "Q4"
     assert qc.lora_r == 32
     assert qc.epochs == 1.0
+
+
+# ── T10: UI stage card + handler wiring ───────────────────────────────────────
+
+def test_runrequest_accepts_qat_section_and_enables_stage():
+    """RunRequest must carry an optional qat section + accept 'qat' in
+    enabled_stages."""
+    import app as app_module
+
+    rr = app_module.RunRequest(
+        qat=app_module.QATCfg(dataset="data/qat.jsonl"),
+        enabled_stages=["qat"],
+    )
+    assert rr.qat is not None
+    assert rr.qat.dataset == "data/qat.jsonl"
+    assert "qat" in rr.enabled_stages
+
+
+def test_qat_is_registered_stage_and_handler():
+    """do_qat must be wired into the stage runner table and ALL_STAGES, in
+    order before magicquant."""
+    import app as app_module
+
+    assert "qat" in app_module.ALL_STAGES
+    assert "qat" in app_module.STAGE_RUNNERS
+    assert app_module.ALL_STAGES.index("qat") < app_module.ALL_STAGES.index("magicquant")
+    assert callable(app_module.STAGE_RUNNERS["qat"])
+
+
+def test_index_html_serves_qat_card():
+    """The FastAPI index serves index.html and it contains the QAT stage card
+    (sidebar item + config panel hooks)."""
+    from fastapi.testclient import TestClient
+
+    import app as app_module
+
+    client = TestClient(app_module.app)
+    r = client.get("/")
+    assert r.status_code == 200
+    body = r.text
+    # Sidebar stage item.
+    assert 'data-stage="qat"' in body
+    # Config panel render function + a data-key bound input for the dataset.
+    assert "renderQAT" in body
+    assert "qat.dataset" in body
+    # Wired into the stage order used to build the run payload.
+    assert "'qat'" in body
