@@ -1,6 +1,6 @@
 # Foundry
 
-ML fine-tuning and hybrid quantization pipeline for AMD ROCm. Provides a 6-stage workflow — QLoRA training, LoRA merge (export), Heretic abliteration, REAP MoE expert pruning, MagicQuant hybrid quantization, and HuggingFace Hub upload — with a FastAPI web UI for orchestration. Heretic and REAP are optional stages.
+ML fine-tuning and hybrid quantization pipeline for AMD ROCm. Provides a 7-stage workflow — QLoRA training, LoRA merge (export), Heretic abliteration, REAP MoE expert pruning, QAT-LoRA (quantization-aware training), MagicQuant hybrid quantization, and HuggingFace Hub upload — with a FastAPI web UI for orchestration. Heretic, REAP, and QAT are optional stages.
 
 Designed for AMD APU unified memory systems (Strix Halo, gfx1151) where CPU and GPU share system RAM via GTT. Uses custom streaming loaders that process models shard-by-shard to avoid the memory bottlenecks of standard HuggingFace `from_pretrained()`.
 
@@ -55,6 +55,13 @@ python core/pipeline.py --model "org/model" --dataset data/training.jsonl --no-e
 
 # Export only (merge LoRA adapters)
 python core/fast_export.py
+
+# QAT-LoRA (quant-aware fine-tune; off by default). Needs a prior search's
+# search_results.json (auto-detected in <output>/magicquant/, or pass
+# --qat-config-source) plus a chat JSONL dataset:
+python core/pipeline.py --model "org/model" --qat \
+    --qat-dataset data/qat_training.jsonl --qat-tier Q4 \
+    --no-export --no-magicquant
 
 # MagicQuant + Upload
 python scripts/run_magicquant_upload.py
@@ -134,8 +141,9 @@ All settings can be configured via environment variables with `FOUNDRY_` prefix 
 
 ## Pipeline Stages
 
-The pipeline has six stages; Heretic (3) and REAP (4) are optional and off by
-default. Enable them with `--heretic` / `--reap` on the CLI or via the UI.
+The pipeline has seven stages; Heretic (3), REAP (4), and QAT (5) are optional
+and off by default. Enable them with `--heretic` / `--reap` / `--qat` on the CLI
+or via the UI.
 
 ### 1. Training
 Custom fast QLoRA with shard-by-shard BnB 4-bit quantized loading. Uses completion-only loss masking (only assistant turns contribute to loss). Peak ~30 GB for 40B models.
@@ -149,10 +157,13 @@ Safety-alignment removal (abliteration) via Optuna-optimized directional ablatio
 ### 4. REAP (optional, MoE only)
 Router-weighted Expert Activation Pruning — removes a fraction of experts per MoE layer. Only runs on supported MoE architectures; otherwise it is skipped. Enable with `--reap`.
 
-### 5. MagicQuant
+### 5. QAT-LoRA (optional)
+Quantization-Aware Training. Freezes the base model, fake-quantizes it to MagicQuant's per-group hybrid config in the forward pass, and trains LoRA adapters that compensate (completion-only loss). The per-group config is read from a prior MagicQuant search's `search_results.json` (`--qat-config-source`, or auto-detected at `<output>/magicquant/search_results.json`); `--qat-tier` selects the tier to make the adapters robust to. Off by default; enable with `--qat --qat-dataset <chat.jsonl>`. Runs `magicquant.qat.run_qat` (requires the MagicQuant `[qat]` extra) and writes adapters to `<output>/qat_adapters/`. Largest benefit at the aggressive tiers (Q2/Q3/MXFP4).
+
+### 6. MagicQuant
 Evolutionary per-tensor hybrid quantization. Generates tiered GGUF files (Q4/Q5/Q6) with different size-quality tradeoffs. See [MagicQuant](../MagicQuant/) for details.
 
-### 6. Upload
+### 7. Upload
 Uploads artifacts to HuggingFace Hub with auto-generated model card, progress reporting, and dry-run validation.
 
 ### Resume / re-run
