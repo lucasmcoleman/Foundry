@@ -39,11 +39,11 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0",
 
-    # Quantization
-    "magicquant>=0.1.0",
-
-    # Abliteration (safety alignment removal)
-    "heretic-llm>=0.1.0",
+    # NOTE: magicquant + heretic-llm are sibling pipeline tools invoked as
+    # SUBPROCESSES (see core/_magicquant_entry.py / _heretic_entry.py), not
+    # imported by the foundry package. They are NOT PyPI-installable, so they live
+    # in the optional [external] extra below rather than hard dependencies — that
+    # keeps `pip install .` and the Docker image buildable without the sibling repos.
 
     # Utilities
     "Pillow>=9.0.0",
@@ -57,6 +57,12 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.23.0",
     "httpx>=0.25.0",
+]
+# Sibling pipeline tools, invoked as subprocesses — install from their local repos
+# (e.g. `pip install -e ../MagicQuant`), not PyPI. Not needed to build the package.
+external = [
+    "magicquant>=0.1.0",
+    "heretic-llm>=0.1.0",
 ]
 
 [project.scripts]
