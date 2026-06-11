@@ -94,7 +94,12 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
    `<output>/magicquant/search_results.json`) in the forward, and trains LoRA
    adapters that compensate. Delegates to `magicquant.qat.run_qat` (needs the
    MagicQuant `[qat]` extra). Enable with `--qat --qat-dataset <chat.jsonl>` or
-   the UI QAT card. Writes adapters to `<output>/qat_adapters/`.
+   the UI QAT card. Writes adapters to `<output>/qat_adapters/`. Validated
+   (confound-controlled, Qwen2.5-0.5B base, aggressive Q4_K-attn/MXFP4-FFN hybrid):
+   QAT recovered **47.5% of the quantization loss beyond plain LoRA domain
+   adaptation** (bf16-vs-quant PPL gap +3.19 → +1.67 vs a bf16+identical-LoRA
+   control). Recovery scales with quant aggressiveness; the final GGUF pack is
+   exact-ggml. See MagicQuant's `docs/qat.md`.
 6. **MagicQuant**: Evolutionary search → 3-tier hybrid GGUFs (Q4/Q5/Q6)
 7. **Upload**: HuggingFace Hub with model card generation
 
