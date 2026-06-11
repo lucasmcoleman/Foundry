@@ -13,7 +13,7 @@ Foundry: LLM fine-tuning and hybrid quantization pipeline for AMD ROCm (Strix Ha
 
 ```
 core/                     # Main library modules
-  pipeline.py             # Orchestrator: training → export → magicquant → upload
+  pipeline.py             # Orchestrator: training → export → heretic → reap → qat → magicquant → upload
   fast_train_zeroclaw.py  # Shard-by-shard BnB 4-bit quantized loading + QLoRA training
   fast_export.py          # Streaming LoRA merge at ~6 GB peak
   hf_upload.py            # HuggingFace Hub upload with model card generation
@@ -22,6 +22,7 @@ core/                     # Main library modules
   _export_entry.py        # Importable export (streaming LoRA merge) stage body
   _heretic_entry.py       # Importable heretic abliteration stage body (Optuna search)
   _reap_entry.py          # Importable REAP expert-pruning stage body
+  _qat_entry.py           # Importable QAT-LoRA stage body (run(cfg) -> magicquant.qat.run_qat)
   _magicquant_entry.py    # Importable MagicQuant evolutionary-quant stage body
   _upload_entry.py        # Importable HF-upload stage body
   dataset_format.py       # Normalize messages / {text} / {prompt,completion} / alpaca → one chat schema
@@ -85,8 +86,17 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
 ### Pipeline Stages (core/pipeline.py)
 1. **Training**: Custom fast QLoRA with completion-only loss (masks system/user turns)
 2. **Export**: Streaming shard-by-shard LoRA merge to safetensors (~6 GB peak)
-3. **MagicQuant**: Evolutionary search → 3-tier hybrid GGUFs (Q4/Q5/Q6)
-4. **Upload**: HuggingFace Hub with model card generation
+3. **Heretic** (optional, off by default): Optuna-optimized directional ablation
+4. **REAP** (optional, MoE only): router-weighted expert pruning
+5. **QAT** (optional, off by default): quantization-aware LoRA. Freezes the base,
+   fake-quantizes it to MagicQuant's per-group hybrid config (read from a prior
+   search's `search_results.json` via `config_source`+`tier`, or auto-detected at
+   `<output>/magicquant/search_results.json`) in the forward, and trains LoRA
+   adapters that compensate. Delegates to `magicquant.qat.run_qat` (needs the
+   MagicQuant `[qat]` extra). Enable with `--qat --qat-dataset <chat.jsonl>` or
+   the UI QAT card. Writes adapters to `<output>/qat_adapters/`.
+6. **MagicQuant**: Evolutionary search → 3-tier hybrid GGUFs (Q4/Q5/Q6)
+7. **Upload**: HuggingFace Hub with model card generation
 
 ### MagicQuant (MagicQuant/magicquant/)
 Classifies tensors into sensitivity groups (E=Embeddings, H=Head, Q=Query, K=Key, O=Output, U=FFN Up, D=FFN Down, X=MoE Experts, R=Router), then runs evolutionary search to find optimal per-group quantization. Supports BF16, Q8_0, Q6_K, Q5_K, IQ4_NL, MXFP4.
