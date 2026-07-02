@@ -21,7 +21,7 @@ import pytest
 
 from services import (
     TrainingService, ExportService, HereticService,
-    ReapService, MagicQuantService, UploadService,
+    ReapService, MagicQuantService, ROCmFPXService, UploadService,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -61,6 +61,12 @@ STAGES = [
         dict(llamacpp_hint="", pipeline_root_str="/repo", mq_source_override="/src",
              out_abs_str="/o", generations=5, population_size=10,
              target_base_quant="IQ4_NL", tiers_json="{}", model_name="m", verify=False),
+    ),
+    (
+        "_rocmfpx_entry", ROCmFPXService,
+        dict(rocmfpx_hint="", pipeline_root_str="/repo", source_override="/src",
+             out_abs_str="/o", formats_json='["rocmfp4-agent"]', model_name="m",
+             imatrix=""),
     ),
     (
         "_upload_entry", UploadService,
