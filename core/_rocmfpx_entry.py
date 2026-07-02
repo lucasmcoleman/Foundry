@@ -52,6 +52,13 @@ SCHEME_TO_ROCMFPX = {
     "Q3_K": "Q3_0_ROCMFPX", "Q2_K": "Q3_0_ROCMFPX",
     "ROCMFP8": "Q8_0_ROCMFPX", "ROCMFP6": "Q6_0_ROCMFPX",
     "ROCMFP4": "Q4_0_ROCMFP4", "ROCMFP3": "Q3_0_ROCMFPX",
+    # Opt-in MagicQuant IQ (importance-quant) schemes round UP to the nearest
+    # ROCmFPX family type at-or-above their bit width; Q3_0_ROCMFPX is the
+    # smallest ROCmFPX type, so every sub-3-bit IQ scheme bottoms out there.
+    "IQ4_XS": "Q4_0_ROCMFP4",
+    "IQ3_S": "Q3_0_ROCMFPX", "IQ3_XXS": "Q3_0_ROCMFPX",
+    "IQ2_S": "Q3_0_ROCMFPX", "IQ2_XS": "Q3_0_ROCMFPX", "IQ2_XXS": "Q3_0_ROCMFPX",
+    "IQ1_M": "Q3_0_ROCMFPX", "IQ1_S": "Q3_0_ROCMFPX",
 }
 
 # Quality order (best first) for picking a base type when a tier's groups
@@ -464,7 +471,11 @@ def _quantize_preset(spec, out_dir, model_name, quantize_bin, bf16_gguf, imatrix
     """Run one uniform-preset quantize pass (rocmfp4-agent etc.)."""
     import subprocess
 
-    fmt, profile = parse_format_spec(spec)
+    try:
+        fmt, profile = parse_format_spec(spec)
+    except ValueError as e:
+        print(f"Warning: skipping ROCmFPX format {spec!r}: {e}", flush=True)
+        return None
     ggml_type = FORMAT_TABLE[(fmt, profile)]
     out_path = out_dir / f"{model_name}-{ggml_type}.gguf"
     cmd = [str(quantize_bin)]
@@ -527,13 +538,12 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
 
     try:
         config = _load_mq_tier_config(out_dir, tier)
+        group_patterns = TensorGroupClassifier.GROUP_PATTERNS
+        lines = build_tensor_type_lines(config, group_patterns)
+        base_type = pick_base_type(config)
     except (FileNotFoundError, KeyError, ValueError) as e:
         print(f"Error ({spec}): {e}", flush=True)
         return None
-
-    group_patterns = TensorGroupClassifier.GROUP_PATTERNS
-    lines = build_tensor_type_lines(config, group_patterns)
-    base_type = pick_base_type(config)
 
     type_file = rocmfpx_out_dir / f"_ttf-mq-{tier}.txt"
     type_file.write_text("\n".join(lines) + "\n")
