@@ -110,6 +110,8 @@ class MagicQuantConfig:
     measured: bool = False
     measurement_rounds: int = 3
     rocmfpx_schemes: bool = False
+    # seed: optional RNG seed for a reproducible search (None = nondeterministic).
+    seed: Optional[int] = None
 
 
 @dataclass
@@ -1076,7 +1078,7 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         "population_size": mc.population_size, "target_base_quant": mc.target_base_quant,
         "tiers": mc.tiers, "verify": mc.verify,
         "measured": mc.measured, "measurement_rounds": mc.measurement_rounds,
-        "rocmfpx_schemes": mc.rocmfpx_schemes,
+        "rocmfpx_schemes": mc.rocmfpx_schemes, "seed": mc.seed,
     })
     existing = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.magicquant_dir / "_placeholder.gguf")
@@ -1101,6 +1103,7 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         measured=mc.measured,
         measurement_rounds=mc.measurement_rounds,
         rocmfpx_schemes=mc.rocmfpx_schemes,
+        seed=mc.seed,
     )
 
     rc = _run_stage_script(
@@ -1493,6 +1496,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--magicquant-rocmfpx", action="store_true",
                         help="Let MagicQuant's search also explore AMD-native ROCmFPX fork "
                              "types (needs a ROCmFPX build; output loads only on the fork)")
+    parser.add_argument("--magicquant-seed", type=int, default=None,
+                        help="Optional RNG seed for a reproducible MagicQuant search "
+                             "(default: nondeterministic)")
     parser.add_argument("--rocmfpx", action="store_true",
                         help="Enable ROCmFPX stage (AMD-tuned GGUF quants; default off)")
     parser.add_argument("--no-rocmfpx", action="store_true",
@@ -1558,6 +1564,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             cfg.magicquant.measurement_rounds = args.magicquant_rounds
         if args.magicquant_rocmfpx:
             cfg.magicquant.rocmfpx_schemes = True
+        if args.magicquant_seed is not None:
+            cfg.magicquant.seed = args.magicquant_seed
     if args.rocmfpx and not args.no_rocmfpx:
         cfg.rocmfpx = ROCmFPXConfig(
             source_model=args.rocmfpx_source_model,
