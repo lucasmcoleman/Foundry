@@ -124,7 +124,7 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
 ### MagicQuant (MagicQuant/magicquant/)
 Classifies tensors into sensitivity groups (E=Embeddings, H=Head, Q=Query, K=Key, O=Output, U=FFN Up, D=FFN Down, X=MoE Experts, R=Router), then runs evolutionary search to find optimal per-group quantization. Supports BF16, Q8_0, Q6_K, Q5_K, Q4_K_M, IQ4_NL, MXFP4, Q3_K, Q2_K, and (opt-in, fork-only) the AMD-native ROCMFP3/4/6/8 schemes.
 
-**GGUF writer** (`gguf/writer.py`): Two-pass streaming — header pass computes sizes/offsets, data pass overlaps I/O with encoding. Has block-size compatibility check for hybrid architectures (Mamba layers with non-standard dimensions fall back to BF16).
+**GGUF writer** (`gguf/writer.py`): Two-pass streaming — header pass computes sizes/offsets, data pass overlaps I/O with encoding. Has a block-size compatibility check for hybrid architectures: a row width that isn't a multiple of the requested K-quant's 256-block falls back to a block-32 quant (MXFP4 for low-bit targets, Q8_0 for high-bit); SSM/group-`S` operands and rows that aren't even 32-divisible fall back to F32. Each such downgrade is recorded in `writer._fallbacks` and summarized in a one-line warning.
 
 ### Fast Loaders (for 40B+ models on unified memory)
 - `core/fast_train_zeroclaw.py`: Creates model on meta device, loads safetensors shard-by-shard, replaces nn.Linear with bnb.nn.Linear4bit, quantizes inline per-shard, frees each shard before next. Includes completion-only loss masking and checkpoint resume. Peak ~30 GB for a 40B model.
@@ -154,6 +154,6 @@ Training data generators in `datagen/` (ZeroClaw tool-calls) and `gardener/` (NC
 
 ## Known Issues
 
-- **Qwen3.5 hybrid architecture** has Mamba (linear_attention) layers with 48-element rows. Quantization types with block_size > 32 are incompatible — the GGUF writer falls back to BF16 for these.
+- **Qwen3.5 hybrid architecture** has Mamba (linear_attention) layers with 48-element rows. Quantization types with block_size > 32 are incompatible — since 48 isn't 32-divisible either, the GGUF writer falls back to F32 for these (block-32 quants only apply to 32-divisible rows).
 - **GGUF files from MagicQuant need chat template patching** — the source reader pulls from tokenizer_config.json, which must contain `chat_template`. The streaming merge (core/fast_export.py) copies tokenizer files but may omit the template; verify and use `scripts/patch_gguf_metadata.py` if needed.
 - **`UNSLOTH_COMPILE_DISABLE=1`** may be needed for gfx1151 if training produces NaN losses (known Triton code generation issue on RDNA).
