@@ -313,6 +313,7 @@ class MagicQuantService:
         measured: bool = False,
         measurement_rounds: int = 3,
         rocmfpx_schemes: bool = False,
+        iq_schemes: bool = False,
         seed: Optional[int] = None,
     ) -> dict:
         """Build the JSON config consumed by core/_magicquant_entry.py."""
@@ -331,6 +332,7 @@ class MagicQuantService:
             "measured": measured,
             "measurement_rounds": measurement_rounds,
             "rocmfpx_schemes": rocmfpx_schemes,
+            "iq_schemes": iq_schemes,
             "seed": seed,
         }
 

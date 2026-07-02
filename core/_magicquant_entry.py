@@ -167,11 +167,12 @@ def run(cfg_path: str | None = None) -> None:
     target_base_quant = cfg["target_base_quant"]
     measured = cfg.get("measured", False)
     enable_rocmfpx = cfg.get("rocmfpx_schemes", False)
+    enable_iq = cfg.get("iq_schemes", False)
     mode = "measured (Predict->Measure->Learn)" if measured else "prediction-only"
     print(
         f"Search [{mode}]: generations={generations}, "
         f"population={population_size}, base={target_base_quant}, "
-        f"rocmfpx_schemes={enable_rocmfpx}",
+        f"rocmfpx_schemes={enable_rocmfpx}, iq_schemes={enable_iq}",
         flush=True,
     )
 
@@ -183,6 +184,7 @@ def run(cfg_path: str | None = None) -> None:
             measurement_rounds=cfg.get("measurement_rounds", 3),
             verbose=True,
             enable_rocmfpx=enable_rocmfpx,
+            enable_iq=enable_iq,
             seed=cfg.get("seed"),
         )
     else:
@@ -192,6 +194,7 @@ def run(cfg_path: str | None = None) -> None:
             population_size=population_size,
             verbose=True,
             enable_rocmfpx=enable_rocmfpx,
+            enable_iq=enable_iq,
             seed=cfg.get("seed"),
         )
     if not tiered:
