@@ -603,7 +603,7 @@ const S = {
     heretic: { n_trials: 200, n_startup_trials: 60, quantization: 'bnb_4bit', kl_divergence_scale: 1.0, orthogonalize_direction: false, row_normalization: 'none' },
     reap: { compression_ratio: 0.25, prune_method: 'reap', samples_per_category: 512, model_max_length: 2048, dataset_name: 'theblackcat102/evol-codealpaca-v1', seed: 42 },
     qat: { config_source: '', tier: 'Q4', dataset: '', lora_r: 32, lora_alpha: 64.0, epochs: 1.0, max_steps: -1, lr: 0.0002, max_seq_len: 512 },
-    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false },
+    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, seed: null },
     rocmfpx: { formats: ['rocmfp4-agent','rocmfp6-agent','rocmfp8-agent'], rocmfpx_hint: '', source_model: '', imatrix: '' },
     upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
@@ -1321,6 +1321,7 @@ function renderMagicQuant() {
     </div>
     <div class="form-group">${L('Measured Search','Run the Predict→Measure→Learn loop with real perplexity per candidate instead of the fast prediction-only search. More accurate, much slower (builds & measures candidate GGUFs).')}<label class="toggle"><input type="checkbox" data-key="magicquant.measured" ${c.measured?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
     <div class="form-group">${L('Measurement Rounds','Build-measure-learn cycles for measured search. More rounds = better predictor calibration, more compute.')}<input class="form-input" type="number" data-key="magicquant.measurement_rounds" value="${c.measurement_rounds}"></div>
+    <div class="form-group">${L('Search Seed','Optional RNG seed for a reproducible search (blank = nondeterministic).')}<input class="form-input" type="number" data-key="magicquant.seed" value="${c.seed ?? ''}"></div>
     <div class="form-group span-2">${L('Explore ROCmFPX types','Let the evolutionary search also consider AMD-native ROCmFPX fork types (ROCMFP3/4/6/8) per group. Requires a ROCmFPX build; the resulting hybrid GGUFs load only on the ROCmFPX llama.cpp fork.')}<label class="toggle"><input type="checkbox" data-key="magicquant.rocmfpx_schemes" ${c.rocmfpx_schemes?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
   </div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">MagicQuant</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>

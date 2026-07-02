@@ -183,6 +183,7 @@ def run(cfg_path: str | None = None) -> None:
             measurement_rounds=cfg.get("measurement_rounds", 3),
             verbose=True,
             enable_rocmfpx=enable_rocmfpx,
+            seed=cfg.get("seed"),
         )
     else:
         best_configs, tiered = orch.run_full_search(
@@ -191,6 +192,7 @@ def run(cfg_path: str | None = None) -> None:
             population_size=population_size,
             verbose=True,
             enable_rocmfpx=enable_rocmfpx,
+            seed=cfg.get("seed"),
         )
     if not tiered:
         print("Error: no viable configurations found", flush=True)
