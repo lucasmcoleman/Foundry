@@ -194,6 +194,7 @@ class MagicQuantCfg(BaseModel):
     measured: bool = False           # real perplexity search vs prediction-only
     measurement_rounds: int = 3
     rocmfpx_schemes: bool = False    # explore AMD-native ROCmFPX fork types
+    iq_schemes: bool = False         # explore sub-4-bit stock-ggml IQ schemes
     seed: Optional[int] = None       # optional RNG seed for a reproducible search
 
 class QATCfg(BaseModel):
@@ -889,7 +890,7 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         "target_base_quant": mc.target_base_quant, "tiers": mc.tiers,
         "source_model": mc.source_model, "measured": mc.measured,
         "measurement_rounds": mc.measurement_rounds, "rocmfpx_schemes": mc.rocmfpx_schemes,
-        "seed": mc.seed,
+        "iq_schemes": mc.iq_schemes, "seed": mc.seed,
     })
     existing_ggufs = sorted(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
     mq_key = existing_ggufs[0] if existing_ggufs else (mq_dir / "_placeholder.gguf")
@@ -924,6 +925,7 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         measured=mc.measured,
         measurement_rounds=mc.measurement_rounds,
         rocmfpx_schemes=mc.rocmfpx_schemes,
+        iq_schemes=mc.iq_schemes,
         seed=mc.seed,
     )
     rc = await run_script(script, out)
