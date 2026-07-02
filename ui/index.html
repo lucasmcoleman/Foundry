@@ -431,6 +431,14 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
           <label class="toggle"><input type="checkbox" onchange="toggleStage('magicquant',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
         </div>
       </div>
+      <div class="stage-item" data-stage="rocmfpx" data-status="pending" onclick="selectStage('rocmfpx')">
+        <div class="stage-indicator"></div>
+        <div class="stage-name">ROCmFPX</div>
+        <div class="stage-desc">AMD-tuned GGUF quants (ROCmFP3/4/6/8)</div>
+        <div class="stage-toggle" onclick="event.stopPropagation()">
+          <label class="toggle"><input type="checkbox" onchange="toggleStage('rocmfpx',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+      </div>
       <div class="stage-item" data-stage="upload" data-status="pending" onclick="selectStage('upload')">
         <div class="stage-indicator"></div>
         <div class="stage-name">Upload</div>
@@ -595,10 +603,12 @@ const S = {
     heretic: { n_trials: 200, n_startup_trials: 60, quantization: 'bnb_4bit', kl_divergence_scale: 1.0, orthogonalize_direction: false, row_normalization: 'none' },
     reap: { compression_ratio: 0.25, prune_method: 'reap', samples_per_category: 512, model_max_length: 2048, dataset_name: 'theblackcat102/evol-codealpaca-v1', seed: 42 },
     qat: { config_source: '', tier: 'Q4', dataset: '', lora_r: 32, lora_alpha: 64.0, epochs: 1.0, max_steps: -1, lr: 0.0002, max_seq_len: 512 },
-    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '' },
+    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false },
+    rocmfpx: { formats: ['rocmfp4-agent','rocmfp6-agent','rocmfp8-agent'], rocmfpx_hint: '', source_model: '', imatrix: '' },
     upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
   mqTiers: ['Q2','Q3','Q4','Q5','Q6','Q8'],
+  rcFormats: ['rocmfp3','rocmfp3-agent','rocmfp4','rocmfp4-agent','rocmfp6','rocmfp6-agent','rocmfp8','rocmfp8-agent','mq-q4','mq-q5','mq-q6'],
   hfUsername: '',
 };
 
@@ -743,7 +753,7 @@ async function saveCurrentWorkflow() {
     showStatus('Invalid name. Use letters, numbers, hyphens, underscores only.', 'error');
     return;
   }
-  const stageOrder = ['training', 'export', 'heretic', 'reap', 'qat', 'magicquant', 'upload'];
+  const stageOrder = ['training', 'export', 'heretic', 'reap', 'qat', 'magicquant', 'rocmfpx', 'upload'];
   const enabled = stageOrder.filter(s => S.enabledStages.has(s));
   const payload = {
     training: S.config.training,
@@ -752,6 +762,7 @@ async function saveCurrentWorkflow() {
     reap: S.config.reap,
     qat: S.config.qat,
     magicquant: S.config.magicquant,
+    rocmfpx: S.config.rocmfpx,
     upload: S.config.upload,
     enabled_stages: enabled,
   };
@@ -809,7 +820,7 @@ function applyWorkflow(data) {
   }
   // Restore enabled stages (ignore unknown stages from old saves)
   if (data.enabled_stages) {
-    const validStages = new Set(['training', 'export', 'heretic', 'reap', 'qat', 'magicquant', 'upload']);
+    const validStages = new Set(['training', 'export', 'heretic', 'reap', 'qat', 'magicquant', 'rocmfpx', 'upload']);
     S.enabledStages = new Set(data.enabled_stages.filter(s => validStages.has(s)));
   }
   // Sync sidebar toggles
@@ -965,7 +976,7 @@ function toggleStage(name, on) {
  * Binds data-key inputs to S.config and persists changes to localStorage.
  */
 function renderStageContent() {
-  const r = {training: renderTraining, export: renderExport, heretic: renderHeretic, reap: renderReap, qat: renderQAT, magicquant: renderMagicQuant, upload: renderUpload};
+  const r = {training: renderTraining, export: renderExport, heretic: renderHeretic, reap: renderReap, qat: renderQAT, magicquant: renderMagicQuant, rocmfpx: renderROCmFPX, upload: renderUpload};
   const container = document.getElementById('stage-content');
   if (!container) return;
   container.innerHTML = (r[S.selectedStage] || (() => ''))();
@@ -1308,8 +1319,38 @@ function renderMagicQuant() {
       <div class="tag-list">${S.mqTiers.map(t=>`<div class="tag ${sel.has(t)?'selected':''}" data-tier="${t}" onclick="toggleTier('${t}')">${t}</div>`).join('')}</div>
       <div class="form-hint">Q8 = near-lossless, Q6 = high quality, Q4 = balanced, Q3 = small, Q2 = smallest</div>
     </div>
+    <div class="form-group">${L('Measured Search','Run the Predict→Measure→Learn loop with real perplexity per candidate instead of the fast prediction-only search. More accurate, much slower (builds & measures candidate GGUFs).')}<label class="toggle"><input type="checkbox" data-key="magicquant.measured" ${c.measured?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+    <div class="form-group">${L('Measurement Rounds','Build-measure-learn cycles for measured search. More rounds = better predictor calibration, more compute.')}<input class="form-input" type="number" data-key="magicquant.measurement_rounds" value="${c.measurement_rounds}"></div>
+    <div class="form-group span-2">${L('Explore ROCmFPX types','Let the evolutionary search also consider AMD-native ROCmFPX fork types (ROCMFP3/4/6/8) per group. Requires a ROCmFPX build; the resulting hybrid GGUFs load only on the ROCmFPX llama.cpp fork.')}<label class="toggle"><input type="checkbox" data-key="magicquant.rocmfpx_schemes" ${c.rocmfpx_schemes?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
   </div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">MagicQuant</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
+  </div>`;
+}
+
+/** @returns {string} HTML for the ROCmFPX configuration panel. */
+function renderROCmFPX() {
+  const c = S.config.rocmfpx;
+  const sel = new Set(c.formats);
+  const on = S.enabledStages.has('rocmfpx');
+  const exportOn = S.enabledStages.has('export');
+  const needsSource = !exportOn;
+  return `
+  <div class="section-header"><div class="section-title">ROCmFPX</div><div class="section-badge badge-optional">Optional</div></div>
+  ${masterToggle('rocmfpx', 'ROCmFPX Stage')}
+  <div class="${on?'':'stage-content-disabled'}">
+  ${depBanner('info', '<strong>AMD-tuned GGUF quants.</strong> Builds <a href="https://github.com/ciru-ai/ROCmFPX" target="_blank" rel="noopener">ROCmFPX</a> (a llama.cpp fork adding the ROCmFP3/4/6/8 quant family, straight + agent tool-calling-safe presets) on first use and quantizes the source model with it. Experimental research build — auto-installs a pinned commit, targets Strix Halo (gfx1151).')}
+  ${needsSource ? depBanner('warn', 'Export is disabled. Provide a local path to a GGUF file or merged safetensors directory below. If a previous pipeline run produced artifacts in the output directory, those will be used automatically.<br><br>To use a HuggingFace model ID, re-enable Export and set it as the source model there instead.') : ''}
+  <div class="form-grid">
+    ${needsSource ? `<div class="form-group span-2">${L('Source Model','Path to a GGUF file or merged safetensors directory. If left empty, will look for existing artifacts in the output directory.')}<input class="form-input" data-key="rocmfpx.source_model" value="${c.source_model}" placeholder="auto-detect from output directory"></div>` : ''}
+    <div class="form-group span-2">${L('ROCmFPX Build Path','Path to an existing ROCmFPX/llama.cpp-fork build (must expose llama-quantize). Leave empty to auto-detect or auto-install.')}<input class="form-input" data-key="rocmfpx.rocmfpx_hint" value="${c.rocmfpx_hint}" placeholder="auto-detect / auto-install"></div>
+    <div class="form-group span-2">${L('imatrix Path','Optional importance-matrix GGUF, forwarded to llama-quantize --imatrix. Improves low-bit (rocmfp3/rocmfp4) quality.')}<input class="form-input" data-key="rocmfpx.imatrix" value="${c.imatrix}" placeholder="(none)"></div>
+    <div class="form-group span-2">
+      ${L('Formats','Which ROCmFPX format/profile pairs to produce. "agent" presets protect tensors that affect tool-calling/JSON/coding structure; "straight" presets are size-optimal.')}
+      <div class="tag-list">${S.rcFormats.map(f=>`<div class="tag ${sel.has(f)?'selected':''}" data-format="${f}" onclick="toggleFormat('${f}')">${f}</div>`).join('')}</div>
+      <div class="form-hint">rocmfp8 = near-lossless, rocmfp6 = high quality, rocmfp4 = balanced, rocmfp3 = smallest</div>
+    </div>
+  </div>
+  <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">ROCmFPX</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
   </div>`;
 }
 
@@ -1359,6 +1400,14 @@ function toggleTier(t) {
   saveFormState();
 }
 
+function toggleFormat(f) {
+  const formats = S.config.rocmfpx.formats;
+  const i = formats.indexOf(f);
+  if (i >= 0) formats.splice(i, 1); else formats.push(f);
+  document.querySelector(`[data-format="${f}"]`)?.classList.toggle('selected');
+  saveFormState();
+}
+
 // ── Log Panel ──────────────────────────────────────────────────────────────
 
 /**
@@ -1398,7 +1447,7 @@ function toggleAutoScroll() {
 async function runPipeline() {
   if (S.running) return;
   dismissStatus();
-  const stageOrder = ['training', 'export', 'heretic', 'reap', 'qat', 'magicquant', 'upload'];
+  const stageOrder = ['training', 'export', 'heretic', 'reap', 'qat', 'magicquant', 'rocmfpx', 'upload'];
   const enabled = stageOrder.filter(s => S.enabledStages.has(s));
   if (enabled.length === 0) {
     showStatus('Enable at least one stage before running.', 'error');
@@ -1415,6 +1464,7 @@ async function runPipeline() {
     reap: S.config.reap,
     qat: S.config.qat,
     magicquant: S.config.magicquant,
+    rocmfpx: S.config.rocmfpx,
     upload: S.config.upload,
     enabled_stages: enabled,
   };

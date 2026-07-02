@@ -63,3 +63,13 @@ def test_llamacpp_clone_is_pinned():
     entry_src = (_P(pipeline.__file__).parent / "_magicquant_entry.py").read_text()
     assert "LLAMACPP_PIN" in entry_src
     assert "--branch" in entry_src
+
+
+def test_rocmfpx_clone_is_pinned():
+    """Same supply-chain-pin convention for the ROCmFPX auto-install (a git
+    clone + compile, not a pip package) -- pinned commit, checked out
+    explicitly rather than trusting the default branch."""
+    from pathlib import Path as _P
+    entry_src = (_P(pipeline.__file__).parent / "_rocmfpx_entry.py").read_text()
+    assert "ROCMFPX_PIN" in entry_src
+    assert '"checkout"' in entry_src

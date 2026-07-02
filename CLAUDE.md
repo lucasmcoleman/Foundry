@@ -7,13 +7,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Foundry: LLM fine-tuning and hybrid quantization pipeline for AMD ROCm (Strix Halo APU, gfx1151). Three core components:
 - **Custom fast QLoRA training** with shard-by-shard BnB quantization and completion-only loss masking (replaces Unsloth)
 - **MagicQuant** evolutionary per-tensor hybrid quantization
+- **ROCmFPX** AMD-native uniform-quant GGUFs (ROCmFP3/4/6/8, straight + agent presets) — see `docs/rocmfpx.md`
 - **FastAPI Web UI** for pipeline orchestration
 
 ## Directory Structure
 
 ```
 core/                     # Main library modules
-  pipeline.py             # Orchestrator: training → export → heretic → reap → qat → magicquant → upload
+  pipeline.py             # Orchestrator: training → export → heretic → reap → qat → magicquant → rocmfpx → upload
   fast_train_zeroclaw.py  # Shard-by-shard BnB 4-bit quantized loading + QLoRA training
   fast_export.py          # Streaming LoRA merge at ~6 GB peak
   hf_upload.py            # HuggingFace Hub upload with model card generation
@@ -24,6 +25,7 @@ core/                     # Main library modules
   _reap_entry.py          # Importable REAP expert-pruning stage body
   _qat_entry.py           # Importable QAT-LoRA stage body (run(cfg) -> magicquant.qat.run_qat)
   _magicquant_entry.py    # Importable MagicQuant evolutionary-quant stage body
+  _rocmfpx_entry.py       # Importable ROCmFPX stage body (build/convert/quantize; see docs/rocmfpx.md)
   _upload_entry.py        # Importable HF-upload stage body
   dataset_format.py       # Normalize messages / {text} / {prompt,completion} / alpaca → one chat schema
   markers.py              # _stage_complete.json completion markers (resume/skip)
@@ -100,11 +102,27 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
    adaptation** (bf16-vs-quant PPL gap +3.19 → +1.67 vs a bf16+identical-LoRA
    control). Recovery scales with quant aggressiveness; the final GGUF pack is
    exact-ggml. See MagicQuant's `docs/qat.md`.
-6. **MagicQuant**: Evolutionary search → 3-tier hybrid GGUFs (Q4/Q5/Q6)
-7. **Upload**: HuggingFace Hub with model card generation
+6. **MagicQuant**: Evolutionary search → 3-tier hybrid GGUFs (Q4/Q5/Q6).
+   Prediction-only by default; `--magicquant-measured` runs the real-perplexity
+   Predict→Measure→Learn loop. `--magicquant-rocmfpx` lets the search also
+   explore AMD-native ROCmFPX fork types per group (needs a ROCmFPX build;
+   output loads only on the fork). Persists `search_results.json` from both
+   search paths (consumed by QAT and by ROCmFPX's mq-hybrid mode).
+7. **ROCmFPX** (optional, off by default): AMD-native quant GGUFs via
+   [ciru-ai/ROCmFPX](https://github.com/ciru-ai/ROCmFPX) (a llama.cpp fork,
+   git-cloned + compiled — not a pip package). Produces ROCmFP3/4/6/8 GGUFs
+   (straight + tool-calling/JSON-safe "agent" presets), targeting this box's
+   Strix Halo (gfx1151) hardware specifically. Two modes: uniform presets
+   (`rocmfp4-agent` …) and **MagicQuant-hybrid** (`mq-q4`/`mq-q5`/`mq-q6`) —
+   the latter reproduces a MagicQuant tier's per-group precision layout in
+   ROCmFPX-family types via `llama-quantize --tensor-type-file`, i.e. a
+   ROCm-optimized version of a MagicQuant-optimized quant. Enable with
+   `--rocmfpx` or the UI ROCmFPX card. Writes GGUFs to `<output>/rocmfpx/`.
+   Experimental upstream research build — see `docs/rocmfpx.md`.
+8. **Upload**: HuggingFace Hub with model card generation
 
 ### MagicQuant (MagicQuant/magicquant/)
-Classifies tensors into sensitivity groups (E=Embeddings, H=Head, Q=Query, K=Key, O=Output, U=FFN Up, D=FFN Down, X=MoE Experts, R=Router), then runs evolutionary search to find optimal per-group quantization. Supports BF16, Q8_0, Q6_K, Q5_K, IQ4_NL, MXFP4.
+Classifies tensors into sensitivity groups (E=Embeddings, H=Head, Q=Query, K=Key, O=Output, U=FFN Up, D=FFN Down, X=MoE Experts, R=Router), then runs evolutionary search to find optimal per-group quantization. Supports BF16, Q8_0, Q6_K, Q5_K, Q4_K_M, IQ4_NL, MXFP4, Q3_K, Q2_K, and (opt-in, fork-only) the AMD-native ROCMFP3/4/6/8 schemes.
 
 **GGUF writer** (`gguf/writer.py`): Two-pass streaming — header pass computes sizes/offsets, data pass overlaps I/O with encoding. Has block-size compatibility check for hybrid architectures (Mamba layers with non-standard dimensions fall back to BF16).
 

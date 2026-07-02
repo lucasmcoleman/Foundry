@@ -121,6 +121,28 @@ def run(cfg_path: str | None = None) -> None:
     llamacpp = ensure_llamacpp(cfg.get("llamacpp_hint", ""))
     print(f"llama.cpp: {llamacpp or 'not found (heuristic mode)'}", flush=True)
 
+    # ROCmFPX-native search: the AMD fork types can only be encoded by the
+    # fork's libggml, so point MagicQuant's ctypes binding at a ROCmFPX build
+    # before importing the orchestrator (the binding resolves the lib lazily,
+    # but set it early and fail loudly if the fork isn't available).
+    if cfg.get("rocmfpx_schemes"):
+        try:
+            import _rocmfpx_entry
+        except ImportError:
+            from core import _rocmfpx_entry  # pragma: no cover
+        rocmfpx_dir = _rocmfpx_entry.find_rocmfpx(cfg.get("rocmfpx_hint", ""))
+        if not rocmfpx_dir:
+            print(
+                "Error: --magicquant-rocmfpx needs a ROCmFPX build (for its "
+                "libggml). None found — build it via the ROCmFPX stage first, "
+                "or set a build hint.",
+                flush=True,
+            )
+            sys.exit(1)
+        bindir = str(Path(rocmfpx_dir) / "build-strix-rocmfp4" / "bin")
+        os.environ["MAGICQUANT_LIBGGML_DIR"] = bindir
+        print(f"MagicQuant libggml -> {bindir} (ROCmFPX fork types enabled)", flush=True)
+
     from magicquant.orchestrator import MagicQuantOrchestrator
 
     out_dir = Path(cfg["out_abs_str"])
@@ -143,18 +165,33 @@ def run(cfg_path: str | None = None) -> None:
     generations = cfg["generations"]
     population_size = cfg["population_size"]
     target_base_quant = cfg["target_base_quant"]
+    measured = cfg.get("measured", False)
+    enable_rocmfpx = cfg.get("rocmfpx_schemes", False)
+    mode = "measured (Predict->Measure->Learn)" if measured else "prediction-only"
     print(
-        f"Search: generations={generations}, population={population_size}, "
-        f"base={target_base_quant}",
+        f"Search [{mode}]: generations={generations}, "
+        f"population={population_size}, base={target_base_quant}, "
+        f"rocmfpx_schemes={enable_rocmfpx}",
         flush=True,
     )
 
-    best_configs, tiered = orch.run_full_search(
-        target_base_quant=target_base_quant,
-        max_generations=generations,
-        population_size=population_size,
-        verbose=True,
-    )
+    if measured:
+        best_configs, tiered = orch.run_measured_search(
+            target_base_quant=target_base_quant,
+            search_generations=generations,
+            population_size=population_size,
+            measurement_rounds=cfg.get("measurement_rounds", 3),
+            verbose=True,
+            enable_rocmfpx=enable_rocmfpx,
+        )
+    else:
+        best_configs, tiered = orch.run_full_search(
+            target_base_quant=target_base_quant,
+            max_generations=generations,
+            population_size=population_size,
+            verbose=True,
+            enable_rocmfpx=enable_rocmfpx,
+        )
     if not tiered:
         print("Error: no viable configurations found", flush=True)
         sys.exit(1)

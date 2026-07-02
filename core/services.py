@@ -310,6 +310,9 @@ class MagicQuantService:
         tiers_json: str,
         model_name: str,
         verify: bool = False,
+        measured: bool = False,
+        measurement_rounds: int = 3,
+        rocmfpx_schemes: bool = False,
     ) -> dict:
         """Build the JSON config consumed by core/_magicquant_entry.py."""
         return {
@@ -324,6 +327,9 @@ class MagicQuantService:
             "tiers_json": tiers_json,
             "model_name": model_name,
             "verify": verify,
+            "measured": measured,
+            "measurement_rounds": measurement_rounds,
+            "rocmfpx_schemes": rocmfpx_schemes,
         }
 
     def build_script(self, **kwargs) -> str:
@@ -386,6 +392,50 @@ class QATService:
         """Generate the QAT subprocess shim (calls core/_qat_entry.py)."""
         cfg = self.build_config(**kwargs)
         return _entry_shim("_qat_entry", cfg, self.pipeline_root)
+
+
+class ROCmFPXService:
+    """Orchestrates the ROCmFPX (AMD-tuned GGUF quant family) subprocess.
+
+    ROCmFPX (https://github.com/ciru-ai/ROCmFPX) is a llama.cpp fork adding
+    the ROCmFP3/4/6/8 quant types; it is a native build (git clone + compile),
+    not a pip package. The heavy work (discovery/auto-install, BF16 GGUF
+    conversion, per-format quantize) lives in the importable
+    ``core/_rocmfpx_entry.py`` -- this service builds the JSON config that
+    module consumes, the same shape as ``MagicQuantService``.
+    """
+
+    def __init__(self, pipeline_root: Path, venv_python: str) -> None:
+        self.pipeline_root = pipeline_root
+        self.venv_python = venv_python
+
+    def build_config(
+        self,
+        *,
+        rocmfpx_hint: str,
+        pipeline_root_str: str,
+        source_override: str,
+        out_abs_str: str,
+        formats_json: str,
+        model_name: str,
+        imatrix: str = "",
+    ) -> dict:
+        """Build the JSON config consumed by core/_rocmfpx_entry.py."""
+        return {
+            "pipeline_root": str(self.pipeline_root),
+            "rocmfpx_hint": rocmfpx_hint,
+            "pipeline_root_str": pipeline_root_str,
+            "source_override": source_override,
+            "out_abs_str": out_abs_str,
+            "formats_json": formats_json,
+            "model_name": model_name,
+            "imatrix": imatrix,
+        }
+
+    def build_script(self, **kwargs) -> str:
+        """Generate the ROCmFPX subprocess shim (calls _rocmfpx_entry.py)."""
+        cfg = self.build_config(**kwargs)
+        return _entry_shim("_rocmfpx_entry", cfg, self.pipeline_root)
 
 
 class UploadService:

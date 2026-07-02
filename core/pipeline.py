@@ -102,6 +102,29 @@ class MagicQuantConfig:
     tiers: list[str] = field(default_factory=lambda: ["Q4", "Q5", "Q6"])
     verify: bool = False
     llamacpp_path: Optional[str] = None
+    # measured: run the Predict->Measure->Learn loop (real perplexity per
+    # candidate) instead of the default prediction-only search. Slower but
+    # empirical. rocmfpx_schemes: let the search also explore the AMD-native
+    # ROCmFPX fork types (requires the fork's libggml; produces GGUFs loadable
+    # only on the fork). See docs/rocmfpx.md.
+    measured: bool = False
+    measurement_rounds: int = 3
+    rocmfpx_schemes: bool = False
+
+
+@dataclass
+class ROCmFPXConfig:
+    """ROCmFPX: AMD-tuned GGUF quant family (ROCmFP3/4/6/8, straight + agent
+    presets) via https://github.com/ciru-ai/ROCmFPX -- a llama.cpp fork, not
+    a pip package. Auto-installed (git clone + Strix Halo build) on first use.
+    Optional stage, gated off by default (``--rocmfpx``).
+    """
+    formats: list[str] = field(
+        default_factory=lambda: ["rocmfp4-agent", "rocmfp6-agent", "rocmfp8-agent"]
+    )
+    source_model: str = ""  # when export is skipped: path to GGUF or merged model dir
+    rocmfpx_hint: str = ""  # path to an existing ROCmFPX/llama.cpp-fork build
+    imatrix: str = ""  # optional path to an imatrix GGUF
 
 
 @dataclass
@@ -168,6 +191,7 @@ class PipelineConfig:
     reap: Optional[ReapConfig] = None
     qat: Optional[QATConfig] = None  # optional; gated off by default (--qat)
     magicquant: Optional[MagicQuantConfig] = field(default_factory=MagicQuantConfig)
+    rocmfpx: Optional[ROCmFPXConfig] = None  # optional; gated off by default (--rocmfpx)
     upload: Optional[UploadConfig] = None
 
 
@@ -205,6 +229,10 @@ class Artifacts:
     @property
     def qat_dir(self) -> Path:
         return self.output_dir / "qat_adapters"
+
+    @property
+    def rocmfpx_dir(self) -> Path:
+        return self.output_dir / "rocmfpx"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1047,6 +1075,8 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         "src": str(source), "generations": mc.generations,
         "population_size": mc.population_size, "target_base_quant": mc.target_base_quant,
         "tiers": mc.tiers, "verify": mc.verify,
+        "measured": mc.measured, "measurement_rounds": mc.measurement_rounds,
+        "rocmfpx_schemes": mc.rocmfpx_schemes,
     })
     existing = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.magicquant_dir / "_placeholder.gguf")
@@ -1068,6 +1098,9 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         tiers_json=_json.dumps(mc.tiers),
         model_name=model_name,
         verify=mc.verify,
+        measured=mc.measured,
+        measurement_rounds=mc.measurement_rounds,
+        rocmfpx_schemes=mc.rocmfpx_schemes,
     )
 
     rc = _run_stage_script(
@@ -1089,6 +1122,81 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     except OSError as e:
         log(f"Could not write completion marker: {e}", "warn")
     log(f"Generated {len(ggufs)} hybrid GGUF files", "success")
+    return True
+
+
+# ── Stage: ROCmFPX ───────────────────────────────────────────────────────────
+
+def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+                  force: bool = False, timeout: Optional[float] = None,
+                  skip_preflight: bool = False) -> bool:
+    """Quantize with ROCmFPX (AMD-tuned GGUF quant family).
+
+    Builds the quantize script via the shared ROCmFPXService (single source of
+    truth with the UI). Same source priority as MagicQuant. Skips on a valid
+    completion marker.
+    """
+    log("Starting ROCmFPX quantization", "stage")
+
+    rc_cfg = config.rocmfpx
+
+    if rc_cfg.source_model:
+        source = rc_cfg.source_model
+    else:
+        try:
+            from reap_common import resolve_artifact_source
+        except ImportError:  # pragma: no cover
+            from core.reap_common import resolve_artifact_source
+        source = resolve_artifact_source(artifacts.output_dir, require_safetensors=False)
+    if source is None:
+        log("No merged model or BF16 GGUF found — run export first, or set "
+            "ROCmFPX source_model", "error")
+        return False
+    log(f"Source: {source}")
+
+    cfg_hash = _markers().config_hash({
+        "src": str(source), "formats": rc_cfg.formats, "imatrix": rc_cfg.imatrix,
+    })
+    existing = sorted(artifacts.rocmfpx_dir.glob("*.gguf")) if artifacts.rocmfpx_dir.exists() else []
+    key_file = existing[0] if existing else (artifacts.rocmfpx_dir / "_placeholder.gguf")
+    if _markers().is_stage_complete(artifacts.rocmfpx_dir, key_file, cfg_hash, force=force):
+        log(f"ROCmFPX already complete (marker matches) at {artifacts.rocmfpx_dir} — skipping", "success")
+        return True
+
+    _preflight_stage("rocmfpx", config, log, skip=skip_preflight)
+
+    model_name = config.training.model_name.split("/")[-1]
+    import json as _json
+    svc = _services().ROCmFPXService(PROJECT_ROOT, _find_python())
+    script = svc.build_script(
+        rocmfpx_hint=rc_cfg.rocmfpx_hint,
+        pipeline_root_str=str(PROJECT_ROOT),
+        source_override=str(source),
+        out_abs_str=str(artifacts.output_dir.resolve()),
+        formats_json=_json.dumps(rc_cfg.formats),
+        model_name=model_name,
+        imatrix=rc_cfg.imatrix,
+    )
+
+    rc = _run_stage_script(
+        script, artifacts.output_dir / "_stage_rocmfpx.py", log,
+        cfg_hash=cfg_hash, timeout=timeout,
+    )
+    if rc != 0:
+        log(f"ROCmFPX failed (exit code {rc})", "error")
+        return False
+
+    ggufs = sorted(artifacts.rocmfpx_dir.glob("*.gguf")) if artifacts.rocmfpx_dir.exists() else []
+    if not ggufs:
+        log("No GGUF files produced by ROCmFPX", "error")
+        return False
+    for p in ggufs:
+        log(f"  {p.name} ({p.stat().st_size / 1e9:.1f} GB)")
+    try:
+        _markers().write_marker(artifacts.rocmfpx_dir, "rocmfpx", ggufs[0], cfg_hash)
+    except OSError as e:
+        log(f"Could not write completion marker: {e}", "warn")
+    log(f"Generated {len(ggufs)} ROCmFPX GGUF files", "success")
     return True
 
 
@@ -1215,6 +1323,7 @@ STAGES = [
     ("reap",       stage_reap),
     ("qat",        stage_qat),
     ("magicquant", stage_magicquant),
+    ("rocmfpx",    stage_rocmfpx),
     ("upload",     stage_upload),
 ]
 
@@ -1244,6 +1353,8 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log,
         enabled.add("qat")
     if config.magicquant is not None:
         enabled.add("magicquant")
+    if config.rocmfpx is not None:
+        enabled.add("rocmfpx")
     if config.upload is not None:
         enabled.add("upload")
 
@@ -1282,6 +1393,7 @@ _CONFIG_SECTIONS = {
     "reap": ("reap", ReapConfig),
     "qat": ("qat", QATConfig),
     "magicquant": ("magicquant", MagicQuantConfig),
+    "rocmfpx": ("rocmfpx", ROCmFPXConfig),
     "upload": ("upload", UploadConfig),
 }
 
@@ -1373,6 +1485,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--qat-tier", type=str, default="Q4",
                         help="Tier within search_results.json to target for QAT (default: Q4)")
     parser.add_argument("--no-magicquant", action="store_true")
+    parser.add_argument("--magicquant-measured", action="store_true",
+                        help="Run MagicQuant's measured (Predict->Measure->Learn) search "
+                             "with real perplexity instead of prediction-only (slower)")
+    parser.add_argument("--magicquant-rounds", type=int, default=3,
+                        help="Measurement rounds for --magicquant-measured (default 3)")
+    parser.add_argument("--magicquant-rocmfpx", action="store_true",
+                        help="Let MagicQuant's search also explore AMD-native ROCmFPX fork "
+                             "types (needs a ROCmFPX build; output loads only on the fork)")
+    parser.add_argument("--rocmfpx", action="store_true",
+                        help="Enable ROCmFPX stage (AMD-tuned GGUF quants; default off)")
+    parser.add_argument("--no-rocmfpx", action="store_true",
+                        help="Disable the ROCmFPX stage")
+    parser.add_argument("--rocmfpx-formats", nargs="+", default=None,
+                        help="ROCmFPX '<format>-<profile>' specs, e.g. rocmfp4-agent "
+                             "rocmfp6-agent rocmfp8-agent (default: those three)")
+    parser.add_argument("--rocmfpx-source-model", type=str, default="",
+                        help="Path to a GGUF file or merged safetensors dir "
+                             "(when export/magicquant are skipped)")
+    parser.add_argument("--rocmfpx-hint", type=str, default="",
+                        help="Path to an existing ROCmFPX/llama.cpp-fork build "
+                             "(default: auto-detect or auto-install)")
     parser.add_argument("--upload-to", type=str, help="HF repo ID")
     parser.add_argument("--llamacpp-path", type=str)
     parser.add_argument("--dry-run", action="store_true",
@@ -1419,6 +1552,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         cfg.qat = None
     if args.no_magicquant:
         cfg.magicquant = None
+    if cfg.magicquant is not None:
+        if args.magicquant_measured:
+            cfg.magicquant.measured = True
+            cfg.magicquant.measurement_rounds = args.magicquant_rounds
+        if args.magicquant_rocmfpx:
+            cfg.magicquant.rocmfpx_schemes = True
+    if args.rocmfpx and not args.no_rocmfpx:
+        cfg.rocmfpx = ROCmFPXConfig(
+            source_model=args.rocmfpx_source_model,
+            rocmfpx_hint=args.rocmfpx_hint,
+            **({"formats": args.rocmfpx_formats} if args.rocmfpx_formats else {}),
+        )
+    if args.no_rocmfpx:
+        cfg.rocmfpx = None
     if args.upload_to:
         cfg.upload = UploadConfig(repo_id=args.upload_to)
     if args.llamacpp_path and cfg.magicquant:
@@ -1447,6 +1594,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             _dry_enabled.add("qat")
         if cfg.magicquant is not None:
             _dry_enabled.add("magicquant")
+        if cfg.rocmfpx is not None:
+            _dry_enabled.add("rocmfpx")
         if cfg.upload is not None:
             _dry_enabled.add("upload")
         report = stage_upload_dry_run(cfg, artifacts, _default_log, enabled=_dry_enabled)

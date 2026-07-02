@@ -40,6 +40,7 @@ from services import (
     ReapService,
     QATService,
     MagicQuantService,
+    ROCmFPXService,
     UploadService,
 )
 
@@ -101,7 +102,7 @@ class StageStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
 
-ALL_STAGES = ["training", "export", "heretic", "reap", "qat", "magicquant", "upload"]
+ALL_STAGES = ["training", "export", "heretic", "reap", "qat", "magicquant", "rocmfpx", "upload"]
 
 class PipelineState:
     """Shared mutable state for the running pipeline, including WebSocket fan-out."""
@@ -190,6 +191,9 @@ class MagicQuantCfg(BaseModel):
     tiers: list[str] = ["Q4", "Q5", "Q6"]
     llamacpp_path: str = ""
     source_model: str = ""  # when export is skipped: path to GGUF or merged model dir
+    measured: bool = False           # real perplexity search vs prediction-only
+    measurement_rounds: int = 3
+    rocmfpx_schemes: bool = False    # explore AMD-native ROCmFPX fork types
 
 class QATCfg(BaseModel):
     """QAT-LoRA stage config.
@@ -207,6 +211,17 @@ class QATCfg(BaseModel):
     max_steps: int = -1
     lr: float = 2e-4
     max_seq_len: int = 512
+
+class ROCmFPXCfg(BaseModel):
+    """ROCmFPX stage config (AMD-tuned GGUF quant family, see docs/rocmfpx.md).
+
+    Auto-installed on first use (git clone + Strix Halo build) -- not a pip
+    package, unlike MagicQuant.
+    """
+    formats: list[str] = ["rocmfp4-agent", "rocmfp6-agent", "rocmfp8-agent"]
+    rocmfpx_hint: str = ""  # path to an existing ROCmFPX/llama.cpp-fork build
+    source_model: str = ""  # when export is skipped: path to GGUF or merged model dir
+    imatrix: str = ""  # optional path to an imatrix GGUF
 
 class UploadCfg(BaseModel):
     repo_id: str = ""
@@ -242,6 +257,7 @@ class RunRequest(BaseModel):
     reap: Optional[ReapCfg] = None
     qat: Optional[QATCfg] = None
     magicquant: Optional[MagicQuantCfg] = None
+    rocmfpx: Optional[ROCmFPXCfg] = None
     upload: Optional[UploadCfg] = None
     enabled_stages: list[str] = ["training", "export"]
 
@@ -870,7 +886,8 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     mq_hash = markers.config_hash({
         "generations": mc.generations, "population_size": mc.population_size,
         "target_base_quant": mc.target_base_quant, "tiers": mc.tiers,
-        "source_model": mc.source_model,
+        "source_model": mc.source_model, "measured": mc.measured,
+        "measurement_rounds": mc.measurement_rounds, "rocmfpx_schemes": mc.rocmfpx_schemes,
     })
     existing_ggufs = sorted(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
     mq_key = existing_ggufs[0] if existing_ggufs else (mq_dir / "_placeholder.gguf")
@@ -902,6 +919,9 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         tiers_json=tiers_json,
         model_name=model_name,
         verify=False,
+        measured=mc.measured,
+        measurement_rounds=mc.measurement_rounds,
+        rocmfpx_schemes=mc.rocmfpx_schemes,
     )
     rc = await run_script(script, out)
     ok = rc == 0
@@ -913,6 +933,64 @@ async def do_magicquant(cfg: RunRequest) -> bool:
             except OSError:
                 pass
     await state.set_stage("magicquant", StageStatus.COMPLETE if ok else StageStatus.FAILED)
+    if ok:
+        await state.set_progress(100)
+    return ok
+
+
+async def do_rocmfpx(cfg: RunRequest) -> bool:
+    """Run ROCmFPX quantization (AMD-tuned GGUF quant family)."""
+    out = cfg.training.output_dir
+    out_abs = _resolve_out(out)
+    rc_cfg = cfg.rocmfpx
+    export_enabled = "export" in cfg.enabled_stages
+
+    if rc_cfg is None:
+        await state.log("ROCmFPX stage enabled but no ROCmFPX config provided", "error")
+        await state.set_stage("rocmfpx", StageStatus.FAILED)
+        return False
+
+    # Completion-marker resume (mirrors do_magicquant).
+    rc_dir = out_abs / "rocmfpx"
+    rc_hash = markers.config_hash({
+        "formats": rc_cfg.formats, "imatrix": rc_cfg.imatrix,
+        "source_model": rc_cfg.source_model,
+    })
+    existing_ggufs = sorted(rc_dir.glob("*.gguf")) if rc_dir.exists() else []
+    rc_key = existing_ggufs[0] if existing_ggufs else (rc_dir / "_placeholder.gguf")
+    if markers.is_stage_complete(rc_dir, rc_key, rc_hash):
+        await state.log(f"ROCmFPX already complete (marker matches) at {rc_dir} — skipping", "success")
+        await state.set_stage("rocmfpx", StageStatus.COMPLETE)
+        await state.set_progress(100)
+        return True
+
+    await state.set_stage("rocmfpx", StageStatus.RUNNING)
+    await state.set_progress(0)
+    await state.log("Starting ROCmFPX quantization", "stage")
+
+    model_name = _derive_model_short_name(cfg)
+    source_override = rc_cfg.source_model if (rc_cfg.source_model and not export_enabled) else ""
+
+    svc = ROCmFPXService(FOUNDRY_ROOT, VENV_PYTHON)
+    script = svc.build_script(
+        rocmfpx_hint=rc_cfg.rocmfpx_hint,
+        pipeline_root_str=str(FOUNDRY_ROOT),
+        source_override=source_override,
+        out_abs_str=str(out_abs),
+        formats_json=json.dumps(rc_cfg.formats),
+        model_name=model_name,
+        imatrix=rc_cfg.imatrix,
+    )
+    rc = await run_script(script, out)
+    ok = rc == 0
+    if ok and rc_dir.exists():
+        ggufs = sorted(rc_dir.glob("*.gguf"))
+        if ggufs:
+            try:
+                markers.write_marker(rc_dir, "rocmfpx", ggufs[0], rc_hash)
+            except OSError:
+                pass
+    await state.set_stage("rocmfpx", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
     return ok
@@ -1001,6 +1079,7 @@ STAGE_RUNNERS = {
     "reap":       do_reap,
     "qat":        do_qat,
     "magicquant": do_magicquant,
+    "rocmfpx":    do_rocmfpx,
     "upload":     do_upload,
 }
 
@@ -1063,6 +1142,30 @@ async def validate_pipeline(cfg: RunRequest) -> bool:
             await state.log(f"Export skipped — MagicQuant will use existing: {out_abs}/merged_model")
         else:
             await state.log(f"Export skipped — MagicQuant will use existing: {out_abs}/model-bf16.gguf")
+
+    # ROCmFPX without export: needs a source (same check as MagicQuant)
+    if "rocmfpx" in enabled and "export" not in enabled:
+        rc_cfg = cfg.rocmfpx
+        source = rc_cfg.source_model if rc_cfg else ""
+        has_reap = (out_abs / "reap_model").exists()
+        has_heretic = (out_abs / "heretic_model").exists()
+        has_merged = (out_abs / "merged_model").exists()
+        has_gguf = (out_abs / "model-bf16.gguf").exists()
+        if not source and not has_reap and not has_heretic and not has_merged and not has_gguf:
+            await state.log("ROCmFPX is enabled without Export, and no existing model artifacts "
+                            "were found in the output directory. Set a Source Model path in ROCmFPX "
+                            "config, or enable Export.", "error")
+            return False
+        if source:
+            await state.log(f"Export skipped — ROCmFPX will use source: {source}")
+        elif has_reap:
+            await state.log(f"Export skipped — ROCmFPX will use existing: {out_abs}/reap_model")
+        elif has_heretic:
+            await state.log(f"Export skipped — ROCmFPX will use existing: {out_abs}/heretic_model")
+        elif has_merged:
+            await state.log(f"Export skipped — ROCmFPX will use existing: {out_abs}/merged_model")
+        else:
+            await state.log(f"Export skipped — ROCmFPX will use existing: {out_abs}/model-bf16.gguf")
 
     # Upload: check that at least some artifacts will exist
     if "upload" in enabled:
