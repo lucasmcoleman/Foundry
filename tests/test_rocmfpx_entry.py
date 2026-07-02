@@ -28,7 +28,7 @@ def test_parse_format_spec_valid(spec, expected):
     assert entry.parse_format_spec(spec) == expected
 
 
-@pytest.mark.parametrize("spec", ["rocmfp5", "rocmfp4-turbo", "", "agent"])
+@pytest.mark.parametrize("spec", ["rocmfp5", "rocmfp4-turbo", "", "agent", "rocmfp5-agent"])
 def test_parse_format_spec_rejects_unknown(spec):
     with pytest.raises(ValueError):
         entry.parse_format_spec(spec)
@@ -166,6 +166,34 @@ def test_translate_scheme_rejects_unknown():
         entry.translate_scheme("NOPE_Q9")
 
 
+# ── opt-in MagicQuant IQ schemes (defect 1a) ────────────────────────────────
+
+@pytest.mark.parametrize("scheme,expected", [
+    ("IQ4_XS", "Q4_0_ROCMFP4"),
+    ("IQ3_S", "Q3_0_ROCMFPX"),
+    ("IQ3_XXS", "Q3_0_ROCMFPX"),
+    ("IQ2_S", "Q3_0_ROCMFPX"),
+    ("IQ2_XS", "Q3_0_ROCMFPX"),
+    ("IQ2_XXS", "Q3_0_ROCMFPX"),
+    ("IQ1_M", "Q3_0_ROCMFPX"),
+    ("IQ1_S", "Q3_0_ROCMFPX"),
+])
+def test_translate_scheme_covers_iq_schemes(scheme, expected):
+    """The 8 opt-in MagicQuant IQ schemes must translate instead of raising --
+    previously missing from SCHEME_TO_ROCMFPX, which aborted the whole
+    ROCmFPX stage the moment a search used an IQ scheme."""
+    assert entry.translate_scheme(scheme) == expected
+
+
+def test_build_tensor_type_lines_succeeds_with_iq_scheme():
+    """A tier config containing an IQ scheme must produce a translated line,
+    not raise -- this is what build_tensor_type_lines does inside
+    _quantize_mq_hybrid's (now widened) try/except."""
+    config = {"X": "IQ3_S"}
+    lines = entry.build_tensor_type_lines(config, _PATTERNS)
+    assert lines == [r"ffn_(up|gate|down)_exps=Q3_0_ROCMFPX"]
+
+
 # ── tensor-type-file emission ───────────────────────────────────────────────
 
 _PATTERNS = {
@@ -239,3 +267,44 @@ def test_load_mq_tier_config_missing_tier(tmp_path):
     }))
     with pytest.raises(KeyError):
         entry._load_mq_tier_config(tmp_path, "Q4")
+
+
+# ── graceful degradation on a single bad format (defects 1b & 2) ───────────
+#
+# One untranslatable/unparseable format spec must skip with a warning and
+# return None, not raise out of the per-format loop in run() and abort every
+# other queued ROCmFPX format.
+
+def test_quantize_mq_hybrid_returns_none_on_untranslatable_scheme(tmp_path):
+    out_dir = tmp_path / "output"
+    mq_dir = out_dir / "magicquant"
+    mq_dir.mkdir(parents=True)
+    mq_dir.joinpath("search_results.json").write_text(json.dumps({
+        "tiered": {"Q4": {"config": {"X": "NOPE_Q9"}}}
+    }))
+    rocmfpx_out_dir = out_dir / "rocmfpx"
+    rocmfpx_out_dir.mkdir()
+
+    # No real llama-quantize binary or GGUF needed: an untranslatable scheme
+    # must be caught before any subprocess is ever spawned. If it weren't
+    # caught (the pre-fix behavior), build_tensor_type_lines's ValueError
+    # would propagate out of this call instead of returning None.
+    result = entry._quantize_mq_hybrid(
+        "mq-q4", "Q4", out_dir, rocmfpx_out_dir, "model",
+        entry.Path("/nonexistent/llama-quantize"), entry.Path("/nonexistent/model-bf16.gguf"), "",
+    )
+    assert result is None
+
+
+def test_quantize_preset_returns_none_on_bad_spec(tmp_path):
+    out_dir = tmp_path / "rocmfpx"
+    out_dir.mkdir()
+
+    # A bad spec must be caught before any subprocess is spawned -- if it
+    # weren't (the pre-fix behavior), parse_format_spec's ValueError would
+    # propagate instead of returning None.
+    result = entry._quantize_preset(
+        "rocmfp5-agent", out_dir, "model",
+        entry.Path("/nonexistent/llama-quantize"), entry.Path("/nonexistent/model-bf16.gguf"), "",
+    )
+    assert result is None
