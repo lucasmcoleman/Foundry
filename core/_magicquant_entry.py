@@ -176,6 +176,9 @@ def run(cfg_path: str | None = None) -> None:
         flush=True,
     )
 
+    use_imatrix = cfg.get("use_imatrix", False)
+    imatrix_corpus = cfg.get("imatrix_corpus") or None
+
     if measured:
         best_configs, tiered = orch.run_measured_search(
             target_base_quant=target_base_quant,
@@ -186,6 +189,11 @@ def run(cfg_path: str | None = None) -> None:
             enable_rocmfpx=enable_rocmfpx,
             enable_iq=enable_iq,
             seed=cfg.get("seed"),
+            use_imatrix=use_imatrix,
+            imatrix_corpus=imatrix_corpus,
+            enable_kl=cfg.get("enable_kl", False),
+            kl_weight=cfg.get("kl_weight", 0.1),
+            enable_speed_bench=cfg.get("enable_speed_bench", False),
         )
     else:
         best_configs, tiered = orch.run_full_search(
@@ -196,6 +204,8 @@ def run(cfg_path: str | None = None) -> None:
             enable_rocmfpx=enable_rocmfpx,
             enable_iq=enable_iq,
             seed=cfg.get("seed"),
+            use_imatrix=use_imatrix,
+            imatrix_corpus=imatrix_corpus,
         )
     if not tiered:
         print("Error: no viable configurations found", flush=True)
