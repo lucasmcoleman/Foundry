@@ -116,6 +116,20 @@ class MagicQuantConfig:
     iq_schemes: bool = False
     # seed: optional RNG seed for a reproducible search (None = nondeterministic).
     seed: Optional[int] = None
+    # use_imatrix/imatrix_corpus: capture/reuse an importance matrix and weight
+    # quantization noise by activation magnitude (both search paths). Off by
+    # default (unweighted, historical behavior). imatrix_corpus=None uses the
+    # bundled default calibration corpus.
+    use_imatrix: bool = False
+    imatrix_corpus: Optional[str] = None
+    # enable_kl/kl_weight/enable_speed_bench: measured-search-only extras (see
+    # MagicQuantOrchestrator.run_measured_search). enable_kl also measures real
+    # KL-divergence-to-base per candidate and blends |mean_kl| * kl_weight into
+    # final-survivor selection; enable_speed_bench also measures real
+    # tokens/sec per candidate via llama-bench (informational).
+    enable_kl: bool = False
+    kl_weight: float = 0.1
+    enable_speed_bench: bool = False
 
 
 @dataclass
@@ -1084,6 +1098,9 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         "measured": mc.measured, "measurement_rounds": mc.measurement_rounds,
         "rocmfpx_schemes": mc.rocmfpx_schemes, "iq_schemes": mc.iq_schemes,
         "seed": mc.seed,
+        "use_imatrix": mc.use_imatrix, "imatrix_corpus": mc.imatrix_corpus,
+        "enable_kl": mc.enable_kl, "kl_weight": mc.kl_weight,
+        "enable_speed_bench": mc.enable_speed_bench,
     })
     existing = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.magicquant_dir / "_placeholder.gguf")
@@ -1110,6 +1127,11 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         rocmfpx_schemes=mc.rocmfpx_schemes,
         iq_schemes=mc.iq_schemes,
         seed=mc.seed,
+        use_imatrix=mc.use_imatrix,
+        imatrix_corpus=mc.imatrix_corpus,
+        enable_kl=mc.enable_kl,
+        kl_weight=mc.kl_weight,
+        enable_speed_bench=mc.enable_speed_bench,
     )
 
     rc = _run_stage_script(
@@ -1508,6 +1530,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--magicquant-seed", type=int, default=None,
                         help="Optional RNG seed for a reproducible MagicQuant search "
                              "(default: nondeterministic)")
+    parser.add_argument("--magicquant-use-imatrix", action="store_true",
+                        help="Capture/reuse an importance matrix and weight quant "
+                             "noise by activation magnitude during MagicQuant search")
+    parser.add_argument("--magicquant-imatrix-corpus", type=str, default=None,
+                        help="Calibration corpus for --magicquant-use-imatrix "
+                             "(default: bundled corpus)")
+    parser.add_argument("--magicquant-kl", action="store_true",
+                        help="Also measure real KL-divergence-to-base per candidate "
+                             "during --magicquant-measured search")
+    parser.add_argument("--magicquant-kl-weight", type=float, default=0.1,
+                        help="Weight applied to |mean_kl| when blending into the "
+                             "measured-search selection score (default 0.1)")
+    parser.add_argument("--magicquant-speed-bench", action="store_true",
+                        help="Also measure real tokens/sec per candidate (llama-bench) "
+                             "during --magicquant-measured search")
     parser.add_argument("--rocmfpx", action="store_true",
                         help="Enable ROCmFPX stage (AMD-tuned GGUF quants; default off)")
     parser.add_argument("--no-rocmfpx", action="store_true",
@@ -1577,6 +1614,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             cfg.magicquant.iq_schemes = True
         if args.magicquant_seed is not None:
             cfg.magicquant.seed = args.magicquant_seed
+        if args.magicquant_use_imatrix:
+            cfg.magicquant.use_imatrix = True
+        if args.magicquant_imatrix_corpus is not None:
+            cfg.magicquant.imatrix_corpus = args.magicquant_imatrix_corpus
+        if args.magicquant_kl:
+            cfg.magicquant.enable_kl = True
+            cfg.magicquant.kl_weight = args.magicquant_kl_weight
+        if args.magicquant_speed_bench:
+            cfg.magicquant.enable_speed_bench = True
     if args.rocmfpx and not args.no_rocmfpx:
         cfg.rocmfpx = ROCmFPXConfig(
             source_model=args.rocmfpx_source_model,
