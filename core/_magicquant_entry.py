@@ -28,17 +28,31 @@ def parse_config(cfg_path: str) -> dict:
 
 
 def find_llamacpp(hint: str = "") -> str | None:
-    """Return a llama.cpp dir that contains the converter or quantize binary."""
+    """Return a llama.cpp dir that contains the converter or quantize binary.
+
+    Accepts the same layouts LlamaCppTools itself searches (repo root with
+    build/bin, a standalone build dir with bin/, or a bare bin dir) so a
+    user-supplied hint like a ROCmFPX build directory isn't silently
+    rejected in favor of an auto-detected -- possibly incompatible -- build.
+    """
     import os
 
-    for p in [hint, os.environ.get("LLAMACPP_PATH", ""),
-              str(Path.home() / "llama.cpp"), "./llama.cpp", "/usr/local"]:
+    candidates = [hint, os.environ.get("LLAMACPP_PATH", ""),
+                  str(Path.home() / "llama.cpp"), "./llama.cpp", "/usr/local"]
+    for p in candidates:
         if not p:
             continue
         pp = Path(p)
-        for sub in [pp / "convert_hf_to_gguf.py", pp / "build" / "bin" / "llama-quantize"]:
+        for sub in [pp / "convert_hf_to_gguf.py",
+                    pp / "build" / "bin" / "llama-quantize",
+                    pp / "bin" / "llama-quantize",
+                    pp / "llama-quantize"]:
             if sub.exists():
                 return str(pp)
+        if p == hint:
+            print(f"WARNING: llamacpp path hint {hint!r} has no "
+                  "convert_hf_to_gguf.py or llama-quantize (searched ., bin/, "
+                  "build/bin/) -- falling back to auto-detection", flush=True)
     return None
 
 
