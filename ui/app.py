@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Header, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, ValidationError
 
@@ -78,6 +79,14 @@ async def verify_api_key(authorization: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 app = FastAPI(title="Foundry")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 FOUNDRY_DIR = Path(__file__).resolve().parent.parent
 
