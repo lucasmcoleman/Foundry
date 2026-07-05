@@ -234,6 +234,8 @@ def run(cfg_path: str | None = None) -> None:
     use_imatrix = cfg.get("use_imatrix", False)
     imatrix_corpus = cfg.get("imatrix_corpus") or None
     measurement_chunks = cfg.get("measurement_chunks")
+    stream_aware = cfg.get("stream_aware", False)
+    head_aggressive = cfg.get("head_aggressive", False)
 
     if measured:
         best_configs, tiered = orch.run_measured_search(
@@ -251,6 +253,8 @@ def run(cfg_path: str | None = None) -> None:
             kl_weight=cfg.get("kl_weight", 0.1),
             enable_speed_bench=cfg.get("enable_speed_bench", False),
             measurement_chunks=measurement_chunks,
+            stream_aware=stream_aware,
+            head_aggressive=head_aggressive,
         )
     else:
         best_configs, tiered = orch.run_full_search(
@@ -264,6 +268,8 @@ def run(cfg_path: str | None = None) -> None:
             use_imatrix=use_imatrix,
             imatrix_corpus=imatrix_corpus,
             measurement_chunks=measurement_chunks,
+            stream_aware=stream_aware,
+            head_aggressive=head_aggressive,
         )
     if not tiered:
         print("Error: no viable configurations found", flush=True)

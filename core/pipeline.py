@@ -137,6 +137,14 @@ class MagicQuantConfig:
     # CHUNKS to a real, provenance-stamped setting (see search_results.json's
     # "measurement" block).
     measurement_chunks: Optional[int] = None
+    # stream_aware/head_aggressive: search-bias knobs (EvolutionarySurvivor
+    # sampling, not scoring; both search paths). stream_aware biases sampling
+    # of streamed matmul groups toward BF16->Q8_0 (recommended: faster
+    # generation, smaller size, PPL-neutral). head_aggressive biases the 'H'
+    # (LM head) group toward smaller K-quants; superseded by stream_aware for
+    # most models. Off by default (unbiased sampling, historical behavior).
+    stream_aware: bool = False
+    head_aggressive: bool = False
 
 
 @dataclass
@@ -1109,6 +1117,7 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         "enable_kl": mc.enable_kl, "kl_weight": mc.kl_weight,
         "enable_speed_bench": mc.enable_speed_bench,
         "measurement_chunks": mc.measurement_chunks,
+        "stream_aware": mc.stream_aware, "head_aggressive": mc.head_aggressive,
     })
     existing = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.magicquant_dir / "_placeholder.gguf")
@@ -1141,6 +1150,8 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         kl_weight=mc.kl_weight,
         enable_speed_bench=mc.enable_speed_bench,
         measurement_chunks=mc.measurement_chunks,
+        stream_aware=mc.stream_aware,
+        head_aggressive=mc.head_aggressive,
     )
 
     rc = _run_stage_script(
@@ -1558,6 +1569,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="Cap perplexity/KL passes to this many ctx-size chunks "
                              "instead of the whole corpus (both measured and "
                              "prediction-only search paths); default: whole corpus")
+    parser.add_argument("--magicquant-stream-aware", action="store_true",
+                        help="Bias MagicQuant's search sampling toward BF16->Q8_0 on "
+                             "streamed matmul groups (recommended: ~+18% gen speed, "
+                             "-16% size, PPL-neutral; ~-8% prompt speed)")
+    parser.add_argument("--magicquant-head-aggressive", action="store_true",
+                        help="Bias MagicQuant's search sampling for the 'H' (LM head) "
+                             "group toward smaller K-quants (superseded by "
+                             "--magicquant-stream-aware for most models)")
     parser.add_argument("--rocmfpx", action="store_true",
                         help="Enable ROCmFPX stage (AMD-tuned GGUF quants; default off)")
     parser.add_argument("--no-rocmfpx", action="store_true",
@@ -1638,6 +1657,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             cfg.magicquant.enable_speed_bench = True
         if args.magicquant_chunks is not None:
             cfg.magicquant.measurement_chunks = args.magicquant_chunks
+        if args.magicquant_stream_aware:
+            cfg.magicquant.stream_aware = True
+        if args.magicquant_head_aggressive:
+            cfg.magicquant.head_aggressive = True
     if args.rocmfpx and not args.no_rocmfpx:
         cfg.rocmfpx = ROCmFPXConfig(
             source_model=args.rocmfpx_source_model,
