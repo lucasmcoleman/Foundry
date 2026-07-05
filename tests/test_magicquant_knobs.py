@@ -381,3 +381,25 @@ def test_index_html_gates_kl_and_speed_bench_behind_measured():
     ungated = body[:body.index("c.measured ?")]
     assert "magicquant.use_imatrix" in ungated
     assert "magicquant.imatrix_corpus" in ungated
+
+
+# ── find_llamacpp hint layouts ────────────────────────────────────────────────
+
+def test_find_llamacpp_accepts_bare_build_dir_hint(tmp_path):
+    """A ROCmFPX-style build dir (binaries in bin/, no convert script, no
+    build/ subdir) must be accepted -- it used to fail validation and fall
+    back silently to an auto-detected, possibly arch-incompatible build."""
+    import _train_entry  # noqa: F401  (sys.path side effect via conftest)
+    import _magicquant_entry as entry
+
+    fork = tmp_path / "build-strix-rocmfp4"
+    (fork / "bin").mkdir(parents=True)
+    (fork / "bin" / "llama-quantize").write_text("")
+    assert entry.find_llamacpp(str(fork)) == str(fork)
+
+
+def test_find_llamacpp_bad_hint_warns_and_falls_back(tmp_path, capsys):
+    import _magicquant_entry as entry
+
+    entry.find_llamacpp(str(tmp_path / "nope"))
+    assert "falling back to auto-detection" in capsys.readouterr().out
