@@ -68,27 +68,6 @@ _ROCMFPX_QUALITY_ORDER = [
     "Q3_0_ROCMFPX", "F32",
 ]
 
-# tg (token generation) is memory-bandwidth-bound: fewer bytes streamed per
-# token = faster, ~linearly. Q3_0_ROCMFPX and Q6_0_ROCMFPX are tg-SLOW on top
-# of that: cross-word bit-stitch + __constant__ codebook LUT decode, and
-# untuned occupancy (nwarps=1 vs ROCmFP4's 2) -- no AMD-ISA fast path. Their
-# tg-fast siblings, Q4_0_ROCMFP4 and Q8_0_ROCMFPX, decode via register-permute
-# / plain int8 dp4a and are meaningfully faster per token, at the cost of a
-# few more bits per weight (bigger file, more bytes to stream -- but the
-# bit-stitch/LUT tax dwarfs that extra bandwidth in wall-clock tg terms).
-# Q4_0_ROCMFP4/Q4_0_ROCMFP4_FAST/Q8_0_ROCMFPX are already tg-fast and map to
-# themselves (no steering needed).
-TG_SAFE_ROCMFPX = {
-    "Q3_0_ROCMFPX": "Q4_0_ROCMFP4",
-    "Q6_0_ROCMFPX": "Q8_0_ROCMFPX",
-}
-
-# Groups steered by tg_safe: the bandwidth-heavy bulk that dominates tg (FFN
-# up/down + MoE experts). Attention/embeddings/head groups (Q/K/O/E/H/...)
-# keep faithful translation even under tg_safe -- steering only the
-# high-traffic groups captures most of the tg win while limiting the size cost.
-TG_SAFE_GROUPS = {"U", "D", "X"}
-
 # Float types are non-quantizing: passing one as llama-quantize's positional
 # base ftype makes the whole op a no-op copy that SKIPS the per-tensor
 # overrides. The base must therefore be a quantizing type; these are excluded.
@@ -115,44 +94,14 @@ def parse_mq_spec(spec: str) -> str | None:
     return tier.upper() if tier else None
 
 
-def tg_safe_rocmfpx(rocmfpx_type: str) -> str:
-    """Steer a tg-slow ROCmFPX fork type to its nearest tg-fast sibling.
-
-    tg (token generation) is memory-bandwidth-bound: fewer bytes streamed per
-    token = faster, ~linearly. ``Q3_0_ROCMFPX`` and ``Q6_0_ROCMFPX`` are
-    tg-SLOW regardless of that: cross-word bit-stitch + ``__constant__``
-    codebook LUT decode, plus untuned occupancy (nwarps=1 vs ROCmFP4's 2) --
-    no AMD-ISA fast path. ``Q4_0_ROCMFP4`` and ``Q8_0_ROCMFPX`` decode via
-    register-permute / plain int8 dp4a and are meaningfully faster per token.
-
-    Tradeoff: the steered type is slightly *bigger* (Q3->Q4, Q6->Q8, a few
-    more bits/weight, more bytes on disk and in the KV-adjacent weight
-    stream) in exchange for a much faster tg decode path -- the bit-stitch/LUT
-    tax the slow types pay dwarfs that extra bandwidth in wall-clock tg terms.
-    Types already tg-fast (``Q4_0_ROCMFP4``, ``Q4_0_ROCMFP4_FAST``,
-    ``Q8_0_ROCMFPX``) map to themselves -- no steering needed.
-    """
-    return TG_SAFE_ROCMFPX.get(rocmfpx_type, rocmfpx_type)
-
-
-def translate_scheme(scheme: str, tg_safe: bool = False) -> str:
-    """Translate a MagicQuant scheme name to its ROCmFPX-family ggml type.
-
-    ``tg_safe`` (opt-in, default off) steers the faithful translation through
-    ``tg_safe_rocmfpx`` to its tg-fast sibling instead of returning it as-is.
-    Callers decide *which* groups get steered (see ``build_tensor_type_lines``,
-    which only steers the high-traffic FFN/expert groups) -- this function
-    just applies the steering when asked.
-    """
+def translate_scheme(scheme: str) -> str:
+    """Translate a MagicQuant scheme name to its ROCmFPX-family ggml type."""
     if scheme not in SCHEME_TO_ROCMFPX:
         raise ValueError(
             f"No ROCmFPX translation for MagicQuant scheme {scheme!r}. "
             f"Known: {sorted(SCHEME_TO_ROCMFPX)}"
         )
-    ggml_type = SCHEME_TO_ROCMFPX[scheme]
-    if tg_safe:
-        ggml_type = tg_safe_rocmfpx(ggml_type)
-    return ggml_type
+    return SCHEME_TO_ROCMFPX[scheme]
 
 
 def pick_base_type(config: dict) -> str:
@@ -174,7 +123,7 @@ def pick_base_type(config: dict) -> str:
     return _DEFAULT_QUANTIZING_BASE
 
 
-def build_tensor_type_lines(config: dict, group_patterns: dict, tg_safe: bool = False) -> list[str]:
+def build_tensor_type_lines(config: dict, group_patterns: dict) -> list[str]:
     """Emit ``<regex>=<TYPE>`` lines for a per-group config.
 
     ``config`` maps group letters (E/H/Q/K/O/U/D/X/R/S) to MagicQuant scheme
@@ -184,21 +133,12 @@ def build_tensor_type_lines(config: dict, group_patterns: dict, tg_safe: bool = 
     semantics reproduce the classifier's assignment (e.g. the X pattern
     ``ffn_(up|gate|down)_exps`` precedes the U pattern ``ffn_up``, so fused
     expert tensors resolve to X, not U).
-
-    ``tg_safe`` (opt-in, default off -- faithful translation stays the
-    default): when True, the high-traffic groups (``TG_SAFE_GROUPS`` -- FFN
-    up/down + MoE experts, the bandwidth-heavy bulk that dominates tg) get
-    their translated type steered through ``tg_safe_rocmfpx`` to its nearest
-    tg-fast sibling. Attention/embedding/head groups (Q/K/O/E/H/...) always
-    keep the faithful translation, steered or not -- limiting the size cost
-    while still capturing most of the tg win.
     """
     lines: list[str] = []
     for group, patterns in group_patterns.items():
         if group not in config:
             continue  # groups the search didn't vary (N norms, V vision) keep defaults
-        steer = tg_safe and group in TG_SAFE_GROUPS
-        ggml_type = translate_scheme(config[group], tg_safe=steer)
+        ggml_type = translate_scheme(config[group])
         for pat in patterns:
             lines.append(f"{pat}={ggml_type}")
     return lines
@@ -502,7 +442,6 @@ def run(cfg_path: str | None = None) -> None:
     formats = json.loads(cfg["formats_json"])
     imatrix = cfg.get("imatrix", "")
     model_name = cfg["model_name"]
-    tg_safe = cfg.get("tg_safe", False)
 
     import subprocess
 
@@ -512,7 +451,7 @@ def run(cfg_path: str | None = None) -> None:
         if tier is not None:
             out_path = _quantize_mq_hybrid(
                 spec, tier, out_dir, rocmfpx_out_dir, model_name,
-                quantize_bin, bf16_gguf, imatrix, tg_safe=tg_safe,
+                quantize_bin, bf16_gguf, imatrix,
             )
         else:
             out_path = _quantize_preset(
@@ -578,16 +517,12 @@ def _load_mq_tier_config(out_dir: Path, tier: str) -> dict:
 
 
 def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
-                        quantize_bin, bf16_gguf, imatrix, tg_safe=False):
+                        quantize_bin, bf16_gguf, imatrix):
     """Produce a ROCmFPX hybrid matching MagicQuant's per-group config for ``tier``.
 
     Translates each group's MagicQuant scheme to a ROCmFPX-family type and
     drives llama-quantize with a per-tensor override file so the AMD-native
     formats land exactly where MagicQuant's search placed each precision.
-
-    ``tg_safe`` (opt-in, default off): steer the high-traffic FFN/expert
-    groups (U/D/X) to their tg-fast sibling type -- see
-    ``build_tensor_type_lines``/``tg_safe_rocmfpx``.
     """
     import subprocess
 
@@ -604,7 +539,7 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
     try:
         config = _load_mq_tier_config(out_dir, tier)
         group_patterns = TensorGroupClassifier.GROUP_PATTERNS
-        lines = build_tensor_type_lines(config, group_patterns, tg_safe=tg_safe)
+        lines = build_tensor_type_lines(config, group_patterns)
         base_type = pick_base_type(config)
     except (FileNotFoundError, KeyError, ValueError) as e:
         print(f"Error ({spec}): {e}", flush=True)
@@ -615,8 +550,7 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
     out_path = rocmfpx_out_dir / f"{model_name}-ROCMFPX-MQ-{tier}.gguf"
 
     schemes = " ".join(f"{g}:{s}" for g, s in sorted(config.items()))
-    tg_note = " (tg-safe: U/D/X steered to tg-fast siblings)" if tg_safe else ""
-    print(f"Quantizing {spec}: MagicQuant {tier} layout in ROCmFPX types{tg_note}", flush=True)
+    print(f"Quantizing {spec}: MagicQuant {tier} layout in ROCmFPX types", flush=True)
     print(f"  base={base_type}  groups={schemes}", flush=True)
 
     cmd = [str(quantize_bin), "--tensor-type-file", str(type_file)]
