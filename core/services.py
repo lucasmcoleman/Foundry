@@ -315,6 +315,11 @@ class MagicQuantService:
         rocmfpx_schemes: bool = False,
         iq_schemes: bool = False,
         seed: Optional[int] = None,
+        use_imatrix: bool = False,
+        imatrix_corpus: Optional[str] = None,
+        enable_kl: bool = False,
+        kl_weight: float = 0.1,
+        enable_speed_bench: bool = False,
     ) -> dict:
         """Build the JSON config consumed by core/_magicquant_entry.py."""
         return {
@@ -334,6 +339,11 @@ class MagicQuantService:
             "rocmfpx_schemes": rocmfpx_schemes,
             "iq_schemes": iq_schemes,
             "seed": seed,
+            "use_imatrix": use_imatrix,
+            "imatrix_corpus": imatrix_corpus,
+            "enable_kl": enable_kl,
+            "kl_weight": kl_weight,
+            "enable_speed_bench": enable_speed_bench,
         }
 
     def build_script(self, **kwargs) -> str:
