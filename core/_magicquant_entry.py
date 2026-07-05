@@ -37,7 +37,16 @@ def find_llamacpp(hint: str = "") -> str | None:
     """
     import os
 
-    candidates = [hint, os.environ.get("LLAMACPP_PATH", ""),
+    # Prefer ROCmFPX fork builds over stock llama.cpp: they measure everything
+    # stock can, auto-offload to GPU, and are the only builds that handle the
+    # rocmfp* types this pipeline exists to produce. Stock stays as fallback
+    # (it tracks upstream master, so a brand-new arch may load there first --
+    # override with the explicit hint / LLAMACPP_PATH when that happens).
+    fork_builds = sorted(
+        str(d) for d in (Path.home() / "ROCmFPX").glob("build-*")
+        if (d / "bin" / "llama-quantize").exists()
+    )
+    candidates = [hint, os.environ.get("LLAMACPP_PATH", ""), *fork_builds,
                   str(Path.home() / "llama.cpp"), "./llama.cpp", "/usr/local"]
     for p in candidates:
         if not p:

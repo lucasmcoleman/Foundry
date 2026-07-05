@@ -403,3 +403,24 @@ def test_find_llamacpp_bad_hint_warns_and_falls_back(tmp_path, capsys):
 
     entry.find_llamacpp(str(tmp_path / "nope"))
     assert "falling back to auto-detection" in capsys.readouterr().out
+
+
+def test_find_llamacpp_prefers_rocmfpx_fork_over_stock(tmp_path, monkeypatch):
+    """With no hint/env, an installed ROCmFPX fork build wins over ~/llama.cpp:
+    it measures everything stock can, GPU-offloads by default, and is the only
+    build that handles the rocmfp* types the pipeline produces."""
+    import _magicquant_entry as entry
+
+    home = tmp_path
+    fork_bin = home / "ROCmFPX" / "build-strix-rocmfp4" / "bin"
+    fork_bin.mkdir(parents=True)
+    (fork_bin / "llama-quantize").write_text("")
+    stock = home / "llama.cpp"
+    stock.mkdir()
+    (stock / "convert_hf_to_gguf.py").write_text("")
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.delenv("LLAMACPP_PATH", raising=False)
+    assert entry.find_llamacpp("") == str(fork_bin.parent)
+    # explicit hint still beats the fork preference
+    assert entry.find_llamacpp(str(stock)) == str(stock)
