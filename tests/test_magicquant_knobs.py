@@ -208,6 +208,11 @@ def fake_orchestrator(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "magicquant", fake_pkg)
     monkeypatch.setitem(sys.modules, "magicquant.orchestrator", fake_orch_mod)
     monkeypatch.setattr(entry, "find_llamacpp", lambda hint="": "/fake/llamacpp")
+    # Measured runs auto-convert a safetensors source to BF16 GGUF via
+    # convert_hf_to_gguf.py, which the fake llamacpp dir doesn't have.
+    monkeypatch.setattr(
+        entry, "_ensure_bf16_gguf", lambda llamacpp_dir, source, out_dir: source
+    )
 
     return entry
 
