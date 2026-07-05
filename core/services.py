@@ -320,6 +320,7 @@ class MagicQuantService:
         enable_kl: bool = False,
         kl_weight: float = 0.1,
         enable_speed_bench: bool = False,
+        measurement_chunks: Optional[int] = None,
     ) -> dict:
         """Build the JSON config consumed by core/_magicquant_entry.py."""
         return {
@@ -344,6 +345,7 @@ class MagicQuantService:
             "enable_kl": enable_kl,
             "kl_weight": kl_weight,
             "enable_speed_bench": enable_speed_bench,
+            "measurement_chunks": measurement_chunks,
         }
 
     def build_script(self, **kwargs) -> str:

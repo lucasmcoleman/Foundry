@@ -210,6 +210,7 @@ class MagicQuantCfg(BaseModel):
     enable_kl: bool = False          # measured-search only: real KL-divergence-to-base
     kl_weight: float = 0.1           # weight of |mean_kl| in measured-search selection
     enable_speed_bench: bool = False  # measured-search only: real tokens/sec per candidate
+    measurement_chunks: Optional[int] = None  # cap perplexity/KL passes (both search paths)
 
 class QATCfg(BaseModel):
     """QAT-LoRA stage config.
@@ -908,6 +909,7 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         "use_imatrix": mc.use_imatrix, "imatrix_corpus": mc.imatrix_corpus,
         "enable_kl": mc.enable_kl, "kl_weight": mc.kl_weight,
         "enable_speed_bench": mc.enable_speed_bench,
+        "measurement_chunks": mc.measurement_chunks,
     })
     existing_ggufs = sorted(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
     mq_key = existing_ggufs[0] if existing_ggufs else (mq_dir / "_placeholder.gguf")
@@ -949,6 +951,7 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         enable_kl=mc.enable_kl,
         kl_weight=mc.kl_weight,
         enable_speed_bench=mc.enable_speed_bench,
+        measurement_chunks=mc.measurement_chunks,
     )
     rc = await run_script(script, out)
     ok = rc == 0

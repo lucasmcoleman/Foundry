@@ -130,6 +130,13 @@ class MagicQuantConfig:
     enable_kl: bool = False
     kl_weight: float = 0.1
     enable_speed_bench: bool = False
+    # measurement_chunks: cap every perplexity/KL pass (both search paths) to
+    # this many ctx_size-token chunks instead of the whole corpus, trading
+    # statistical resolution for wall-clock time. None (default) measures the
+    # whole corpus every pass -- promotes the old env-only MAGICQUANT_PPL_
+    # CHUNKS to a real, provenance-stamped setting (see search_results.json's
+    # "measurement" block).
+    measurement_chunks: Optional[int] = None
 
 
 @dataclass
@@ -1101,6 +1108,7 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         "use_imatrix": mc.use_imatrix, "imatrix_corpus": mc.imatrix_corpus,
         "enable_kl": mc.enable_kl, "kl_weight": mc.kl_weight,
         "enable_speed_bench": mc.enable_speed_bench,
+        "measurement_chunks": mc.measurement_chunks,
     })
     existing = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.magicquant_dir / "_placeholder.gguf")
@@ -1132,6 +1140,7 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         enable_kl=mc.enable_kl,
         kl_weight=mc.kl_weight,
         enable_speed_bench=mc.enable_speed_bench,
+        measurement_chunks=mc.measurement_chunks,
     )
 
     rc = _run_stage_script(
@@ -1545,6 +1554,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--magicquant-speed-bench", action="store_true",
                         help="Also measure real tokens/sec per candidate (llama-bench) "
                              "during --magicquant-measured search")
+    parser.add_argument("--magicquant-chunks", type=int, default=None,
+                        help="Cap perplexity/KL passes to this many ctx-size chunks "
+                             "instead of the whole corpus (both measured and "
+                             "prediction-only search paths); default: whole corpus")
     parser.add_argument("--rocmfpx", action="store_true",
                         help="Enable ROCmFPX stage (AMD-tuned GGUF quants; default off)")
     parser.add_argument("--no-rocmfpx", action="store_true",
@@ -1623,6 +1636,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             cfg.magicquant.kl_weight = args.magicquant_kl_weight
         if args.magicquant_speed_bench:
             cfg.magicquant.enable_speed_bench = True
+        if args.magicquant_chunks is not None:
+            cfg.magicquant.measurement_chunks = args.magicquant_chunks
     if args.rocmfpx and not args.no_rocmfpx:
         cfg.rocmfpx = ROCmFPXConfig(
             source_model=args.rocmfpx_source_model,
