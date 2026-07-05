@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 LLAMACPP_REPO = "https://github.com/ggml-org/llama.cpp.git"
-LLAMACPP_PIN = "b4585"  # known-good release tag; bump deliberately
+LLAMACPP_PIN = "gguf-v0.19.0"  # known-good release tag; bump deliberately
 
 
 def parse_config(cfg_path: str) -> dict:
@@ -107,6 +107,32 @@ def resolve_source(override: str, out_dir: Path, pipeline_root: str) -> str | No
     return None
 
 
+def _ensure_bf16_gguf(llamacpp_dir: str, source: str, out_dir: Path) -> str:
+    import subprocess
+    if source.endswith(".gguf"):
+        return source
+    cached = out_dir / "model-bf16.gguf"
+    if cached.exists():
+        print(f"Reusing cached BF16 GGUF: {cached}", flush=True)
+        return str(cached)
+    convert_script = Path(llamacpp_dir) / "convert_hf_to_gguf.py"
+    if not convert_script.exists():
+        convert_script = Path(llamacpp_dir) / "bin" / "convert_hf_to_gguf.py"
+    if not convert_script.exists():
+        raise RuntimeError(
+            f"convert_hf_to_gguf.py not found in {llamacpp_dir} "
+            "(needed to convert safetensors -> BF16 GGUF for baseline perplexity)"
+        )
+    print(f"Converting {source} -> {cached} (BF16)...", flush=True)
+    rc = subprocess.run([
+        sys.executable, str(convert_script), source,
+        "--outfile", str(cached), "--outtype", "bf16",
+    ]).returncode
+    if rc != 0 or not cached.exists():
+        raise RuntimeError(f"convert_hf_to_gguf.py failed (exit code {rc})")
+    return str(cached)
+
+
 def run(cfg_path: str | None = None) -> None:
     if cfg_path is None:
         cfg_path = sys.argv[1]
@@ -155,6 +181,12 @@ def run(cfg_path: str | None = None) -> None:
         )
         sys.exit(1)
     print(f"MagicQuant source: {source}", flush=True)
+
+    # Measured search needs a GGUF — convert safetensors to BF16 GGUF first
+    measured = cfg.get("measured", False)
+    if measured and llamacpp and not source.endswith(".gguf"):
+        source = _ensure_bf16_gguf(llamacpp, source, out_dir)
+        print(f"MagicQuant GGUF source: {source}", flush=True)
 
     orch = MagicQuantOrchestrator(
         source_model_path=source,

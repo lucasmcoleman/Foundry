@@ -339,7 +339,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Pinned llama.cpp ref for reproducible auto-install (audit L-supply-chain).
 # Bump deliberately; clone uses --branch so it pins a tag, not the default branch.
 LLAMACPP_REPO = "https://github.com/ggml-org/llama.cpp.git"
-LLAMACPP_PIN = "b4585"  # known-good release tag
+LLAMACPP_PIN = "gguf-v0.19.0"  # known-good release tag
 
 
 def _services():
