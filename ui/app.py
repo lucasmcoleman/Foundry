@@ -211,6 +211,8 @@ class MagicQuantCfg(BaseModel):
     kl_weight: float = 0.1           # weight of |mean_kl| in measured-search selection
     enable_speed_bench: bool = False  # measured-search only: real tokens/sec per candidate
     measurement_chunks: Optional[int] = None  # cap perplexity/KL passes (both search paths)
+    stream_aware: bool = False       # bias sampling toward BF16->Q8_0 on streamed groups
+    head_aggressive: bool = False    # bias 'H' (LM head) group sampling toward smaller K-quants
 
 class QATCfg(BaseModel):
     """QAT-LoRA stage config.
@@ -910,6 +912,7 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         "enable_kl": mc.enable_kl, "kl_weight": mc.kl_weight,
         "enable_speed_bench": mc.enable_speed_bench,
         "measurement_chunks": mc.measurement_chunks,
+        "stream_aware": mc.stream_aware, "head_aggressive": mc.head_aggressive,
     })
     existing_ggufs = sorted(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
     mq_key = existing_ggufs[0] if existing_ggufs else (mq_dir / "_placeholder.gguf")
@@ -952,6 +955,8 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         kl_weight=mc.kl_weight,
         enable_speed_bench=mc.enable_speed_bench,
         measurement_chunks=mc.measurement_chunks,
+        stream_aware=mc.stream_aware,
+        head_aggressive=mc.head_aggressive,
     )
     rc = await run_script(script, out)
     ok = rc == 0
