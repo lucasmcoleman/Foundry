@@ -152,6 +152,13 @@ class ROCmFPXConfig:
     source_model: str = ""  # when export is skipped: path to GGUF or merged model dir
     rocmfpx_hint: str = ""  # path to an existing ROCmFPX/llama.cpp-fork build
     imatrix: str = ""  # optional path to an imatrix GGUF
+    # tg_safe: opt-in mq-hybrid steering (default off -- faithful translation
+    # stays the default). Steers the tg-slow Q3_0_ROCMFPX/Q6_0_ROCMFPX types
+    # to their tg-fast siblings (Q4_0_ROCMFP4/Q8_0_ROCMFPX) for the
+    # high-traffic FFN/expert groups only (U/D/X), trading a modest size
+    # increase for a meaningfully faster token-generation decode path. See
+    # _rocmfpx_entry.tg_safe_rocmfpx.
+    tg_safe: bool = False
 
 
 @dataclass
@@ -1196,6 +1203,7 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     cfg_hash = _markers().config_hash({
         "src": str(source), "formats": rc_cfg.formats, "imatrix": rc_cfg.imatrix,
+        "tg_safe": rc_cfg.tg_safe,
     })
     existing = sorted(artifacts.rocmfpx_dir.glob("*.gguf")) if artifacts.rocmfpx_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.rocmfpx_dir / "_placeholder.gguf")
@@ -1216,6 +1224,7 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         formats_json=_json.dumps(rc_cfg.formats),
         model_name=model_name,
         imatrix=rc_cfg.imatrix,
+        tg_safe=rc_cfg.tg_safe,
     )
 
     rc = _run_stage_script(
@@ -1571,6 +1580,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--rocmfpx-hint", type=str, default="",
                         help="Path to an existing ROCmFPX/llama.cpp-fork build "
                              "(default: auto-detect or auto-install)")
+    parser.add_argument("--rocmfpx-tg-safe", action="store_true",
+                        help="mq-hybrid only: steer the tg-slow Q3_0_ROCMFPX/"
+                             "Q6_0_ROCMFPX types to their tg-fast siblings "
+                             "(Q4_0_ROCMFP4/Q8_0_ROCMFPX) for the high-traffic "
+                             "FFN/expert groups (U/D/X); default off (faithful "
+                             "translation)")
     parser.add_argument("--upload-to", type=str, help="HF repo ID")
     parser.add_argument("--llamacpp-path", type=str)
     parser.add_argument("--dry-run", action="store_true",
@@ -1642,6 +1657,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         cfg.rocmfpx = ROCmFPXConfig(
             source_model=args.rocmfpx_source_model,
             rocmfpx_hint=args.rocmfpx_hint,
+            tg_safe=args.rocmfpx_tg_safe,
             **({"formats": args.rocmfpx_formats} if args.rocmfpx_formats else {}),
         )
     if args.no_rocmfpx:

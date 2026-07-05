@@ -166,6 +166,42 @@ def test_translate_scheme_rejects_unknown():
         entry.translate_scheme("NOPE_Q9")
 
 
+# ── tg-safe steering (opt-in, default off) ──────────────────────────────────
+
+def test_tg_safe_rocmfpx_steers_the_slow_types():
+    """Q3_0_ROCMFPX/Q6_0_ROCMFPX pay a bit-stitch + LUT decode tax on tg
+    (no AMD-ISA fast path); steer them to their tg-fast siblings."""
+    assert entry.tg_safe_rocmfpx("Q3_0_ROCMFPX") == "Q4_0_ROCMFP4"
+    assert entry.tg_safe_rocmfpx("Q6_0_ROCMFPX") == "Q8_0_ROCMFPX"
+
+
+@pytest.mark.parametrize("already_fast", [
+    "Q4_0_ROCMFP4", "Q4_0_ROCMFP4_FAST", "Q8_0_ROCMFPX",
+])
+def test_tg_safe_rocmfpx_leaves_already_fast_types_unchanged(already_fast):
+    assert entry.tg_safe_rocmfpx(already_fast) == already_fast
+
+
+def test_tg_safe_rocmfpx_passes_through_types_outside_the_map():
+    # Float/other types not covered by the steering map pass through as-is.
+    assert entry.tg_safe_rocmfpx("BF16") == "BF16"
+    assert entry.tg_safe_rocmfpx("F32") == "F32"
+
+
+def test_translate_scheme_tg_safe_steers_the_slow_schemes():
+    # Q3_K -> Q3_0_ROCMFPX (faithful) -> Q4_0_ROCMFP4 (steered)
+    assert entry.translate_scheme("Q3_K", tg_safe=True) == "Q4_0_ROCMFP4"
+    # Q6_K -> Q6_0_ROCMFPX (faithful) -> Q8_0_ROCMFPX (steered)
+    assert entry.translate_scheme("Q6_K", tg_safe=True) == "Q8_0_ROCMFPX"
+
+
+def test_translate_scheme_tg_safe_false_matches_faithful_default():
+    """tg_safe=False must be byte-identical to today's (no-tg_safe-arg)
+    behavior for every known scheme."""
+    for scheme in entry.SCHEME_TO_ROCMFPX:
+        assert entry.translate_scheme(scheme, tg_safe=False) == entry.translate_scheme(scheme)
+
+
 # ── opt-in MagicQuant IQ schemes (defect 1a) ────────────────────────────────
 
 @pytest.mark.parametrize("scheme,expected", [
@@ -198,11 +234,17 @@ def test_build_tensor_type_lines_succeeds_with_iq_scheme():
 
 _PATTERNS = {
     # Minimal stand-in for TensorGroupClassifier.GROUP_PATTERNS with the
-    # ordering that matters: X (fused experts) before U (dense up).
+    # ordering that matters: X (fused experts) before U (dense up). Q/K/O/H
+    # (attention + head groups) are appended after D so the append doesn't
+    # disturb the X-before-U ordering the tests above rely on.
     "E": [r"token_embd\.weight"],
     "X": [r"ffn_(up|gate|down)_exps"],
     "U": [r"ffn_up", r"ffn_gate(?!_inp)"],
     "D": [r"ffn_down(?!_exps)"],
+    "H": [r"output\.weight"],
+    "Q": [r"attn_q"],
+    "K": [r"attn_k"],
+    "O": [r"attn_output"],
 }
 
 
@@ -224,6 +266,47 @@ def test_build_tensor_type_lines_skips_groups_absent_from_config():
     config = {"E": "BF16"}  # only E present
     lines = entry.build_tensor_type_lines(config, _PATTERNS)
     assert lines == [r"token_embd\.weight=BF16"]
+
+
+# ── build_tensor_type_lines tg-safe steering (opt-in, default off) ─────────
+
+def test_build_tensor_type_lines_tg_safe_steers_only_high_traffic_groups():
+    """tg_safe=True must steer U/D/X (the bandwidth-heavy FFN/expert bulk
+    that dominates tg) to their tg-fast siblings, while attention/embedding/
+    head groups (Q/K/O/E/H) keep the faithful translation untouched."""
+    config = {
+        "E": "BF16", "H": "Q6_K",           # untouched groups
+        "Q": "Q3_K", "K": "Q3_K", "O": "Q6_K",  # untouched groups
+        "X": "Q3_K", "U": "Q6_K", "D": "Q3_K",  # steered groups
+    }
+    lines = entry.build_tensor_type_lines(config, _PATTERNS, tg_safe=True)
+    by_pattern = dict(line.split("=", 1) for line in lines)
+
+    # Attention/embedding/head groups: faithful (unsteered) translation.
+    assert by_pattern[r"token_embd\.weight"] == "BF16"
+    assert by_pattern[r"output\.weight"] == "Q6_0_ROCMFPX"
+    assert by_pattern[r"attn_q"] == "Q3_0_ROCMFPX"
+    assert by_pattern[r"attn_k"] == "Q3_0_ROCMFPX"
+    assert by_pattern[r"attn_output"] == "Q6_0_ROCMFPX"
+
+    # High-traffic FFN/expert groups: steered to their tg-fast siblings.
+    assert by_pattern[r"ffn_(up|gate|down)_exps"] == "Q4_0_ROCMFP4"  # X: fp3 -> fp4
+    assert by_pattern[r"ffn_up"] == "Q8_0_ROCMFPX"                    # U: fp6 -> Q8
+    assert by_pattern[r"ffn_gate(?!_inp)"] == "Q8_0_ROCMFPX"          # U: fp6 -> Q8
+    assert by_pattern[r"ffn_down(?!_exps)"] == "Q4_0_ROCMFP4"         # D: fp3 -> fp4
+
+
+def test_build_tensor_type_lines_tg_safe_false_is_byte_identical_to_default():
+    """tg_safe=False must be byte-identical to calling without the arg at all
+    (today's faithful-translation behavior stays the default)."""
+    config = {
+        "E": "BF16", "H": "Q6_K", "Q": "Q3_K", "K": "Q3_K", "O": "Q6_K",
+        "X": "Q3_K", "U": "Q6_K", "D": "Q3_K",
+    }
+    assert (
+        entry.build_tensor_type_lines(config, _PATTERNS, tg_safe=False)
+        == entry.build_tensor_type_lines(config, _PATTERNS)
+    )
 
 
 def test_pick_base_type_is_always_a_quantizing_type():
@@ -308,3 +391,127 @@ def test_quantize_preset_returns_none_on_bad_spec(tmp_path):
         entry.Path("/nonexistent/llama-quantize"), entry.Path("/nonexistent/model-bf16.gguf"), "",
     )
     assert result is None
+
+
+# ── _quantize_mq_hybrid tg-safe threading (opt-in, default off) ────────────
+
+def test_quantize_mq_hybrid_tg_safe_steers_the_written_type_file(tmp_path, monkeypatch):
+    """tg_safe=True must reach build_tensor_type_lines and steer the
+    high-traffic groups in the emitted --tensor-type-file, while attention
+    groups in the same tier stay faithful. The type file is written before
+    the quantize subprocess call, so stub subprocess.run to a no-op (no real
+    llama-quantize binary needed) and inspect the file it wrote."""
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1))
+
+    out_dir = tmp_path / "output"
+    mq_dir = out_dir / "magicquant"
+    mq_dir.mkdir(parents=True)
+    mq_dir.joinpath("search_results.json").write_text(json.dumps({
+        "tiered": {"Q4": {"config": {"X": "Q3_K", "Q": "Q3_K"}}}
+    }))
+    rocmfpx_out_dir = out_dir / "rocmfpx"
+    rocmfpx_out_dir.mkdir()
+
+    entry._quantize_mq_hybrid(
+        "mq-q4", "Q4", out_dir, rocmfpx_out_dir, "model",
+        entry.Path("/nonexistent/llama-quantize"), entry.Path("/nonexistent/model-bf16.gguf"), "",
+        tg_safe=True,
+    )
+    lines = (rocmfpx_out_dir / "_ttf-mq-Q4.txt").read_text().splitlines()
+    by_pattern = dict(line.split("=", 1) for line in lines if line)
+    # X (fused experts, high-traffic): steered fp3 -> fp4.
+    assert by_pattern[r"ffn_(up|gate|down)_exps"] == "Q4_0_ROCMFP4"
+    # Q (attention, not high-traffic): faithful, unsteered fp3.
+    assert by_pattern[r"attn_q\.weight"] == "Q3_0_ROCMFPX"
+
+
+def test_quantize_mq_hybrid_tg_safe_default_false_matches_faithful_output(tmp_path, monkeypatch):
+    """Calling _quantize_mq_hybrid without tg_safe (today's call sites) must
+    produce the byte-identical type file to an explicit tg_safe=False."""
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1))
+
+    out_dir = tmp_path / "output"
+    mq_dir = out_dir / "magicquant"
+    mq_dir.mkdir(parents=True)
+    mq_dir.joinpath("search_results.json").write_text(json.dumps({
+        "tiered": {"Q4": {"config": {"X": "Q3_K", "U": "Q6_K"}}}
+    }))
+
+    rocmfpx_out_dir_a = out_dir / "rocmfpx_a"
+    rocmfpx_out_dir_a.mkdir()
+    entry._quantize_mq_hybrid(
+        "mq-q4", "Q4", out_dir, rocmfpx_out_dir_a, "model",
+        entry.Path("/nonexistent/llama-quantize"), entry.Path("/nonexistent/model-bf16.gguf"), "",
+    )
+    rocmfpx_out_dir_b = out_dir / "rocmfpx_b"
+    rocmfpx_out_dir_b.mkdir()
+    entry._quantize_mq_hybrid(
+        "mq-q4", "Q4", out_dir, rocmfpx_out_dir_b, "model",
+        entry.Path("/nonexistent/llama-quantize"), entry.Path("/nonexistent/model-bf16.gguf"), "",
+        tg_safe=False,
+    )
+    assert (
+        (rocmfpx_out_dir_a / "_ttf-mq-Q4.txt").read_text()
+        == (rocmfpx_out_dir_b / "_ttf-mq-Q4.txt").read_text()
+    )
+
+
+# ── run() cfg threading (opt-in, default off) ───────────────────────────────
+
+def test_run_reads_tg_safe_from_cfg_and_forwards_it(tmp_path, monkeypatch):
+    """run() must read cfg.get("tg_safe") and pass it through to
+    _quantize_mq_hybrid for an mq-* format spec."""
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    pipeline_root = tmp_path / "pipeline"
+    (pipeline_root / "core").mkdir(parents=True)
+
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps({
+        "pipeline_root": str(pipeline_root),
+        "pipeline_root_str": str(pipeline_root),
+        "out_abs_str": str(out_dir),
+        "formats_json": json.dumps(["mq-q4"]),
+        "model_name": "model",
+        "rocmfpx_hint": "",
+        "imatrix": "",
+        "tg_safe": True,
+    }))
+
+    monkeypatch.setattr(entry, "ensure_rocmfpx", lambda hint: str(tmp_path / "rocmfpx-build"))
+    monkeypatch.setattr(entry, "resolve_source", lambda override, out, root: str(out_dir / "model.safetensors"))
+    monkeypatch.setattr(entry, "_ensure_bf16_gguf", lambda rocmfpx_dir, source, out: str(out_dir / "model-bf16.gguf"))
+
+    captured = {}
+
+    def fake_quantize_mq_hybrid(spec, tier, out, rocmfpx_out, model_name,
+                                 quantize_bin, bf16_gguf, imatrix, tg_safe=False):
+        captured["tg_safe"] = tg_safe
+        return rocmfpx_out / "fake.gguf"
+
+    monkeypatch.setattr(entry, "_quantize_mq_hybrid", fake_quantize_mq_hybrid)
+
+    entry.run(str(cfg_path))
+    assert captured["tg_safe"] is True
+
+
+# ── build_config threading (core/services.py -> _rocmfpx_entry.py) ─────────
+
+def test_rocmfpx_service_build_config_threads_tg_safe():
+    """The flag must reach the JSON config _rocmfpx_entry.run() reads, via
+    ROCmFPXService.build_config -- the same shim path CLI/UI both use."""
+    from pathlib import Path as _Path
+
+    from services import ROCmFPXService
+
+    svc = ROCmFPXService(_Path("/tmp/pipeline-root"), "/usr/bin/python3")
+    common = dict(
+        rocmfpx_hint="", pipeline_root_str="/tmp/pipeline-root",
+        source_override="", out_abs_str="/tmp/out",
+        formats_json="[]", model_name="model",
+    )
+    assert svc.build_config(**common)["tg_safe"] is False  # default off
+    assert svc.build_config(**common, tg_safe=True)["tg_safe"] is True
+    assert svc.build_config(**common, tg_safe=False)["tg_safe"] is False
