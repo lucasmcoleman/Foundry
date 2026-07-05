@@ -205,6 +205,11 @@ class MagicQuantCfg(BaseModel):
     rocmfpx_schemes: bool = False    # explore AMD-native ROCmFPX fork types
     iq_schemes: bool = False         # explore sub-4-bit stock-ggml IQ schemes
     seed: Optional[int] = None       # optional RNG seed for a reproducible search
+    use_imatrix: bool = False        # capture/reuse an importance matrix (both search paths)
+    imatrix_corpus: Optional[str] = None  # calibration corpus; None = bundled default
+    enable_kl: bool = False          # measured-search only: real KL-divergence-to-base
+    kl_weight: float = 0.1           # weight of |mean_kl| in measured-search selection
+    enable_speed_bench: bool = False  # measured-search only: real tokens/sec per candidate
 
 class QATCfg(BaseModel):
     """QAT-LoRA stage config.
@@ -900,6 +905,9 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         "source_model": mc.source_model, "measured": mc.measured,
         "measurement_rounds": mc.measurement_rounds, "rocmfpx_schemes": mc.rocmfpx_schemes,
         "iq_schemes": mc.iq_schemes, "seed": mc.seed,
+        "use_imatrix": mc.use_imatrix, "imatrix_corpus": mc.imatrix_corpus,
+        "enable_kl": mc.enable_kl, "kl_weight": mc.kl_weight,
+        "enable_speed_bench": mc.enable_speed_bench,
     })
     existing_ggufs = sorted(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
     mq_key = existing_ggufs[0] if existing_ggufs else (mq_dir / "_placeholder.gguf")
@@ -936,6 +944,11 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         rocmfpx_schemes=mc.rocmfpx_schemes,
         iq_schemes=mc.iq_schemes,
         seed=mc.seed,
+        use_imatrix=mc.use_imatrix,
+        imatrix_corpus=mc.imatrix_corpus,
+        enable_kl=mc.enable_kl,
+        kl_weight=mc.kl_weight,
+        enable_speed_bench=mc.enable_speed_bench,
     )
     rc = await run_script(script, out)
     ok = rc == 0
