@@ -19,6 +19,7 @@ tool.
 import gc
 import json
 import os
+import re
 import shutil
 import time
 
@@ -40,6 +41,102 @@ def get_device() -> torch.device:
 
 
 DEVICE = get_device()
+
+
+# ── GGUF source detection / pass-through ────────────────────────────────────
+#
+# Quantization-only runs often start from a GGUF (a local BF16 file or a HF
+# repo that publishes a whole ladder of quants). Those must NOT go through the
+# safetensors merge below — and a GGUF repo must not be snapshot-downloaded
+# wholesale (a real case pulled 245 GB / 15 quant files when only the 54.7 GB
+# BF16 was needed). MagicQuant/ROCmFPX refuse pre-quantized inputs, so only
+# BF16/F16/F32 GGUFs qualify as sources.
+
+_GGUF_PART_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
+# Highest float precision first; (?<!b)f16 so "f16" doesn't match "bf16".
+_GGUF_PRECISION_PATTERNS = (r"bf16", r"(?<!b)f16", r"f32", r"fp32")
+
+
+def pick_best_gguf(filenames):
+    """From a file listing, pick the GGUF(s) usable as a quantization source.
+
+    Chooses the highest-precision float GGUF (BF16 > F16 > F32) and returns
+    all parts of it (split GGUFs) sorted, primary part first. Returns [] when
+    the listing has no .gguf at all; raises ValueError when it has ONLY
+    quantized GGUFs (nothing MagicQuant/ROCmFPX can use as a source).
+    """
+    ggufs = [f for f in filenames if f.lower().endswith(".gguf")]
+    if not ggufs:
+        return []
+    candidates = [f for f in ggufs if "mmproj" not in Path(f).name.lower()]
+    for pattern in _GGUF_PRECISION_PATTERNS:
+        matches = [f for f in candidates if re.search(pattern, Path(f).name.lower())]
+        if not matches:
+            continue
+        primary = sorted(matches)[0]
+        m = _GGUF_PART_RE.search(primary)
+        if m:
+            stem = primary[: m.start()]
+            return sorted(f for f in candidates if f.startswith(stem))
+        return [primary]
+    raise ValueError(
+        "GGUF-only source has no BF16/F16/F32 file to quantize from "
+        "(MagicQuant/ROCmFPX refuse pre-quantized inputs). Available: "
+        + ", ".join(sorted(Path(f).name for f in ggufs))
+    )
+
+
+def detect_gguf_source(model_id: str):
+    """Return the GGUF file list for ``model_id`` if it is a GGUF source.
+
+    Pure detection — no downloads. Returns a list of repo-relative filenames
+    (or a one-element absolute path for a local .gguf file), or None when the
+    source is safetensors-shaped and should take the normal merge path.
+    """
+    p = Path(model_id)
+    if p.is_file():
+        return [str(p)] if model_id.lower().endswith(".gguf") else None
+    if p.is_dir():
+        if any(p.glob("*.safetensors")):
+            return None
+        return pick_best_gguf(sorted(str(f) for f in p.iterdir() if f.is_file())) or None
+    if p.exists() or "/" not in model_id:
+        return None
+    from huggingface_hub import list_repo_files
+
+    try:
+        files = list_repo_files(model_id)
+    except Exception:
+        return None  # unreachable repo: let the normal path raise its own error
+    if any(f.lower().endswith(".safetensors") for f in files):
+        return None
+    return pick_best_gguf(files) or None
+
+
+def resolve_gguf_source(model_id: str):
+    """Materialize a GGUF source locally, downloading ONLY the needed file(s).
+
+    Returns the local path of the (primary) GGUF, or None when ``model_id``
+    is not a GGUF source. Split GGUFs are rejected for now: downstream tools
+    resolve sibling parts relative to the given path, which a lone symlink in
+    the output dir would break — merge them first with llama-gguf-split.
+    """
+    picked = detect_gguf_source(model_id)
+    if picked is None:
+        return None
+    if len(picked) > 1:
+        raise RuntimeError(
+            f"GGUF source {model_id} is split into {len(picked)} parts; "
+            "pass-through doesn't support split GGUFs yet. Merge them first: "
+            f"llama-gguf-split --merge {Path(picked[0]).name} <out.gguf>"
+        )
+    path = Path(picked[0])
+    if path.is_absolute():
+        return str(path)
+    from huggingface_hub import hf_hub_download
+
+    print(f"GGUF repo detected — downloading only {picked[0]}", flush=True)
+    return hf_hub_download(model_id, picked[0])
 
 
 def load_lora_weights(lora_dir: str):
@@ -131,6 +228,27 @@ def streaming_merge(
     """
     from huggingface_hub import snapshot_download
 
+    gguf_src = resolve_gguf_source(model_id)
+    if gguf_src is not None:
+        if lora_dir is not None:
+            raise RuntimeError(
+                "LoRA adapters can only be merged into safetensors weights, "
+                f"but the source is a GGUF ({gguf_src}). Point --model at the "
+                "original safetensors repo, or drop the adapters."
+            )
+        # Pass-through: no merge to do. Link the GGUF where downstream stages
+        # (MagicQuant/ROCmFPX resolve_source) already look for it. The name is
+        # a convention — the file may be F16/F32 if the repo has no BF16.
+        out_root = Path(merged_dir).parent
+        out_root.mkdir(parents=True, exist_ok=True)
+        link = out_root / "model-bf16.gguf"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        os.symlink(gguf_src, link)
+        print(f"GGUF source detected — nothing to merge. Linked {gguf_src} "
+              f"-> {link} for the quantization stages.", flush=True)
+        return
+
     if lora_dir is not None:
         print(f"Loading LoRA from {lora_dir}")
         lora_config, lora_weights = load_lora_weights(lora_dir)
@@ -140,7 +258,8 @@ def streaming_merge(
         lora_map = {}
 
     print(f"\nEnsuring base model cached: {model_id}")
-    model_path = snapshot_download(model_id)
+    # Safetensors repos sometimes also publish GGUF quants — don't pull those.
+    model_path = snapshot_download(model_id, ignore_patterns=["*.gguf"])
 
     # Multi-shard models have an index.json; single-shard models have a single
     # model.safetensors file with no index.

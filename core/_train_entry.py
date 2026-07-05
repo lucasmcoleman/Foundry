@@ -204,6 +204,16 @@ def run(cfg_path: str | None = None) -> None:
     output_dir = cfg["output_dir"]
     max_seq_length = cfg["max_seq_length"]
 
+    from fast_export import detect_gguf_source
+
+    if detect_gguf_source(model_name) is not None:
+        raise RuntimeError(
+            f"Training requires safetensors weights, but {model_name!r} is a "
+            "GGUF source. Disable the training and export stages — GGUF "
+            "sources pass straight through to MagicQuant/ROCmFPX — or point "
+            "--model at the original safetensors repo."
+        )
+
     hf_cache_probe(model_name)
     model, tokenizer = fast_load_quantized_model(model_name)
 
