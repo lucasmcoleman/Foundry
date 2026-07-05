@@ -239,6 +239,10 @@ class ROCmFPXCfg(BaseModel):
     rocmfpx_hint: str = ""  # path to an existing ROCmFPX/llama.cpp-fork build
     source_model: str = ""  # when export is skipped: path to GGUF or merged model dir
     imatrix: str = ""  # optional path to an imatrix GGUF
+    # tg_safe: mq-hybrid only. Steers the tg-slow Q3_0_ROCMFPX/Q6_0_ROCMFPX
+    # types to their tg-fast siblings for the high-traffic FFN/expert groups
+    # (U/D/X); default off (faithful translation).
+    tg_safe: bool = False
 
 class UploadCfg(BaseModel):
     repo_id: str = ""
@@ -984,7 +988,7 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
     rc_dir = out_abs / "rocmfpx"
     rc_hash = markers.config_hash({
         "formats": rc_cfg.formats, "imatrix": rc_cfg.imatrix,
-        "source_model": rc_cfg.source_model,
+        "source_model": rc_cfg.source_model, "tg_safe": rc_cfg.tg_safe,
     })
     existing_ggufs = sorted(rc_dir.glob("*.gguf")) if rc_dir.exists() else []
     rc_key = existing_ggufs[0] if existing_ggufs else (rc_dir / "_placeholder.gguf")
@@ -1010,6 +1014,7 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
         formats_json=json.dumps(rc_cfg.formats),
         model_name=model_name,
         imatrix=rc_cfg.imatrix,
+        tg_safe=rc_cfg.tg_safe,
     )
     rc = await run_script(script, out)
     ok = rc == 0

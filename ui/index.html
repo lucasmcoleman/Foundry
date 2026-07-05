@@ -604,7 +604,7 @@ const S = {
     reap: { compression_ratio: 0.25, prune_method: 'reap', samples_per_category: 512, model_max_length: 2048, dataset_name: 'theblackcat102/evol-codealpaca-v1', seed: 42 },
     qat: { config_source: '', tier: 'Q4', dataset: '', lora_r: 32, lora_alpha: 64.0, epochs: 1.0, max_steps: -1, lr: 0.0002, max_seq_len: 512 },
     magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, iq_schemes: false, seed: null, use_imatrix: false, imatrix_corpus: null, enable_kl: false, kl_weight: 0.1, enable_speed_bench: false, measurement_chunks: null },
-    rocmfpx: { formats: ['rocmfp4-agent','rocmfp6-agent','rocmfp8-agent'], rocmfpx_hint: '', source_model: '', imatrix: '' },
+    rocmfpx: { formats: ['rocmfp4-agent','rocmfp6-agent','rocmfp8-agent'], rocmfpx_hint: '', source_model: '', imatrix: '', tg_safe: false },
     upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
   mqTiers: ['Q2','Q3','Q4','Q5','Q6','Q8'],
@@ -1354,6 +1354,7 @@ function renderROCmFPX() {
     ${needsSource ? `<div class="form-group span-2">${L('Source Model','Path to a GGUF file or merged safetensors directory. If left empty, will look for existing artifacts in the output directory.')}<input class="form-input" data-key="rocmfpx.source_model" value="${c.source_model}" placeholder="auto-detect from output directory"></div>` : ''}
     <div class="form-group span-2">${L('ROCmFPX Build Path','Path to an existing ROCmFPX/llama.cpp-fork build (must expose llama-quantize). Leave empty to auto-detect or auto-install.')}<input class="form-input" data-key="rocmfpx.rocmfpx_hint" value="${c.rocmfpx_hint}" placeholder="auto-detect / auto-install"></div>
     <div class="form-group span-2">${L('imatrix Path','Optional importance-matrix GGUF, forwarded to llama-quantize --imatrix. Improves low-bit (rocmfp3/rocmfp4) quality.')}<input class="form-input" data-key="rocmfpx.imatrix" value="${c.imatrix}" placeholder="(none)"></div>
+    <div class="form-group span-2">${L('tg-safe steering (mq-hybrid)','Steers the tg-slow Q3_0_ROCMFPX/Q6_0_ROCMFPX types to their tg-fast siblings (Q4_0_ROCMFP4/Q8_0_ROCMFPX) for the high-traffic FFN/expert groups only (U/D/X) when producing mq-* hybrid formats. Trades a modest size increase for meaningfully faster token generation. Off by default (faithful translation).')}<label class="toggle"><input type="checkbox" data-key="rocmfpx.tg_safe" ${c.tg_safe?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
     <div class="form-group span-2">
       ${L('Formats','Which ROCmFPX format/profile pairs to produce. "agent" presets protect tensors that affect tool-calling/JSON/coding structure; "straight" presets are size-optimal.')}
       <div class="tag-list">${S.rcFormats.map(f=>`<div class="tag ${sel.has(f)?'selected':''}" data-format="${f}" onclick="toggleFormat('${f}')">${f}</div>`).join('')}</div>
