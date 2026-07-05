@@ -603,7 +603,7 @@ const S = {
     heretic: { n_trials: 200, n_startup_trials: 60, quantization: 'bnb_4bit', kl_divergence_scale: 1.0, orthogonalize_direction: false, row_normalization: 'none' },
     reap: { compression_ratio: 0.25, prune_method: 'reap', samples_per_category: 512, model_max_length: 2048, dataset_name: 'theblackcat102/evol-codealpaca-v1', seed: 42 },
     qat: { config_source: '', tier: 'Q4', dataset: '', lora_r: 32, lora_alpha: 64.0, epochs: 1.0, max_steps: -1, lr: 0.0002, max_seq_len: 512 },
-    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, iq_schemes: false, seed: null, use_imatrix: false, imatrix_corpus: null, enable_kl: false, kl_weight: 0.1, enable_speed_bench: false },
+    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, iq_schemes: false, seed: null, use_imatrix: false, imatrix_corpus: null, enable_kl: false, kl_weight: 0.1, enable_speed_bench: false, measurement_chunks: null },
     rocmfpx: { formats: ['rocmfp4-agent','rocmfp6-agent','rocmfp8-agent'], rocmfpx_hint: '', source_model: '', imatrix: '' },
     upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
@@ -1330,6 +1330,7 @@ function renderMagicQuant() {
     <div class="form-group">${L('KL-Divergence Scoring','Also measure real KL-divergence-to-base for each candidate during measured search (via llama-perplexity --kl-divergence) and blend it into final-survivor selection.')}<label class="toggle"><input type="checkbox" data-key="magicquant.enable_kl" ${c.enable_kl?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
     <div class="form-group">${L('KL Weight','Weight applied to |mean_kl| when blending KL-divergence into the measured-search selection score.')}<input class="form-input" type="number" step="0.01" data-key="magicquant.kl_weight" value="${c.kl_weight}"></div>
     <div class="form-group span-2">${L('Speed Bench','Also measure real tokens/sec per candidate via llama-bench during measured search. Informational — recorded in search_results.json, not fed into per-generation scoring.')}<label class="toggle"><input type="checkbox" data-key="magicquant.enable_speed_bench" ${c.enable_speed_bench?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+    <div class="form-group">${L('Measurement Chunks','Cap perplexity/KL passes to this many ctx-size chunks instead of the whole corpus, trading statistical resolution for wall-clock time. Blank = whole corpus.')}<input class="form-input" type="number" data-key="magicquant.measurement_chunks" value="${c.measurement_chunks ?? ''}" placeholder="(whole corpus)"></div>
     ` : ''}
   </div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">MagicQuant</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>

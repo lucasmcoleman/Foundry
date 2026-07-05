@@ -37,6 +37,7 @@ def test_magicquant_config_new_knob_defaults():
     assert mc.enable_kl is False
     assert mc.kl_weight == 0.1
     assert mc.enable_speed_bench is False
+    assert mc.measurement_chunks is None
 
 
 # ── core/pipeline.py: CLI flag wiring ─────────────────────────────────────────
@@ -75,6 +76,35 @@ def test_magicquant_cli_flags_wire_into_config(monkeypatch):
     assert mc.enable_speed_bench is True
 
 
+def test_magicquant_chunks_cli_flag_wires_into_config(monkeypatch):
+    """--magicquant-chunks is unconditional (like --magicquant-use-imatrix) --
+    it must land in the config whether or not --magicquant-measured is set,
+    since it also caps run_full_search's baseline pass."""
+    pl = _pipeline()
+    captured = {}
+
+    def _fake_run_pipeline(cfg, **kwargs):
+        captured["cfg"] = cfg
+        return {"magicquant": True}
+
+    monkeypatch.setattr(pl, "run_pipeline", _fake_run_pipeline)
+
+    pl.main(["--model", "org/m", "--no-export", "--no-heretic", "--no-reap"])
+    assert captured["cfg"].magicquant.measurement_chunks is None
+
+    pl.main([
+        "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
+        "--magicquant-chunks", "8",
+    ])
+    assert captured["cfg"].magicquant.measurement_chunks == 8
+
+    pl.main([
+        "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
+        "--magicquant-measured", "--magicquant-chunks", "8",
+    ])
+    assert captured["cfg"].magicquant.measurement_chunks == 8
+
+
 def test_magicquant_kl_weight_only_applied_when_kl_flag_set(monkeypatch):
     """--magicquant-kl-weight alone (without --magicquant-kl) must not silently
     enable KL scoring -- mirrors --magicquant-rounds only applying under
@@ -105,7 +135,8 @@ def test_stage_magicquant_hash_source_includes_new_knobs():
     tests/test_stage_cleanup.py's source-text assertions)."""
     src = (ROOT / "core" / "pipeline.py").read_text()
     hash_block = src[src.index('def stage_magicquant'):src.index('existing = sorted(artifacts.magicquant_dir')]
-    for key in ("use_imatrix", "imatrix_corpus", "enable_kl", "kl_weight", "enable_speed_bench"):
+    for key in ("use_imatrix", "imatrix_corpus", "enable_kl", "kl_weight",
+                "enable_speed_bench", "measurement_chunks"):
         assert f'"{key}": mc.{key}' in hash_block, key
 
 
@@ -119,12 +150,14 @@ def test_magicquant_build_config_carries_new_knobs():
         target_base_quant="IQ4_NL", tiers_json="{}", model_name="m", verify=False,
         use_imatrix=True, imatrix_corpus="calib.txt",
         enable_kl=True, kl_weight=0.42, enable_speed_bench=True,
+        measurement_chunks=8,
     )
     assert cfg["use_imatrix"] is True
     assert cfg["imatrix_corpus"] == "calib.txt"
     assert cfg["enable_kl"] is True
     assert cfg["kl_weight"] == 0.42
     assert cfg["enable_speed_bench"] is True
+    assert cfg["measurement_chunks"] == 8
     assert json.loads(json.dumps(cfg)) == cfg
 
 
@@ -140,6 +173,7 @@ def test_magicquant_build_config_new_knobs_default():
     assert cfg["enable_kl"] is False
     assert cfg["kl_weight"] == 0.1
     assert cfg["enable_speed_bench"] is False
+    assert cfg["measurement_chunks"] is None
 
 
 # ── core/_magicquant_entry.py: run() wiring to the orchestrator ──────────────
@@ -160,13 +194,14 @@ class _FakeOrchestrator:
     def run_full_search(
         self, target_base_quant="MXFP4_MOE", max_generations=50, population_size=100,
         verbose=True, patience=None, enable_rocmfpx=False, enable_iq=False,
-        seed=None, use_imatrix=False, imatrix_corpus=None,
+        seed=None, use_imatrix=False, imatrix_corpus=None, measurement_chunks=None,
     ):
         self.run_full_search_kwargs = dict(
             target_base_quant=target_base_quant, max_generations=max_generations,
             population_size=population_size, verbose=verbose, patience=patience,
             enable_rocmfpx=enable_rocmfpx, enable_iq=enable_iq, seed=seed,
             use_imatrix=use_imatrix, imatrix_corpus=imatrix_corpus,
+            measurement_chunks=measurement_chunks,
         )
         return [], {"Q4": {"config": {}}}
 
@@ -175,6 +210,7 @@ class _FakeOrchestrator:
         measurement_rounds=3, candidates_per_round=4, verbose=True, patience=None,
         enable_rocmfpx=False, enable_iq=False, seed=None, use_imatrix=False,
         imatrix_corpus=None, enable_kl=False, kl_weight=0.1, enable_speed_bench=False,
+        measurement_chunks=None,
     ):
         self.run_measured_search_kwargs = dict(
             target_base_quant=target_base_quant, search_generations=search_generations,
@@ -183,6 +219,7 @@ class _FakeOrchestrator:
             enable_rocmfpx=enable_rocmfpx, enable_iq=enable_iq, seed=seed,
             use_imatrix=use_imatrix, imatrix_corpus=imatrix_corpus, enable_kl=enable_kl,
             kl_weight=kl_weight, enable_speed_bench=enable_speed_bench,
+            measurement_chunks=measurement_chunks,
         )
         return [], {"Q4": {"config": {}}}
 
@@ -240,6 +277,7 @@ def _write_cfg(tmp_path, src_file, **overrides):
         "enable_kl": False,
         "kl_weight": 0.1,
         "enable_speed_bench": False,
+        "measurement_chunks": None,
     }
     cfg.update(overrides)
     cfg_path = tmp_path / "cfg.json"
@@ -261,6 +299,7 @@ def test_entry_run_full_search_gets_imatrix_but_not_measured_only_knobs(
         tmp_path, src_file,
         measured=False, use_imatrix=True, imatrix_corpus="calib.txt",
         enable_kl=True, kl_weight=0.42, enable_speed_bench=True,
+        measurement_chunks=6,
     )
 
     fake_orchestrator.run(str(cfg_path))
@@ -271,6 +310,9 @@ def test_entry_run_full_search_gets_imatrix_but_not_measured_only_knobs(
     assert kw is not None
     assert kw["use_imatrix"] is True
     assert kw["imatrix_corpus"] == "calib.txt"
+    # measurement_chunks reaches run_full_search too -- it caps the (single)
+    # baseline perplexity pass, symmetric with the measured path.
+    assert kw["measurement_chunks"] == 6
 
 
 def test_entry_run_measured_search_gets_all_five_knobs(fake_orchestrator, tmp_path):
@@ -280,6 +322,7 @@ def test_entry_run_measured_search_gets_all_five_knobs(fake_orchestrator, tmp_pa
         tmp_path, src_file,
         measured=True, use_imatrix=True, imatrix_corpus="calib.txt",
         enable_kl=True, kl_weight=0.42, enable_speed_bench=True,
+        measurement_chunks=6,
     )
 
     fake_orchestrator.run(str(cfg_path))
@@ -293,6 +336,18 @@ def test_entry_run_measured_search_gets_all_five_knobs(fake_orchestrator, tmp_pa
     assert kw["enable_kl"] is True
     assert kw["kl_weight"] == 0.42
     assert kw["enable_speed_bench"] is True
+    assert kw["measurement_chunks"] == 6
+
+
+def test_entry_measurement_chunks_defaults_to_none(fake_orchestrator, tmp_path):
+    src_file = tmp_path / "src.safetensors"
+    src_file.write_bytes(b"x")
+    cfg_path = _write_cfg(tmp_path, src_file, measured=True)
+
+    fake_orchestrator.run(str(cfg_path))
+
+    inst = _FakeOrchestrator.instances[-1]
+    assert inst.run_measured_search_kwargs["measurement_chunks"] is None
 
 
 def test_entry_empty_imatrix_corpus_normalized_to_none(fake_orchestrator, tmp_path):
@@ -320,6 +375,7 @@ def test_magicquantcfg_new_knob_defaults():
     assert c.enable_kl is False
     assert c.kl_weight == 0.1
     assert c.enable_speed_bench is False
+    assert c.measurement_chunks is None
 
 
 def test_magicquantcfg_accepts_new_knobs():
@@ -328,24 +384,28 @@ def test_magicquantcfg_accepts_new_knobs():
     c = app_module.MagicQuantCfg(
         use_imatrix=True, imatrix_corpus="calib.txt",
         enable_kl=True, kl_weight=0.3, enable_speed_bench=True,
+        measurement_chunks=8,
     )
     assert c.use_imatrix is True
     assert c.imatrix_corpus == "calib.txt"
     assert c.enable_kl is True
     assert c.kl_weight == 0.3
     assert c.enable_speed_bench is True
+    assert c.measurement_chunks == 8
 
 
 def test_do_magicquant_hash_source_includes_new_knobs():
     src = (ROOT / "ui" / "app.py").read_text()
     hash_block = src[src.index("async def do_magicquant"):src.index("existing_ggufs = sorted(mq_dir.glob")]
-    for key in ("use_imatrix", "imatrix_corpus", "enable_kl", "kl_weight", "enable_speed_bench"):
+    for key in ("use_imatrix", "imatrix_corpus", "enable_kl", "kl_weight",
+                "enable_speed_bench", "measurement_chunks"):
         assert f'"{key}": mc.{key}' in hash_block, key
     assert "use_imatrix=mc.use_imatrix" in src
     assert "imatrix_corpus=mc.imatrix_corpus" in src
     assert "enable_kl=mc.enable_kl" in src
     assert "kl_weight=mc.kl_weight" in src
     assert "enable_speed_bench=mc.enable_speed_bench" in src
+    assert "measurement_chunks=mc.measurement_chunks" in src
 
 
 # ── ui/index.html: MagicQuant card exposes + gates the new controls ──────────
@@ -364,12 +424,16 @@ def test_index_html_serves_magicquant_new_knob_controls():
     assert "magicquant.enable_kl" in body
     assert "magicquant.kl_weight" in body
     assert "magicquant.enable_speed_bench" in body
+    assert "magicquant.measurement_chunks" in body
 
 
 def test_index_html_gates_kl_and_speed_bench_behind_measured():
     """KL and speed-bench controls must only render when c.measured is true;
     use_imatrix/imatrix_corpus are NOT measured-gated (run_full_search also
-    accepts them, per the entry.py wiring)."""
+    accepts them, per the entry.py wiring). measurement_chunks is gated the
+    same as KL/speed-bench, even though it too reaches run_full_search --
+    it's shown alongside the other measured-search-only controls to avoid
+    cluttering the default (prediction-only) view."""
     src = (ROOT / "ui" / "index.html").read_text()
     fn_start = src.index("function renderMagicQuant()")
     fn_end = src.index("function renderROCmFPX()")
@@ -378,6 +442,7 @@ def test_index_html_gates_kl_and_speed_bench_behind_measured():
     assert "magicquant.enable_kl" in gated
     assert "magicquant.kl_weight" in gated
     assert "magicquant.enable_speed_bench" in gated
+    assert "magicquant.measurement_chunks" in gated
     ungated = body[:body.index("c.measured ?")]
     assert "magicquant.use_imatrix" in ungated
     assert "magicquant.imatrix_corpus" in ungated
