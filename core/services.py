@@ -435,7 +435,6 @@ class ROCmFPXService:
         formats_json: str,
         model_name: str,
         imatrix: str = "",
-        tg_safe: bool = False,
     ) -> dict:
         """Build the JSON config consumed by core/_rocmfpx_entry.py."""
         return {
@@ -447,7 +446,6 @@ class ROCmFPXService:
             "formats_json": formats_json,
             "model_name": model_name,
             "imatrix": imatrix,
-            "tg_safe": tg_safe,
         }
 
     def build_script(self, **kwargs) -> str:
