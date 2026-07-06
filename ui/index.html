@@ -344,7 +344,7 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 .history-log-placeholder { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-3); font-size: 13px; }
 .history-empty { padding: 40px; text-align: center; color: var(--text-3); font-size: 13px; }
 .history-gguf-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
-.history-gguf { font-size: 10px; padding: 2px 6px; border-radius: 3px; background: rgba(168,85,247,0.1); color: var(--purple); border: 1px solid rgba(168,85,247,0.3); }
+.history-gguf { font-size: 10px; padding: 2px 6px; border-radius: 3px; background: rgba(168,85,247,0.1); color: var(--purple); border: 1px solid rgba(168,85,247,0.3); cursor: pointer; }
 
 @media (max-width: 768px) {
   .history-panel { width: 95vw; height: 90vh; }
@@ -1549,7 +1549,7 @@ async function loadRunHistory() {
       artifacts.push(`<span class="history-artifact ${run.has_lora ? 'yes' : 'no'}">LoRA ${run.has_lora ? '\u2713' : '\u2717'}</span>`);
       artifacts.push(`<span class="history-artifact ${run.has_merged ? 'yes' : 'no'}">Merged ${run.has_merged ? '\u2713' : '\u2717'}</span>`);
 
-      const ggufs = (run.ggufs || []).map(g => `<span class="history-gguf">${g.name} (${g.size_gb}GB)</span>`).join('');
+      const ggufs = (run.ggufs || []).map(g => `<span class="history-gguf" title="Click for the recommended serve command" onclick="event.stopPropagation();loadServeCommand('${run.model}','${g.name}')">${g.name} (${g.size_gb}GB)</span>`).join('');
 
       const logs = (run.logs || []).map(log => {
         const ts = new Date(log.modified * 1000).toLocaleString();
@@ -1570,6 +1570,48 @@ async function loadRunHistory() {
     }).join('');
   } catch (e) {
     listEl.innerHTML = `<div class="history-empty">Failed to load runs: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+/** Fetch and display the recommended llama-server command for a produced GGUF. */
+async function loadServeCommand(model, gguf) {
+  clearTimeout(window._logRefreshTimer);
+  document.querySelectorAll('.history-log-entry.active').forEach(e => e.classList.remove('active'));
+
+  const content = document.getElementById('history-log-content');
+  const header = document.getElementById('history-log-header');
+  const title = document.getElementById('hlv-title');
+  const meta = document.getElementById('hlv-meta');
+
+  content.innerHTML = '<div class="history-log-placeholder">Loading...</div>';
+  header.style.display = 'flex';
+  title.textContent = `${model} / ${gguf} — serve command`;
+  meta.innerHTML = '';
+
+  try {
+    const r = await authFetch(`/api/serve-command/${encodeURIComponent(model)}`);
+    if (!r.ok) {
+      const e = await r.json();
+      content.innerHTML = `<div class="history-log-placeholder" style="color:var(--red)">${escapeHtml(e.detail || 'Failed to load')}</div>`;
+      return;
+    }
+    const data = await r.json();
+    const entry = (data.commands || []).find(c => c.name === gguf);
+    if (!entry) {
+      content.innerHTML = '<div class="history-log-placeholder">No serve command available for this file.</div>';
+      return;
+    }
+    meta.innerHTML = entry.mtp
+      ? '<span style="color:var(--amber)">MTP speculative decoding auto-enabled (~1.7x measured generation speedup)</span>'
+      : 'Standard decoding (no MTP draft tensors detected)';
+
+    const pre = document.createElement('div');
+    pre.style.cssText = 'white-space:pre-wrap;word-break:break-all;';
+    pre.textContent = entry.command;
+    content.innerHTML = '';
+    content.appendChild(pre);
+  } catch (e) {
+    content.innerHTML = `<div class="history-log-placeholder" style="color:var(--red)">Error: ${escapeHtml(e.message)}</div>`;
   }
 }
 
