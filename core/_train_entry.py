@@ -215,7 +215,11 @@ def run(cfg_path: str | None = None) -> None:
         )
 
     hf_cache_probe(model_name)
-    model, tokenizer = fast_load_quantized_model(model_name)
+    from fast_train_zeroclaw import resolve_attn_implementation, resolve_packing
+    attn_implementation = resolve_attn_implementation()
+    model, tokenizer = fast_load_quantized_model(
+        model_name, attn_implementation=attn_implementation
+    )
 
     # Ensure the tokenizer has a chat template (some models ship none).
     if not getattr(tokenizer, "chat_template", None):
@@ -260,7 +264,9 @@ def run(cfg_path: str | None = None) -> None:
     if resume_ckpt:
         print(f"Resuming from checkpoint: {resume_ckpt}", flush=True)
 
-    packing = cfg["packing"]
+    packing, packing_note = resolve_packing(cfg["packing"], attn_implementation)
+    if packing_note:
+        print(f"WARNING: {packing_note}", flush=True)
     sft_kwargs = dict(
         output_dir=output_dir,
         num_train_epochs=cfg["num_train_epochs"],
