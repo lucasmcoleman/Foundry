@@ -44,6 +44,7 @@ from services import (
     ROCmFPXService,
     UploadService,
 )
+from serving import build_serve_command, detect_mtp, format_serve_command
 
 
 def _training_marker_hash(tc) -> str:
@@ -1475,6 +1476,33 @@ async def get_run_log(model: str, logfile: str):
         "content": content if len(content) < 500_000 else "\n".join(lines[-2000:]),
         "truncated": len(content) >= 500_000,
     }
+
+
+@app.get("/api/serve-command/{model}", dependencies=[Depends(verify_api_key)])
+async def get_serve_command(model: str):
+    """Recommended llama-server invocation for each GGUF a run produced.
+
+    Read-only: reports whether each GGUF auto-enables MTP speculative
+    decoding (~1.7x measured generation speedup) and the exact command to
+    serve it optimally on this box.
+    """
+    if not re.match(r'^[\w\-.]+$', model):
+        raise HTTPException(status_code=400, detail="Invalid name")
+
+    model_dir = FOUNDRY_DIR / "output" / model
+    if not model_dir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    ggufs = sorted(model_dir.glob("magicquant/*.gguf")) + sorted(model_dir.glob("rocmfpx/*.gguf"))
+    commands = [
+        {
+            "name": gguf.name,
+            "mtp": detect_mtp(str(gguf)),
+            "command": format_serve_command(build_serve_command(str(gguf))),
+        }
+        for gguf in ggufs
+    ]
+    return {"model": model, "commands": commands}
 
 
 _pipeline_lock = asyncio.Lock()

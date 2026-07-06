@@ -18,6 +18,7 @@ lint:
 	python -m py_compile core/markers.py
 	python -m py_compile core/preflight.py
 	python -m py_compile core/reap_common.py
+	python -m py_compile core/serving.py
 	python -m py_compile ui/app.py
 
 format:
