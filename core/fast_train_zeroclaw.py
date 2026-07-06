@@ -223,6 +223,11 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
     total_t0 = time.time()
     loaded = 0
     total = len(weight_map)
+    # Checkpoint tensors whose module path doesn't exist on the instantiated
+    # architecture (e.g. a bundled MTP/nextn speculative head on a plain
+    # CausalLM). Skipped and reported; core "model.*" tensors are never
+    # allowed to skip — that would mean real breakage, so we fail loudly.
+    skipped_missing = []
 
     for shard_idx, (shard_name, tensor_names) in enumerate(sorted(shards.items())):
         shard_path = os.path.join(model_path, shard_name)
@@ -240,8 +245,12 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
                 # Navigate the module tree using the (possibly remapped) name.
                 parts = name.split(".")
                 target = model
-                for part in parts[:-1]:
-                    target = getattr(target, part)
+                try:
+                    for part in parts[:-1]:
+                        target = getattr(target, part)
+                except AttributeError:
+                    skipped_missing.append(name)
+                    continue
                 attr = parts[-1]
 
                 # Read tensor from shard using the original (on-disk) key.
@@ -278,6 +287,21 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
         elapsed = time.time() - t0
         total_elapsed = time.time() - total_t0
         print(f"  Done in {elapsed:.1f}s | Progress: {loaded}/{total} ({100*loaded/total:.0f}%) | Total: {total_elapsed:.0f}s")
+
+    if skipped_missing:
+        core = [n for n in skipped_missing if n.startswith("model.")]
+        if core:
+            raise RuntimeError(
+                f"{len(core)} core checkpoint tensors have no matching module on "
+                f"{type(model).__name__} (e.g. {core[0]}) — the weight remap is "
+                "wrong for this architecture; refusing to train a partial model."
+            )
+        prefixes = sorted({n.split(".")[0] for n in skipped_missing})
+        print(
+            f"  Skipped {len(skipped_missing)} checkpoint tensors with no matching "
+            f"module on {type(model).__name__} (prefixes: {', '.join(prefixes)}) — "
+            "extra weights (e.g. MTP/speculative head) not used in training."
+        )
 
     # Handle tied weights (e.g. lm_head.weight = embed_tokens.weight) and any
     # other parameters still on meta device after shard loading.
