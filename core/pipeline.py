@@ -1610,8 +1610,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                              "prediction-only search paths); default: whole corpus")
     parser.add_argument("--magicquant-stream-aware", action="store_true",
                         help="Bias MagicQuant's search sampling toward BF16->Q8_0 on "
-                             "streamed matmul groups (recommended: ~+18% gen speed, "
-                             "-16% size, PPL-neutral; ~-8% prompt speed)")
+                             "streamed matmul groups (recommended: ~+18%% gen speed, "
+                             "-16%% size, PPL-neutral; ~-8%% prompt speed)")
     parser.add_argument("--magicquant-head-aggressive", action="store_true",
                         help="Bias MagicQuant's search sampling for the 'H' (LM head) "
                              "group toward smaller K-quants (superseded by "
