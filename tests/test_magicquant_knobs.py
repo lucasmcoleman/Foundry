@@ -953,3 +953,13 @@ def test_find_llamacpp_prefers_rocmfpx_fork_over_stock(tmp_path, monkeypatch):
     assert entry.find_llamacpp("") == str(fork_bin.parent)
     # explicit hint still beats the fork preference
     assert entry.find_llamacpp(str(stock)) == str(stock)
+
+
+def test_pipeline_help_does_not_crash():
+    """argparse expands help via '<help> % params', so a literal '%' in a help
+    string (e.g. '+18% gen speed') raises TypeError and breaks --help entirely.
+    Regression guard for the --magicquant-stream-aware help string."""
+    pl = _pipeline()
+    with pytest.raises(SystemExit) as exc:  # --help exits 0, never TypeError
+        pl.main(["--help"])
+    assert exc.value.code == 0

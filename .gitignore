@@ -49,3 +49,4 @@ unsloth_compiled_cache/
 
 # Spec/plan working dirs (tracked separately if needed)
 # (intentionally NOT ignored: docs/superpowers/ is committed)
+.foundry_ui_key
