@@ -145,6 +145,35 @@ class MagicQuantConfig:
     # most models. Off by default (unbiased sampling, historical behavior).
     stream_aware: bool = False
     head_aggressive: bool = False
+    # speed_aware/speed_metric: measured-search-only final-survivor selection
+    # bias (see MagicQuantOrchestrator.run_measured_search / _speed_aware_pick).
+    # Within a tier, prefer the fastest near-tied measured candidate instead of
+    # the flat quality-best. Off by default (unbiased selection, historical
+    # behavior); a no-op for prediction-only search (run_full_search never
+    # measures candidates for real, so there's nothing to re-rank).
+    speed_aware: bool = False
+    speed_metric: str = "bytes"  # "bytes" (deterministic size) | "bench" (measured tg)
+    # speed_weight/use_bytes_tps: tps-aware SEARCH objective (both search
+    # paths -- see _build_objective_weights). speed_weight reserves this much
+    # weight for the objective's speed term, renormalizing precision:size to
+    # fill the remainder; None (default) leaves today's fixed 0.50/0.35/0.15
+    # weights unchanged. use_bytes_tps scores the speed term deterministically
+    # from predicted size instead of the noisier speed_multiplier path --
+    # recommended whenever speed_weight is set. NOTE: the objective alone only
+    # reshapes per-candidate scoring within each size band; it's speed_aware
+    # (above) that actually changes which candidate wins each tier in measured
+    # search -- the two are meant to be paired.
+    speed_weight: Optional[float] = None
+    use_bytes_tps: bool = False
+    # calibration_source/write_calibration: empirically calibrated noise
+    # factors/speed multipliers (see magicquant.quant.calibration).
+    # calibration_source loads them from this file instead of the fixed
+    # tools/calibration_results.json path (both search paths). write_calibration
+    # fits + writes <output>/noise_calibration.json from THIS measured run's
+    # measurements (measured-search only; best-effort -- a fitting failure is
+    # logged and never blocks a successful search from completing).
+    calibration_source: str = ""
+    write_calibration: bool = False
 
 
 @dataclass
@@ -1118,6 +1147,10 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         "enable_speed_bench": mc.enable_speed_bench,
         "measurement_chunks": mc.measurement_chunks,
         "stream_aware": mc.stream_aware, "head_aggressive": mc.head_aggressive,
+        "speed_aware": mc.speed_aware, "speed_metric": mc.speed_metric,
+        "speed_weight": mc.speed_weight, "use_bytes_tps": mc.use_bytes_tps,
+        "calibration_source": mc.calibration_source,
+        "write_calibration": mc.write_calibration,
     })
     existing = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.magicquant_dir / "_placeholder.gguf")
@@ -1152,6 +1185,12 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         measurement_chunks=mc.measurement_chunks,
         stream_aware=mc.stream_aware,
         head_aggressive=mc.head_aggressive,
+        speed_aware=mc.speed_aware,
+        speed_metric=mc.speed_metric,
+        speed_weight=mc.speed_weight,
+        use_bytes_tps=mc.use_bytes_tps,
+        calibration_source=mc.calibration_source,
+        write_calibration=mc.write_calibration,
     )
 
     rc = _run_stage_script(
@@ -1577,6 +1616,39 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="Bias MagicQuant's search sampling for the 'H' (LM head) "
                              "group toward smaller K-quants (superseded by "
                              "--magicquant-stream-aware for most models)")
+    parser.add_argument("--magicquant-speed-aware", action="store_true",
+                        help="Within each tier, prefer the fastest near-tied measured "
+                             "candidate instead of the flat quality-best (measured "
+                             "search only; see --magicquant-speed-metric)")
+    parser.add_argument("--magicquant-speed-metric", type=str, default="bytes",
+                        choices=["bytes", "bench"],
+                        help="How --magicquant-speed-aware measures 'fastest': bytes "
+                             "= deterministic size (default, recommended) or bench = "
+                             "measured tg (needs --magicquant-speed-bench)")
+    parser.add_argument("--magicquant-speed-weight", type=float, default=None,
+                        help="Reserve this weight (0.0-0.8ish) for the search "
+                             "objective's speed term, renormalizing precision:size to "
+                             "fill the remainder (both search paths; default: "
+                             "unchanged 0.50/0.35/0.15 weights)")
+    parser.add_argument("--magicquant-use-bytes-tps", action="store_true",
+                        help="Score the search objective's speed term deterministically "
+                             "from predicted size instead of the noisy speed_multiplier "
+                             "path (recommended whenever --magicquant-speed-weight is set)")
+    parser.add_argument("--magicquant-calibration-source", type=str, default="",
+                        help="Load empirically calibrated noise factors/speed "
+                             "multipliers from this noise_calibration.json instead of "
+                             "the fixed calibration_results.json path (both search paths)")
+    parser.add_argument("--magicquant-write-calibration", action="store_true",
+                        help="After a successful --magicquant-measured search, fit + "
+                             "write <output>/noise_calibration.json from this run's "
+                             "measurements")
+    parser.add_argument("--magicquant-optimize-for-speed", action="store_true",
+                        help="Convenience: turns on speed-aware selection (bytes "
+                             "metric) AND a moderate speed-weighted, bytes-scored "
+                             "search objective together (speed_aware=True, "
+                             "speed_metric=bytes, speed_weight=0.35, "
+                             "use_bytes_tps=True) -- override any of these "
+                             "individually with the flags above")
     parser.add_argument("--rocmfpx", action="store_true",
                         help="Enable ROCmFPX stage (AMD-tuned GGUF quants; default off)")
     parser.add_argument("--no-rocmfpx", action="store_true",
@@ -1661,6 +1733,28 @@ def main(argv: Optional[list[str]] = None) -> int:
             cfg.magicquant.stream_aware = True
         if args.magicquant_head_aggressive:
             cfg.magicquant.head_aggressive = True
+        if args.magicquant_optimize_for_speed:
+            cfg.magicquant.speed_aware = True
+            cfg.magicquant.speed_metric = "bytes"
+            cfg.magicquant.speed_weight = 0.35
+            cfg.magicquant.use_bytes_tps = True
+        if args.magicquant_speed_aware:
+            cfg.magicquant.speed_aware = True
+        # Applied independently of --magicquant-speed-aware (like
+        # --magicquant-imatrix-corpus is independent of --magicquant-use-
+        # imatrix) so an explicit override composes with --magicquant-
+        # optimize-for-speed without also having to repeat --magicquant-
+        # speed-aware.
+        if args.magicquant_speed_metric != "bytes":
+            cfg.magicquant.speed_metric = args.magicquant_speed_metric
+        if args.magicquant_speed_weight is not None:
+            cfg.magicquant.speed_weight = args.magicquant_speed_weight
+        if args.magicquant_use_bytes_tps:
+            cfg.magicquant.use_bytes_tps = True
+        if args.magicquant_calibration_source:
+            cfg.magicquant.calibration_source = args.magicquant_calibration_source
+        if args.magicquant_write_calibration:
+            cfg.magicquant.write_calibration = True
     if args.rocmfpx and not args.no_rocmfpx:
         cfg.rocmfpx = ROCmFPXConfig(
             source_model=args.rocmfpx_source_model,

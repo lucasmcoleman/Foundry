@@ -236,6 +236,14 @@ def run(cfg_path: str | None = None) -> None:
     measurement_chunks = cfg.get("measurement_chunks")
     stream_aware = cfg.get("stream_aware", False)
     head_aggressive = cfg.get("head_aggressive", False)
+    # speed_weight/use_bytes_tps/calibration_source: tunable SEARCH objective,
+    # accepted by both run_measured_search and run_full_search. speed_aware/
+    # speed_metric/write_calibration are measured-search-only (see their
+    # docstrings) -- forwarded only in the `measured` branch below, never to
+    # run_full_search (which has no such params).
+    speed_weight = cfg.get("speed_weight")
+    use_bytes_tps = cfg.get("use_bytes_tps", False)
+    calibration_source = cfg.get("calibration_source", "")
 
     if measured:
         best_configs, tiered = orch.run_measured_search(
@@ -255,6 +263,12 @@ def run(cfg_path: str | None = None) -> None:
             measurement_chunks=measurement_chunks,
             stream_aware=stream_aware,
             head_aggressive=head_aggressive,
+            speed_aware=cfg.get("speed_aware", False),
+            speed_metric=cfg.get("speed_metric", "bytes"),
+            speed_weight=speed_weight,
+            use_bytes_tps=use_bytes_tps,
+            write_calibration=cfg.get("write_calibration", False),
+            calibration_source=calibration_source,
         )
     else:
         best_configs, tiered = orch.run_full_search(
@@ -270,6 +284,9 @@ def run(cfg_path: str | None = None) -> None:
             measurement_chunks=measurement_chunks,
             stream_aware=stream_aware,
             head_aggressive=head_aggressive,
+            speed_weight=speed_weight,
+            use_bytes_tps=use_bytes_tps,
+            calibration_source=calibration_source,
         )
     if not tiered:
         print("Error: no viable configurations found", flush=True)

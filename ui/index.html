@@ -103,6 +103,15 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 .checkbox-row { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .checkbox-row input[type="checkbox"] { accent-color: var(--amber); width: 14px; height: 14px; }
 
+.speed-optimize-box { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+.speed-optimize-box .speed-optimize-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.speed-optimize-box .form-hint { margin-top: 6px; }
+.speed-advanced { margin-top: 12px; }
+.speed-advanced summary { cursor: pointer; font-size: 11px; font-weight: 500; color: var(--text-2); letter-spacing: 0.3px; user-select: none; }
+.speed-advanced summary:hover { color: var(--text-1); }
+.speed-advanced[open] summary { margin-bottom: 12px; }
+.speed-advanced .form-grid { margin-bottom: 0; }
+
 .stage-master-toggle { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 24px; }
 .stage-master-toggle .smt-left { display: flex; align-items: center; gap: 12px; }
 .stage-master-toggle .smt-label { font-size: 13px; font-weight: 600; color: var(--text-0); }
@@ -603,7 +612,7 @@ const S = {
     heretic: { n_trials: 200, n_startup_trials: 60, quantization: 'bnb_4bit', kl_divergence_scale: 1.0, orthogonalize_direction: false, row_normalization: 'none' },
     reap: { compression_ratio: 0.25, prune_method: 'reap', samples_per_category: 512, model_max_length: 2048, dataset_name: 'theblackcat102/evol-codealpaca-v1', seed: 42 },
     qat: { config_source: '', tier: 'Q4', dataset: '', lora_r: 32, lora_alpha: 64.0, epochs: 1.0, max_steps: -1, lr: 0.0002, max_seq_len: 512 },
-    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, iq_schemes: false, seed: null, use_imatrix: false, imatrix_corpus: null, enable_kl: false, kl_weight: 0.1, enable_speed_bench: false, measurement_chunks: null, stream_aware: false, head_aggressive: false },
+    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, iq_schemes: false, seed: null, use_imatrix: false, imatrix_corpus: null, enable_kl: false, kl_weight: 0.1, enable_speed_bench: false, measurement_chunks: null, stream_aware: false, head_aggressive: false, speed_aware: false, speed_metric: 'bytes', speed_weight: null, use_bytes_tps: false, calibration_source: '', write_calibration: false },
     rocmfpx: { formats: ['rocmfp4-agent','rocmfp6-agent','rocmfp8-agent'], rocmfpx_hint: '', source_model: '', imatrix: '' },
     upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
@@ -1328,6 +1337,26 @@ function renderMagicQuant() {
     <div class="form-group">${L('imatrix Corpus','Calibration corpus for imatrix capture. Leave empty to use the bundled default corpus.')}<input class="form-input" data-key="magicquant.imatrix_corpus" value="${c.imatrix_corpus ?? ''}" placeholder="(bundled default)"></div>
     <div class="form-group span-2">${L('Stream-aware (BF16->Q8_0 on streamed groups: ~+18% gen speed, -16% size, PPL-neutral; ~-8% prompt speed)','RECOMMENDED. Biases the evolutionary search toward BF16->Q8_0 for tensor groups that stream in full every generated token (e.g. the LM head). Q8_0 is effectively lossless there, so this trades a small prompt-processing slowdown for a meaningful generation-speed and size win at close to zero perplexity cost. Off by default (unbiased sampling, historical behavior).')}<label class="toggle"><input type="checkbox" data-key="magicquant.stream_aware" ${c.stream_aware?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
     <div class="form-group span-2">${L('Head-aggressive (superseded by Stream-aware)','Biases the evolutionary search sampling for the H (LM head / output.weight) group specifically toward smaller K-quants (Q6_K/Q5_K/Q8_0), away from BF16. Prefer Stream-aware above for most models -- it covers the same streamed-tensor rationale more generally. Off by default.')}<label class="toggle"><input type="checkbox" data-key="magicquant.head_aggressive" ${c.head_aggressive?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+    <div class="form-group span-2 speed-optimize-box">
+      <div class="speed-optimize-head">
+        ${L('Optimize for generation speed','Convenience: turns on speed-aware selection (bytes metric) AND a moderate speed-weighted, bytes-scored search objective together, so the two halves work as a pair -- the objective biases the evolutionary search toward smaller/faster candidates, and speed-aware selection then picks the fastest near-tied candidate per tier. Sets speed_aware=true, speed_metric=bytes, speed_weight=0.35, use_bytes_tps=true. Use the advanced controls below to tune each independently.')}
+        <label class="toggle"><input type="checkbox" ${(c.speed_aware && c.use_bytes_tps && c.speed_weight !== null && c.speed_weight !== undefined) ? 'checked' : ''} onchange="toggleOptimizeForSpeed(this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+      </div>
+      <div class="form-hint">Speed-aware selection only takes effect during Measured Search (below); the search-objective half (speed weight + bytes-based scoring) also biases the default prediction-only search.</div>
+      <details class="speed-advanced">
+        <summary>Advanced speed controls</summary>
+        <div class="form-grid">
+          <div class="form-group">${L('Search Speed Weight','Reserve this weight (0.0-0.8ish) for the search objective\'s speed term, renormalizing precision:size to fill the remainder (e.g. 0.35 gives about 0.35/0.30/0.35). Both search paths. Blank = today\'s fixed 0.50/0.35/0.15 weights, unchanged.')}<input class="form-input" type="number" step="0.05" min="0" max="0.8" data-key="magicquant.speed_weight" value="${c.speed_weight ?? ''}" placeholder="(unchanged weights)"></div>
+          <div class="form-group">${L('Use Bytes-based TPS','Score the search objective\'s speed term deterministically from predicted size instead of the noisier speed_multiplier path. Both search paths. Recommended whenever Search Speed Weight is set.')}<label class="toggle"><input type="checkbox" data-key="magicquant.use_bytes_tps" ${c.use_bytes_tps?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+          <div class="form-group span-2">${L('Calibration Source','Load empirically calibrated noise factors/speed multipliers from this noise_calibration.json instead of the fixed calibration_results.json path. Both search paths.')}<input class="form-input" data-key="magicquant.calibration_source" value="${c.calibration_source}" placeholder="(fixed calibration_results.json)"></div>
+          ${c.measured ? `
+          <div class="form-group">${L('Speed-aware Selection','Within each tier, prefer the fastest near-tied measured candidate instead of the flat quality-best. Measured search only.')}<label class="toggle"><input type="checkbox" data-key="magicquant.speed_aware" ${c.speed_aware?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+          <div class="form-group">${L('Speed Metric','How Speed-aware Selection measures \'fastest\': bytes = deterministic size (recommended default), bench = measured tokens/sec (needs Speed Bench above).')}<select class="form-input" data-key="magicquant.speed_metric"><option value="bytes" ${c.speed_metric==='bytes'?'selected':''}>bytes (deterministic)</option><option value="bench" ${c.speed_metric==='bench'?'selected':''}>bench (measured tg)</option></select></div>
+          <div class="form-group span-2">${L('Write Calibration','After a successful Measured Search, fit + write <output>/noise_calibration.json from this run\'s measurements. Best-effort -- a fitting failure never blocks a successful search.')}<label class="toggle"><input type="checkbox" data-key="magicquant.write_calibration" ${c.write_calibration?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+          ` : ''}
+        </div>
+      </details>
+    </div>
     ${c.measured ? `
     <div class="form-group">${L('KL-Divergence Scoring','Also measure real KL-divergence-to-base for each candidate during measured search (via llama-perplexity --kl-divergence) and blend it into final-survivor selection.')}<label class="toggle"><input type="checkbox" data-key="magicquant.enable_kl" ${c.enable_kl?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
     <div class="form-group">${L('KL Weight','Weight applied to |mean_kl| when blending KL-divergence into the measured-search selection score.')}<input class="form-input" type="number" step="0.01" data-key="magicquant.kl_weight" value="${c.kl_weight}"></div>
@@ -1410,6 +1439,24 @@ function toggleTier(t) {
   if (i >= 0) tiers.splice(i, 1); else tiers.push(t);
   document.querySelector(`[data-tier="${t}"]`)?.classList.toggle('selected');
   saveFormState();
+}
+
+/**
+ * Convenience toggle for MagicQuant's "Optimize for generation speed" card:
+ * flips the tps-aware search objective (speed_weight/use_bytes_tps) AND
+ * speed-aware final-survivor selection (speed_aware/speed_metric) together,
+ * since the objective alone only reshapes candidate scoring -- selection is
+ * what actually changes which candidate wins each tier (measured search).
+ * @param {boolean} on - Whether to enable the speed-optimized defaults
+ */
+function toggleOptimizeForSpeed(on) {
+  const mc = S.config.magicquant;
+  mc.speed_aware = on;
+  mc.speed_metric = 'bytes';
+  mc.speed_weight = on ? 0.35 : null;
+  mc.use_bytes_tps = on;
+  saveFormState();
+  renderStageContent();
 }
 
 function toggleFormat(f) {
