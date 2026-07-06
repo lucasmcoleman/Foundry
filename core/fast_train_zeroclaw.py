@@ -95,7 +95,53 @@ def _warn_if_unvalidated_internals():
         print(f"WARNING: {w}")
 
 
-def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
+# Attention implementations that reliably isolate packed samples (build a
+# block-diagonal mask from cu_seqlens / position_ids). Anything else lets
+# packed samples attend across boundaries -> cross-contamination.
+_PACKING_SAFE_ATTN = ("flash_attention_2", "flash_attention_3")
+
+
+def resolve_attn_implementation(prefer_flash: bool = True) -> str:
+    """Pick the best attention backend actually available on this box.
+
+    Prefers a real FlashAttention (fastest, and the only variant that isolates
+    packed samples on this transformers/TRL stack) when installed; otherwise
+    falls back to ``sdpa`` (works everywhere, incl. ROCm/gfx1151, no flash-attn
+    package needed). Never returns an implementation that would fail to load.
+    """
+    if prefer_flash:
+        try:
+            from transformers.utils import is_flash_attn_2_available
+            if is_flash_attn_2_available():
+                return "flash_attention_2"
+        except Exception:
+            pass
+    return "sdpa"
+
+
+def resolve_packing(requested_packing: bool, attn_implementation: str):
+    """Gate packing on a packing-safe attention backend.
+
+    Returns ``(effective_packing, note_or_None)``. If packing was requested but
+    the chosen attention can't isolate packed samples (no FlashAttention on this
+    hardware), packing is forced off — silent cross-contamination is a worse
+    outcome than the lost throughput. ``note`` is a human-readable reason to log.
+    """
+    if requested_packing and attn_implementation not in _PACKING_SAFE_ATTN:
+        return False, (
+            f"packing requested but attn_implementation='{attn_implementation}' "
+            "cannot isolate packed samples on this stack (no FlashAttention "
+            "available — not installable on gfx1151/ROCm). Forcing packing=False "
+            "to avoid cross-sample attention contamination; completion-only loss "
+            "masking is used instead."
+        )
+    return requested_packing, None
+
+
+def fast_load_quantized_model(
+    model_id: str = "Tesslate/OmniCoder-9B",
+    attn_implementation: str | None = None,
+):
     """Load model with shard-by-shard 4-bit quantization on GPU.
 
     This is dramatically faster than transformers' default from_pretrained() on
@@ -177,10 +223,16 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
     # meta tensor (no storage). We materialize real tensors shard-by-shard below.
     print("Creating model skeleton on meta device...")
     from transformers import AutoModelForCausalLM
-    # Use SDPA (torch's built-in scaled dot product attention) which supports
-    # efficient attention on ROCm without needing flash-attn package.
+    # Auto-select attention: a real FlashAttention when installed (fastest, and
+    # the only packing-safe variant here), else SDPA (torch built-in; works on
+    # ROCm without the flash-attn package).
+    if attn_implementation is None:
+        attn_implementation = resolve_attn_implementation()
+    print(f"  attn_implementation: {attn_implementation}")
     with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, attn_implementation="sdpa")
+        model = AutoModelForCausalLM.from_config(
+            config, trust_remote_code=True, attn_implementation=attn_implementation
+        )
 
     model.eval()
 
