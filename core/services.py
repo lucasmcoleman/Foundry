@@ -323,6 +323,12 @@ class MagicQuantService:
         measurement_chunks: Optional[int] = None,
         stream_aware: bool = False,
         head_aggressive: bool = False,
+        speed_aware: bool = False,
+        speed_metric: str = "bytes",
+        speed_weight: Optional[float] = None,
+        use_bytes_tps: bool = False,
+        calibration_source: str = "",
+        write_calibration: bool = False,
     ) -> dict:
         """Build the JSON config consumed by core/_magicquant_entry.py."""
         return {
@@ -350,6 +356,12 @@ class MagicQuantService:
             "measurement_chunks": measurement_chunks,
             "stream_aware": stream_aware,
             "head_aggressive": head_aggressive,
+            "speed_aware": speed_aware,
+            "speed_metric": speed_metric,
+            "speed_weight": speed_weight,
+            "use_bytes_tps": use_bytes_tps,
+            "calibration_source": calibration_source,
+            "write_calibration": write_calibration,
         }
 
     def build_script(self, **kwargs) -> str:

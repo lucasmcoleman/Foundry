@@ -214,6 +214,12 @@ class MagicQuantCfg(BaseModel):
     measurement_chunks: Optional[int] = None  # cap perplexity/KL passes (both search paths)
     stream_aware: bool = False       # bias sampling toward BF16->Q8_0 on streamed groups
     head_aggressive: bool = False    # bias 'H' (LM head) group sampling toward smaller K-quants
+    speed_aware: bool = False        # measured-search only: prefer fastest near-tied candidate per tier
+    speed_metric: str = "bytes"      # "bytes" (deterministic) | "bench" (measured tg); only meaningful when speed_aware
+    speed_weight: Optional[float] = None  # tps-aware SEARCH objective weight (both search paths); None = unchanged weights
+    use_bytes_tps: bool = False      # score the search objective's speed term from predicted size, not noisy speed_multiplier
+    calibration_source: str = ""     # path to a noise_calibration.json to load (both search paths)
+    write_calibration: bool = False  # measured-search only: emit <output>/noise_calibration.json from this run
 
 class QATCfg(BaseModel):
     """QAT-LoRA stage config.
@@ -914,6 +920,10 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         "enable_speed_bench": mc.enable_speed_bench,
         "measurement_chunks": mc.measurement_chunks,
         "stream_aware": mc.stream_aware, "head_aggressive": mc.head_aggressive,
+        "speed_aware": mc.speed_aware, "speed_metric": mc.speed_metric,
+        "speed_weight": mc.speed_weight, "use_bytes_tps": mc.use_bytes_tps,
+        "calibration_source": mc.calibration_source,
+        "write_calibration": mc.write_calibration,
     })
     existing_ggufs = sorted(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
     mq_key = existing_ggufs[0] if existing_ggufs else (mq_dir / "_placeholder.gguf")
@@ -958,6 +968,12 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         measurement_chunks=mc.measurement_chunks,
         stream_aware=mc.stream_aware,
         head_aggressive=mc.head_aggressive,
+        speed_aware=mc.speed_aware,
+        speed_metric=mc.speed_metric,
+        speed_weight=mc.speed_weight,
+        use_bytes_tps=mc.use_bytes_tps,
+        calibration_source=mc.calibration_source,
+        write_calibration=mc.write_calibration,
     )
     rc = await run_script(script, out)
     ok = rc == 0
