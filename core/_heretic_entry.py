@@ -94,8 +94,13 @@ def run(cfg_path: str | None = None) -> None:
     from heretic.model import Model, AbliterationParameters
     from heretic.evaluator import Evaluator
     from heretic.utils import (
-        empty_cache, format_duration, load_prompts, print_memory_usage,
+        format_duration, load_prompts, print_memory_usage,
     )
+    # heretic >=1.3 moved empty_cache into heretic.system (was heretic.utils).
+    try:
+        from heretic.system import empty_cache
+    except ImportError:  # pragma: no cover - older heretic fallback
+        from heretic.utils import empty_cache
 
     # Use plain print for pipeline logging.
     import builtins
@@ -178,9 +183,14 @@ def run(cfg_path: str | None = None) -> None:
     _print()
     _print("Checking for common response prefix...")
     responses = model.get_responses_batched(good_prompts[:100] + bad_prompts[:100])
-    model.response_prefix = normalize_response_prefix(commonprefix(responses).rstrip(" "))
-    if model.response_prefix:
-        _print(f"  Prefix found: {model.response_prefix!r}")
+    response_prefix = normalize_response_prefix(commonprefix(responses).rstrip(" "))
+    # heretic >=1.3 reads the prefix from settings (Model.get_responses uses
+    # self.settings.response_prefix); older versions read model.response_prefix.
+    # Set both so the detected prefix is honored regardless of version.
+    settings.response_prefix = response_prefix
+    model.response_prefix = response_prefix
+    if response_prefix:
+        _print(f"  Prefix found: {response_prefix!r}")
     else:
         _print("  None found")
 
