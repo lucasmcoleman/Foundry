@@ -62,7 +62,10 @@ dev = [
 # (e.g. `pip install -e ../MagicQuant`), not PyPI. Not needed to build the package.
 external = [
     "magicquant>=0.1.0",
-    "heretic-llm>=0.1.0",
+    # >=1.3.0: adds Qwen3.5/hybrid-architecture support (linear_attn layers) and
+    # moves empty_cache -> heretic.system, response_prefix -> Settings; core/
+    # _heretic_entry.py targets that API.
+    "heretic-llm>=1.3.0",
 ]
 
 [project.scripts]
