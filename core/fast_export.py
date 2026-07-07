@@ -286,8 +286,16 @@ def streaming_merge(
     merged_path = Path(merged_dir)
     merged_path.mkdir(parents=True, exist_ok=True)
 
-    # Copy model config files from the base model.
-    for fname in ["config.json", "generation_config.json", "special_tokens_map.json"]:
+    # Copy model config files from the base model. The preprocessor/processor
+    # configs are only present on multimodal (vision/video) models — the merged
+    # model keeps the base's vision tensors + ForConditionalGeneration config, so
+    # a consumer that loads AutoProcessor (e.g. heretic >=1.4) needs them too.
+    # copy-if-present, so text-only models are unaffected.
+    for fname in [
+        "config.json", "generation_config.json", "special_tokens_map.json",
+        "preprocessor_config.json", "processor_config.json",
+        "video_preprocessor_config.json",
+    ]:
         src = os.path.join(model_path, fname)
         if os.path.exists(src):
             shutil.copy2(src, merged_path / fname)
