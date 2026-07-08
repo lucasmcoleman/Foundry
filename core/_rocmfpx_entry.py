@@ -396,7 +396,21 @@ def _ensure_bf16_gguf(rocmfpx_dir: str, source: str, out_dir: Path) -> str:
         print(f"Reusing cached BF16 GGUF: {cached}", flush=True)
         return str(cached)
 
-    convert_script = Path(rocmfpx_dir) / "convert_hf_to_gguf.py"
+    # The converter lives in the llama.cpp source root, but rocmfpx_dir is
+    # usually a build subdir (e.g. <src>/build-strix-rocmfp4). Check the dir,
+    # its bin/, and walk up to the source root.
+    d = Path(rocmfpx_dir)
+    convert_script = None
+    for c in [d / "convert_hf_to_gguf.py", d / "bin" / "convert_hf_to_gguf.py",
+              *[p / "convert_hf_to_gguf.py" for p in list(d.parents)[:4]]]:
+        if c.exists():
+            convert_script = c
+            break
+    if convert_script is None:
+        raise RuntimeError(
+            f"convert_hf_to_gguf.py not found near {rocmfpx_dir} "
+            "(needed to convert safetensors -> BF16 GGUF)"
+        )
     print(f"Converting {source} -> {cached} (BF16)...", flush=True)
     rc = subprocess.run([
         sys.executable, str(convert_script), source,

@@ -130,6 +130,25 @@ def resolve_source(override: str, out_dir: Path, pipeline_root: str) -> str | No
     return None
 
 
+def _find_convert_script(llamacpp_dir: str):
+    """Locate llama.cpp's convert_hf_to_gguf.py given a build/bin dir.
+
+    The script lives in the llama.cpp *source root*, but ``llamacpp_dir`` is
+    typically a build subdir (e.g. ``<src>/build-strix-rocmfp4`` or its
+    ``bin/``). Check the dir itself, its ``bin/``, and walk up parents to the
+    source root. Returns the Path or None.
+    """
+    d = Path(llamacpp_dir)
+    candidates = [d / "convert_hf_to_gguf.py", d / "bin" / "convert_hf_to_gguf.py"]
+    # Walk up: build dirs nest under the source root that holds the converter.
+    for parent in list(d.parents)[:4]:
+        candidates.append(parent / "convert_hf_to_gguf.py")
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
 def _ensure_bf16_gguf(llamacpp_dir: str, source: str, out_dir: Path) -> str:
     import subprocess
     if source.endswith(".gguf"):
@@ -138,12 +157,10 @@ def _ensure_bf16_gguf(llamacpp_dir: str, source: str, out_dir: Path) -> str:
     if cached.exists():
         print(f"Reusing cached BF16 GGUF: {cached}", flush=True)
         return str(cached)
-    convert_script = Path(llamacpp_dir) / "convert_hf_to_gguf.py"
-    if not convert_script.exists():
-        convert_script = Path(llamacpp_dir) / "bin" / "convert_hf_to_gguf.py"
-    if not convert_script.exists():
+    convert_script = _find_convert_script(llamacpp_dir)
+    if convert_script is None:
         raise RuntimeError(
-            f"convert_hf_to_gguf.py not found in {llamacpp_dir} "
+            f"convert_hf_to_gguf.py not found near {llamacpp_dir} "
             "(needed to convert safetensors -> BF16 GGUF for baseline perplexity)"
         )
     print(f"Converting {source} -> {cached} (BF16)...", flush=True)
