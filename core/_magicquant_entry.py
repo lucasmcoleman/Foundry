@@ -173,6 +173,66 @@ def _ensure_bf16_gguf(llamacpp_dir: str, source: str, out_dir: Path) -> str:
     return str(cached)
 
 
+def _is_vision_model(source: str) -> bool:
+    """True if the safetensors source is a multimodal (vision) model — detected
+    by a preprocessor_config.json, or a vision_config in config.json."""
+    import os
+    if not os.path.isdir(source):
+        return False
+    if os.path.exists(os.path.join(source, "preprocessor_config.json")):
+        return True
+    cfg_path = os.path.join(source, "config.json")
+    if os.path.exists(cfg_path):
+        try:
+            import json as _json
+            return "vision_config" in _json.loads(Path(cfg_path).read_text())
+        except Exception:
+            return False
+    return False
+
+
+def _maybe_generate_mmproj(llamacpp_dir: str, source: str, out_dir: Path,
+                           model_name: str) -> None:
+    """For a multimodal (vision) source, export the mmproj projector GGUF next to
+    the text quants so image input works (text quant + mmproj = full VL serving:
+    ``llama-server -m <quant>.gguf --mmproj mmproj-*.gguf``).
+
+    Best-effort and additive: silently returns for text-only models, and never
+    fails the quant stage on error — the text quants are valid without it. Needs
+    the original safetensors ``source`` (holds the vision weights + processor
+    config); can't be extracted from an already-converted text GGUF.
+    """
+    import subprocess
+    if not _is_vision_model(source):
+        return
+    convert_script = _find_convert_script(llamacpp_dir)
+    if convert_script is None:
+        print("mmproj: convert_hf_to_gguf.py not found — skipping vision projector",
+              flush=True)
+        return
+    name = model_name or out_dir.name
+    mmproj_dir = out_dir / "mmproj"
+    mmproj_dir.mkdir(parents=True, exist_ok=True)
+    out_file = mmproj_dir / f"mmproj-{name}-f16.gguf"
+    if out_file.exists() and out_file.stat().st_size > 0:
+        print(f"mmproj: reusing {out_file}", flush=True)
+        return
+    print(f"Vision model detected -> generating mmproj: {out_file}", flush=True)
+    try:
+        rc = subprocess.run([
+            sys.executable, str(convert_script), source,
+            "--mmproj", "--outfile", str(out_file), "--outtype", "f16",
+        ]).returncode
+        if rc == 0 and out_file.exists():
+            print(f"mmproj generated ({out_file.stat().st_size / 2**30:.2f} GiB) — "
+                  "pair with any text quant for image input", flush=True)
+        else:
+            print(f"mmproj generation failed (exit {rc}); text quants still valid",
+                  flush=True)
+    except Exception as exc:  # best-effort: must never fail the quant stage
+        print(f"mmproj generation error: {exc}; text quants still valid", flush=True)
+
+
 def run(cfg_path: str | None = None) -> None:
     if cfg_path is None:
         cfg_path = sys.argv[1]
@@ -221,6 +281,13 @@ def run(cfg_path: str | None = None) -> None:
         )
         sys.exit(1)
     print(f"MagicQuant source: {source}", flush=True)
+
+    # Vision models: export the mmproj projector alongside the text quants so
+    # image input works (text quant + mmproj = full VL). Best-effort, from the
+    # original safetensors source (must run before it's reassigned to the BF16
+    # GGUF below, which no longer carries the vision weights).
+    if llamacpp and os.path.isdir(source):
+        _maybe_generate_mmproj(llamacpp, source, out_dir, cfg.get("model_name", ""))
 
     # Measured search needs a GGUF — convert safetensors to BF16 GGUF first
     measured = cfg.get("measured", False)
