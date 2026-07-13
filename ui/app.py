@@ -126,6 +126,27 @@ def _resolve_venv_python() -> str:
 VENV_PYTHON = _resolve_venv_python()
 
 
+# ── Flywheel integration ─────────────────────────────────────────────────────
+# foundry-flywheel is a sibling repo that composes Foundry + foundry_gym +
+# veredict + MagicQuant + did-it-help into one gated improvement iteration.
+# It is imported/run READ-ONLY as a library; the UI never edits its tree.
+FLYWHEEL_ROOT = Path(os.environ.get("FLYWHEEL_ROOT", "/server/programming/foundry-flywheel"))
+
+
+def _resolve_flywheel_python() -> str:
+    """Interpreter for the flywheel subprocess.
+
+    Prefer the flywheel's own venv when present; otherwise fall back to the UI's
+    venv Python (VENV_PYTHON), which has numpy/pyyaml/requests and can import
+    ``flywheel`` plus the composed tools (they are added to sys.path on demand by
+    ``flywheel/_tool_paths.py``). Override the repo location with FLYWHEEL_ROOT.
+    """
+    cand = FLYWHEEL_ROOT / ".venv" / "bin" / "python"
+    if cand.exists():
+        return str(cand)
+    return VENV_PYTHON
+
+
 # ── State ────────────────────────────────────────────────────────────────────
 
 class StageStatus(str, Enum):
@@ -309,6 +330,31 @@ class RunRequest(BaseModel):
     rocmfpx: Optional[ROCmFPXCfg] = None
     upload: Optional[UploadCfg] = None
     enabled_stages: list[str] = ["training", "export"]
+
+
+class FlywheelRequest(BaseModel):
+    """One pre-built-mode flywheel iteration driven from the browser.
+
+    The candidate arm is a served model id (``candidate_model``); leaving it
+    empty runs an A/A control against ``base_model`` (the honest outcome is
+    HOLD). Train/quantize are disabled — producing a candidate (train+quant)
+    is a hours-of-GPU run left for a later UI iteration.
+    """
+    model_config = {"extra": "forbid"}
+    base_model: str = "qwen3.5:9b"
+    candidate_model: Optional[str] = None          # None/empty -> A/A control
+    families: str = "math_logic"                   # comma-separated gym families (= axes)
+    n_tasks: int = 4                               # tasks per family (>= 2 for paired stats)
+    difficulty: float = 0.3
+    seeds: str = "17,29"                           # comma-separated sampling seeds
+    max_tokens: int = 640
+    base_url: str = "http://127.0.0.1:4004/v1"     # llama-swap OpenAI-compatible endpoint
+    bootstrap_iters: int = 2000                    # did-it-help bootstrap iterations
+    gpu_lock_timeout_s: float = 5400.0             # patience for /tmp/claude-gpu.lock
+    name: str = "flywheel-ui"
+    # Optional decision-policy knobs (None => flywheel DecisionPolicy default).
+    min_macro_delta: Optional[float] = None        # practical-significance floor for KEEP
+    veredict_floor: Optional[float] = None         # min candidate veredict pass-rate
 
 
 # ── Subprocess helper ────────────────────────────────────────────────────────
@@ -1336,6 +1382,283 @@ async def run_pipeline(cfg: RunRequest):
         await state.broadcast({"type": "pipeline_done"})
 
 
+# ── Flywheel runner ──────────────────────────────────────────────────────────
+#
+# The flywheel is GPU-bound and takes the SAME _pipeline_lock / state.running as
+# the Foundry pipeline, so the two are mutually exclusive (one active GPU job).
+# It runs as a subprocess in the flywheel repo, streaming progress to the same
+# WebSocket via new message types (flywheel_stage, flywheel_done) plus the
+# shared log stream. Its subprocess is set as state.active_proc so /api/stop
+# works for free, and its own gpu_lock.py serializes inference at the OS level.
+
+# Static driver: reads its config from $FLYWHEEL_PARAMS (data, never interpolated
+# into source), builds a pre-built-mode IterationConfig, wraps the real ToolSuite
+# to emit per-stage @@FLYWHEEL@@ markers, and runs one real iteration.
+_FLYWHEEL_DRIVER = r'''
+import sys, os, json, traceback
+
+_repo = os.environ.get("FLYWHEEL_REPO", "")
+if _repo and _repo not in sys.path:
+    sys.path.insert(0, _repo)
+
+from flywheel import (
+    ArmConfig, DecisionPolicy, EvalConfig, IterationConfig, JudgeConfig,
+    SignalConfig, StageFailure, StatsConfig, run_iteration,
+)
+from flywheel.loop import ToolSuite, default_suite
+
+
+def emit(obj):
+    print("@@FLYWHEEL@@ " + json.dumps(obj), flush=True)
+
+
+with open(os.environ["FLYWHEEL_PARAMS"]) as f:
+    p = json.load(f)
+
+base_model = p["base_model"]
+candidate_model = p.get("candidate_model") or base_model
+aa = candidate_model == base_model
+families = tuple(f.strip() for f in p["families"].split(",") if f.strip())
+seeds = tuple(int(s) for s in str(p["seeds"]).split(",") if str(s).strip())
+checkers = tuple((name, spec) for name, spec in p.get("checkers", []))
+
+policy_kw = {}
+if p.get("min_macro_delta") is not None:
+    policy_kw["min_macro_delta"] = float(p["min_macro_delta"])
+if p.get("veredict_floor") is not None:
+    policy_kw["veredict_floor"] = float(p["veredict_floor"])
+
+cfg = IterationConfig(
+    name=p.get("name", "flywheel-ui"),
+    workdir=p["workdir"],
+    baseline=ArmConfig(label=base_model + " (base arm)", model_id=base_model),
+    candidate=ArmConfig(
+        label=candidate_model + " (candidate arm"
+              + (", A/A control" if aa else "") + ")",
+        model_id=candidate_model),
+    signal=SignalConfig(families=families, n_tasks=int(p["n_tasks"]),
+                        difficulty=float(p["difficulty"]), seed_base=1000),
+    eval=EvalConfig(base_url=p["base_url"], seeds=seeds,
+                    max_tokens=int(p["max_tokens"]),
+                    gpu_lock_timeout_s=float(p.get("gpu_lock_timeout_s", 5400.0))),
+    judge=JudgeConfig(checkers=checkers),
+    stats=StatsConfig(bootstrap_iters=int(p.get("bootstrap_iters", 2000))),
+    policy=DecisionPolicy(**policy_kw),
+)
+
+emit({"event": "start", "aa_control": aa, "base_model": base_model,
+      "candidate_model": candidate_model, "families": list(families),
+      "n_tasks": int(p["n_tasks"]), "seeds": list(seeds)})
+# pre-built candidate: train + quantize are skipped
+emit({"event": "stage", "stage": "train", "status": "skipped"})
+emit({"event": "stage", "stage": "quantize", "status": "skipped"})
+
+_base = default_suite()
+
+
+def _wrap(name, fn):
+    def inner(*a, **k):
+        emit({"event": "stage", "stage": name, "status": "running"})
+        out = fn(*a, **k)
+        emit({"event": "stage", "stage": name, "status": "success"})
+        return out
+    return inner
+
+
+suite = ToolSuite(
+    train=_base.train,
+    quantize=_base.quantize,
+    generate_tasks=_wrap("signal", _base.generate_tasks),
+    rollout=_wrap("rollout", _base.rollout),
+    judge=_wrap("judge", _base.judge),
+    gate=_wrap("gate", _base.gate),
+)
+
+try:
+    manifest = run_iteration(cfg, suite=suite, log=lambda m: print(m, flush=True))
+except StageFailure as e:
+    mp = os.path.join(e.manifest._dir, "iteration.json")
+    emit({"event": "stage", "stage": e.stage, "status": "failed"})
+    emit({"event": "error", "stage": e.stage, "error": str(e.cause),
+          "manifest_path": mp})
+    print("STAGE FAILED: %s: %s" % (e.stage, e.cause), flush=True)
+    sys.exit(1)
+except Exception as e:
+    traceback.print_exc()
+    emit({"event": "error", "error": "%s: %s" % (type(e).__name__, e)})
+    sys.exit(1)
+
+emit({"event": "stage", "stage": "decide", "status": "running"})
+emit({"event": "stage", "stage": "decide", "status": "success"})
+mp = os.path.join(manifest._dir, "iteration.json")
+emit({"event": "manifest", "manifest_path": mp,
+      "iteration_id": manifest.iteration_id})
+print("[flywheel] manifest: " + mp, flush=True)
+'''
+
+
+async def _run_flywheel_subprocess(script_path: Path, params_path: Path):
+    """Run the flywheel driver, streaming stdout to WS clients.
+
+    Returns (returncode, manifest_path, error). Sets state.active_proc so
+    /api/stop can kill it. Never injects the HF token (the flywheel never
+    uploads).
+    """
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["FLYWHEEL_REPO"] = str(FLYWHEEL_ROOT)
+    env["FLYWHEEL_PARAMS"] = str(params_path)
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(FLYWHEEL_ROOT) + (os.pathsep + existing_pp if existing_pp else "")
+    env.pop("HF_TOKEN", None)
+
+    py = _resolve_flywheel_python()
+    manifest_path = None
+    err = None
+    log_file = open(script_path.with_suffix(".log"), "w")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            py, "-u", str(script_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env, cwd=str(FLYWHEEL_ROOT),
+            limit=1024 * 1024,
+            start_new_session=True,
+        )
+        state.active_proc = proc
+        try:
+            async for raw in proc.stdout:
+                decoded = raw.decode("utf-8", errors="replace")
+                log_file.write(decoded)
+                log_file.flush()
+                for line in decoded.split("\r"):
+                    line = line.rstrip("\n").strip()
+                    if not line:
+                        continue
+                    if line.startswith("@@FLYWHEEL@@ "):
+                        try:
+                            ev = json.loads(line[len("@@FLYWHEEL@@ "):])
+                        except json.JSONDecodeError:
+                            continue
+                        kind = ev.get("event")
+                        if kind == "stage":
+                            await state.broadcast({"type": "flywheel_stage",
+                                                   "stage": ev["stage"],
+                                                   "status": ev["status"]})
+                            if ev["status"] in ("running", "failed"):
+                                await state.log(
+                                    f"[flywheel] stage {ev['stage']}: {ev['status']}",
+                                    "stage" if ev["status"] == "running" else "error")
+                        elif kind == "start":
+                            mode = "A/A control" if ev.get("aa_control") else "A/B"
+                            await state.log(
+                                f"[flywheel] {mode} — base={ev['base_model']} "
+                                f"candidate={ev['candidate_model']} "
+                                f"families={ev['families']} n_tasks={ev['n_tasks']} "
+                                f"seeds={ev['seeds']}", "stage")
+                        elif kind == "manifest":
+                            manifest_path = ev.get("manifest_path")
+                        elif kind == "error":
+                            err = ev.get("error")
+                            manifest_path = ev.get("manifest_path") or manifest_path
+                            await state.log(f"[flywheel] error: {err}", "error")
+                    else:
+                        lvl = ("error" if ("Traceback" in line or "Error" in line
+                                           or "error" in line.lower()) else "info")
+                        await state.log(line, lvl)
+        except Exception:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            raise
+        finally:
+            await proc.wait()
+            state.active_proc = None
+    finally:
+        log_file.close()
+    return proc.returncode, manifest_path, err
+
+
+async def run_flywheel(req: FlywheelRequest):
+    """Drive one flywheel iteration and broadcast the final verdict + decision."""
+    state.current_stage = None
+    state.progress = 0
+    workdir = FLYWHEEL_ROOT / "output" / "ui"
+    try:
+        # Reset the flywheel stage tracker for the new run.
+        for stg, status in (("train", "skipped"), ("quantize", "skipped"),
+                            ("signal", "pending"), ("rollout", "pending"),
+                            ("judge", "pending"), ("gate", "pending"),
+                            ("decide", "pending")):
+            await state.broadcast({"type": "flywheel_stage", "stage": stg,
+                                   "status": status})
+
+        workdir.mkdir(parents=True, exist_ok=True)
+        fams = [f.strip() for f in req.families.split(",") if f.strip()]
+        # math_logic secondary contract mirrors scripts/demo.py (verified live
+        # against veredict.checkers.regex_contract).
+        checkers = ([["regex_contract", {"must_match": [r"Answer:\s*-?\d+"]}]]
+                    if "math_logic" in fams else [])
+        ts = int(time.time())
+        script_path = workdir / f"_flywheel_{ts}.py"
+        params_path = workdir / f"_flywheel_{ts}.params.json"
+        params = {
+            "name": req.name,
+            "workdir": str(workdir),
+            "base_model": req.base_model,
+            "candidate_model": req.candidate_model,
+            "families": req.families,
+            "n_tasks": req.n_tasks,
+            "difficulty": req.difficulty,
+            "seeds": req.seeds,
+            "max_tokens": req.max_tokens,
+            "base_url": req.base_url,
+            "bootstrap_iters": req.bootstrap_iters,
+            "gpu_lock_timeout_s": req.gpu_lock_timeout_s,
+            "min_macro_delta": req.min_macro_delta,
+            "veredict_floor": req.veredict_floor,
+            "checkers": checkers,
+        }
+        params_path.write_text(json.dumps(params, indent=2))
+        script_path.write_text(_FLYWHEEL_DRIVER)
+
+        await state.log(f"Flywheel: interpreter {_resolve_flywheel_python()}", "info")
+        await state.log(f"Flywheel: workdir {workdir}", "info")
+        await state.log("Flywheel: acquiring GPU lock /tmp/claude-gpu.lock "
+                        "(waits politely if contended)", "info")
+
+        rc, manifest_path, err = await _run_flywheel_subprocess(script_path, params_path)
+
+        if rc == 0 and manifest_path and Path(manifest_path).exists():
+            data = json.loads(Path(manifest_path).read_text())
+            decision = data.get("decision") or {}
+            action = (decision.get("action") or "").upper()
+            await state.log(f"Flywheel decision: {action} "
+                            f"(promoted: {decision.get('promoted')})", "success")
+            await state.broadcast({
+                "type": "flywheel_done", "ok": True,
+                "verdict": data.get("verdict"),
+                "decision": decision,
+                "manifest_path": manifest_path,
+                "iteration_id": data.get("iteration_id"),
+            })
+        else:
+            await state.broadcast({
+                "type": "flywheel_done", "ok": False,
+                "error": err or f"flywheel exited with code {rc}",
+                "manifest_path": manifest_path,
+            })
+    except Exception as e:
+        await state.log(f"Flywheel error: {e}", "error")
+        await state.broadcast({"type": "flywheel_done", "ok": False,
+                               "error": str(e)})
+    finally:
+        state.running = False
+        state.active_proc = None
+        await state.broadcast({"type": "pipeline_done"})
+
+
 # ── Persistent config ────────────────────────────────────────────────────────
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -1603,6 +1926,32 @@ async def stop_pipeline():
     await state.log("Stop requested by user", "warn")
     await state.broadcast({"type": "pipeline_done"})
     return {"status": "stopping"}
+
+
+@app.post("/api/flywheel", dependencies=[Depends(verify_api_key)])
+async def start_flywheel(req: FlywheelRequest):
+    """Launch one foundry-flywheel iteration (pre-built mode) in the background.
+
+    Shares _pipeline_lock / state.running with the Foundry pipeline so the two
+    are mutually exclusive (one active GPU job). Streams progress over the same
+    WebSocket via flywheel_stage / flywheel_done messages; the subprocess is set
+    as state.active_proc so /api/stop halts it.
+    """
+    if req.n_tasks < 2:
+        return {"error": "n_tasks must be >= 2 (paired stats need at least 2 tasks)"}
+    if not [f for f in req.families.split(",") if f.strip()]:
+        return {"error": "families must be non-empty"}
+    if not [s for s in req.seeds.split(",") if s.strip()]:
+        return {"error": "seeds must be non-empty"}
+    if _pipeline_lock.locked():
+        return {"error": "A job is already running"}
+    async with _pipeline_lock:
+        if state.running:
+            return {"error": "A job is already running"}
+        state.running = True
+        state.progress = 0
+        asyncio.create_task(run_flywheel(req))
+    return {"status": "started"}
 
 
 @app.websocket("/ws")
