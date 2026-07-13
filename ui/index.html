@@ -328,6 +328,46 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 .history-header-title { font-family: var(--font-sans); font-size: 16px; font-weight: 700; }
 .history-close { font-size: 20px; cursor: pointer; color: var(--text-2); background: none; border: none; padding: 4px 8px; border-radius: 4px; }
 .history-close:hover { color: var(--text-0); background: var(--bg-3); }
+/* ── Flywheel overlay ─────────────────────────────────────────────────── */
+.fw-overlay { display: none; position: fixed; inset: 0; z-index: 500; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); }
+.fw-overlay.open { display: flex; align-items: center; justify-content: center; animation: tip-in 0.15s ease; }
+.fw-panel { width: 92vw; max-width: 880px; height: 88vh; background: var(--bg-1); border: 1px solid var(--border-bright); border-radius: 8px; display: grid; grid-template-rows: auto 1fr; overflow: hidden; box-shadow: 0 16px 48px rgba(0,0,0,0.6); }
+.fw-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid var(--border); }
+.fw-title { font-family: var(--font-sans); font-size: 16px; font-weight: 700; }
+.fw-title small { font-weight: 400; color: var(--text-2); font-size: 11px; margin-left: 8px; letter-spacing: 0.2px; }
+.fw-body { overflow-y: auto; padding: 20px 24px; }
+.fw-intro { padding: 12px 16px; background: var(--bg-2); border: 1px solid var(--border); border-left: 3px solid var(--purple); border-radius: var(--radius); font-size: 12px; color: var(--text-1); margin-bottom: 20px; line-height: 1.55; }
+.fw-actions { display: flex; align-items: center; gap: 12px; margin: 22px 0 6px; }
+.fw-stages { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 18px; }
+.fw-chip { display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 11px; padding: 5px 11px; border-radius: 20px; border: 1px solid var(--border); background: var(--bg-2); color: var(--text-2); }
+.fw-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-3); }
+.fw-chip[data-status="running"] { border-color: var(--amber); color: var(--amber); }
+.fw-chip[data-status="running"] .dot { background: var(--amber); box-shadow: 0 0 8px var(--amber); animation: ind-pulse 1.5s infinite; }
+.fw-chip[data-status="success"] { border-color: var(--green-dim); color: var(--green); }
+.fw-chip[data-status="success"] .dot { background: var(--green); }
+.fw-chip[data-status="failed"] { border-color: var(--red-dim); color: var(--red); }
+.fw-chip[data-status="failed"] .dot { background: var(--red); }
+.fw-chip[data-status="skipped"] { opacity: 0.4; }
+.fw-decision { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; padding: 16px 20px; border-radius: var(--radius); margin-bottom: 18px; border: 1px solid var(--border-bright); background: var(--bg-2); }
+.fw-verdict-badge { font-family: var(--font-sans); font-weight: 800; font-size: 22px; letter-spacing: 1px; padding: 8px 18px; border-radius: 6px; }
+.fw-verdict-badge.keep { background: rgba(34,197,94,0.15); color: var(--green); border: 1px solid var(--green-dim); }
+.fw-verdict-badge.hold { background: rgba(245,158,11,0.12); color: var(--amber); border: 1px solid var(--amber-dim); }
+.fw-verdict-badge.rollback, .fw-verdict-badge.error { background: rgba(239,68,68,0.12); color: var(--red); border: 1px solid var(--red-dim); }
+.fw-human-gate { font-family: var(--font-mono); font-size: 10px; font-weight: 700; color: var(--purple); border: 1px solid var(--purple); border-radius: 4px; padding: 3px 8px; letter-spacing: 0.5px; }
+.fw-macro { font-family: var(--font-mono); font-size: 13px; color: var(--text-1); }
+.fw-table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 12px; margin: 8px 0 16px; }
+.fw-table th { text-align: left; color: var(--text-2); font-weight: 500; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 11px; }
+.fw-table td { padding: 6px 10px; border-bottom: 1px solid var(--bg-3); color: var(--text-1); }
+.fw-v { font-weight: 700; }
+.fw-v.improved { color: var(--green); }
+.fw-v.regressed { color: var(--red); }
+.fw-v.inconclusive { color: var(--text-2); }
+.fw-v.borderline { color: var(--amber); }
+.fw-reasons { list-style: none; padding: 0; margin: 8px 0; }
+.fw-reasons li { font-size: 12px; color: var(--text-1); padding: 4px 0 4px 16px; position: relative; line-height: 1.5; }
+.fw-reasons li::before { content: '\203A'; position: absolute; left: 0; color: var(--text-3); }
+.fw-meta { font-family: var(--font-mono); font-size: 11px; color: var(--text-2); word-break: break-all; margin-top: 8px; }
+.fw-section-label { font-family: var(--font-sans); font-size: 13px; font-weight: 700; color: var(--text-0); margin: 18px 0 8px; }
 .history-body { display: grid; grid-template-columns: 320px 1fr; overflow: hidden; }
 .history-run-list { overflow-y: auto; border-right: 1px solid var(--border); padding: 12px 0; }
 .history-run-item { padding: 12px 16px; cursor: pointer; border-left: 3px solid transparent; transition: all 0.12s; }
@@ -372,6 +412,7 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
     <div class="header-right">
       <div class="gpu-badge"><div class="dot"></div><span id="gpu-name">Radeon 8060S &middot; 112GB GTT</span></div>
       <button class="btn" onclick="openHistory()" title="View logs from past pipeline runs">&#128337; History</button>
+      <button class="btn" onclick="openFlywheel()" title="Run a gated foundry-flywheel improvement iteration">&#128260; Flywheel</button>
       <div class="settings-wrap">
         <button class="settings-btn" onclick="toggleSettings()"><span class="gear">&#9881;</span> Settings</button>
         <div class="settings-pop" id="settings-pop">
@@ -507,6 +548,41 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
           <div class="history-log-placeholder">Select a log file to view its contents</div>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="fw-overlay" id="flywheel-overlay" onclick="if(event.target===this)closeFlywheel()">
+  <div class="fw-panel">
+    <div class="fw-header">
+      <div class="fw-title">Flywheel <small>train &rarr; quantize &rarr; signal &rarr; rollout &rarr; judge &rarr; gate &rarr; decide</small></div>
+      <button class="history-close" onclick="closeFlywheel()">&times;</button>
+    </div>
+    <div class="fw-body">
+      <div class="fw-intro">
+        Runs one <b>pre-built-mode</b> foundry-flywheel iteration: two served models are measured on deterministic foundry_gym tasks, scored by the gym verifier and veredict, then statistically gated by did-it-help into a <b>KEEP / ROLLBACK / HOLD</b> decision. Leave <b>Candidate Model</b> empty for an A/A control &mdash; the honest outcome is HOLD. This shares the single GPU job slot with the pipeline (they cannot run at once). Produced-mode (train + quantize on) is not exposed here yet.
+      </div>
+      <div class="form-grid">
+        <div class="form-group span-2"><label class="form-label" data-tip="Served model id for the BASE arm (an llama-swap model on the endpoint below).">Base Model</label><input class="form-input" id="fw-base-model" value="qwen3.5:9b"></div>
+        <div class="form-group span-2"><label class="form-label" data-tip="Served model id for the CANDIDATE arm. Leave empty to compare the base against itself (A/A control) — the flywheel should HOLD.">Candidate Model</label><input class="form-input" id="fw-candidate-model" placeholder="empty = A/A control (expect HOLD)"></div>
+        <div class="form-group"><label class="form-label" data-tip="Comma-separated foundry_gym families; each becomes one did-it-help axis. e.g. math_logic, code_repair, struct_extract.">Families (csv)</label><input class="form-input" id="fw-families" value="math_logic"></div>
+        <div class="form-group"><label class="form-label" data-tip="Tasks per family. Minimum 2 (paired stats need at least two tasks). Keep small on a shared box.">N Tasks</label><input class="form-input" type="number" min="2" id="fw-n-tasks" value="4"></div>
+        <div class="form-group"><label class="form-label" data-tip="Task difficulty passed to the gym generator (0.0–1.0).">Difficulty</label><input class="form-input" type="number" step="0.1" id="fw-difficulty" value="0.3"></div>
+        <div class="form-group"><label class="form-label" data-tip="Comma-separated sampling seeds; N runs per (task, arm) cell.">Seeds (csv)</label><input class="form-input" id="fw-seeds" value="17,29"></div>
+        <div class="form-group"><label class="form-label" data-tip="Max completion tokens per generation.">Max Tokens</label><input class="form-input" type="number" id="fw-max-tokens" value="640"></div>
+        <div class="form-group"><label class="form-label" data-tip="did-it-help bootstrap iterations. 2000 is a fast demo default; 10000 for a real gate.">Bootstrap Iters</label><input class="form-input" type="number" id="fw-bootstrap-iters" value="2000"></div>
+        <div class="form-group span-2"><label class="form-label" data-tip="OpenAI-compatible endpoint that serves both arms. Default is llama-swap on this box.">Base URL</label><input class="form-input" id="fw-base-url" value="http://127.0.0.1:4004/v1"></div>
+        <div class="form-group"><label class="form-label" data-tip="Practical-significance floor for KEEP: a statistically real but tiny macro win below this is declined. Blank = flywheel default (0.0).">Min Macro Delta</label><input class="form-input" type="number" step="0.01" id="fw-min-macro-delta" placeholder="default 0.0"></div>
+        <div class="form-group"><label class="form-label" data-tip="Minimum candidate veredict pass-rate; below it the candidate ROLLBACKs on contract. Blank = not gating on veredict.">Veredict Floor</label><input class="form-input" type="number" step="0.01" id="fw-veredict-floor" placeholder="none"></div>
+        <div class="form-group span-2"><label class="form-label" data-tip="Iteration name (prefix of the iteration id and manifest dir).">Name</label><input class="form-input" id="fw-name" value="flywheel-ui"></div>
+      </div>
+      <div class="fw-actions">
+        <button class="btn btn-primary" id="fw-run" onclick="runFlywheel()">Run Flywheel</button>
+        <span id="fw-status" style="font-size:12px;color:var(--text-2)"></span>
+      </div>
+      <div class="fw-section-label">Stages</div>
+      <div class="fw-stages" id="fw-stages"></div>
+      <div class="fw-results" id="fw-results" style="display:none"></div>
     </div>
   </div>
 </div>
@@ -936,6 +1012,10 @@ function connectWS() {
       // Check if all stages completed
       const allDone = document.querySelectorAll('.stage-item[data-status="failed"]').length === 0;
       if (allDone) showStatus('Pipeline complete', 'success');
+    } else if (m.type === 'flywheel_stage') {
+      setFwStage(m.stage, m.status);
+    } else if (m.type === 'flywheel_done') {
+      renderFwResult(m);
     }
   };
   S.ws.onclose = () => setTimeout(connectWS, 2000);
@@ -954,6 +1034,10 @@ function setPipelineRunning(running) {
   btnRun.disabled = running;
   btnRun.textContent = running ? 'Running...' : 'Run Pipeline';
   btnStop.style.display = running ? 'inline-block' : 'none';
+  // Keep the flywheel Run button mutually exclusive with the pipeline: one GPU
+  // job at a time, enforced server-side by the shared lock + state.running.
+  const fwRun = document.getElementById('fw-run');
+  if (fwRun) { fwRun.disabled = running; fwRun.textContent = running ? 'Running...' : 'Run Flywheel'; }
 }
 
 // ── Stage Navigation ───────────────────────────────────────────────────────
@@ -1734,6 +1818,136 @@ async function initAuth() {
     }
   } catch(e) { /* server may not be ready */ }
   updateAuthButton();
+}
+
+// ── Flywheel ────────────────────────────────────────────────────────────────
+const FW_STAGES = ['train','quantize','signal','rollout','judge','gate','decide'];
+
+/** Open the flywheel overlay and reflect the current job/stage state. */
+function openFlywheel() {
+  document.getElementById('flywheel-overlay').classList.add('open');
+  renderFwStages();
+  const btn = document.getElementById('fw-run');
+  if (btn) { btn.disabled = S.running; btn.textContent = S.running ? 'Running...' : 'Run Flywheel'; }
+}
+
+/** Close the flywheel overlay. */
+function closeFlywheel() {
+  document.getElementById('flywheel-overlay').classList.remove('open');
+}
+
+/** Read a flywheel form input, falling back to a default when blank. */
+function fwVal(id, dflt) {
+  const el = document.getElementById(id);
+  if (!el) return dflt;
+  const v = (el.value == null ? '' : el.value).trim();
+  return v === '' ? dflt : v;
+}
+
+/** Render the flywheel stage chips from the tracked statuses in S.fwStages. */
+function renderFwStages() {
+  const el = document.getElementById('fw-stages');
+  if (!el) return;
+  const cur = S.fwStages || {};
+  el.innerHTML = FW_STAGES.map(s => {
+    const st = cur[s] || 'pending';
+    return `<div class="fw-chip" data-fwstage="${s}" data-status="${st}"><span class="dot"></span>${s}</div>`;
+  }).join('');
+}
+
+/** Update one flywheel stage chip (called from WS flywheel_stage messages). */
+function setFwStage(stage, status) {
+  S.fwStages = S.fwStages || {};
+  S.fwStages[stage] = status;
+  const chip = document.querySelector(`.fw-chip[data-fwstage="${stage}"]`);
+  if (chip) chip.dataset.status = status; else renderFwStages();
+}
+
+function fwFmtDelta(x) { return (x == null || isNaN(x)) ? '—' : (x >= 0 ? '+' : '') + Number(x).toFixed(4); }
+function fwFmtCI(ci) { return (!Array.isArray(ci) || ci.length < 2) ? '—' : `[${Number(ci[0]).toFixed(4)}, ${Number(ci[1]).toFixed(4)}]`; }
+
+/** Render the final flywheel verdict + decision (from a flywheel_done message). */
+function renderFwResult(m) {
+  const el = document.getElementById('fw-results');
+  const st = document.getElementById('fw-status');
+  if (!el) return;
+  el.style.display = 'block';
+  if (!m.ok) {
+    if (st) st.textContent = 'Failed: ' + (m.error || 'unknown');
+    el.innerHTML = `<div class="fw-decision"><span class="fw-verdict-badge error">ERROR</span><span class="fw-macro">${escapeHtml(m.error || 'flywheel failed')}</span></div>`
+      + (m.manifest_path ? `<div class="fw-meta">partial manifest: ${escapeHtml(m.manifest_path)}</div>` : '');
+    return;
+  }
+  if (st) st.textContent = '';
+  const d = m.decision || {};
+  const v = m.verdict || {};
+  const action = (d.action || 'hold').toLowerCase();
+  const axes = v.axes || {};
+  const rows = Object.keys(axes).map(name => {
+    const a = axes[name] || {};
+    const vv = (a.verdict || '').toLowerCase();
+    const note = a.verdict_note ? ` <span style="color:var(--text-3)">(${escapeHtml(a.verdict_note)})</span>` : '';
+    return `<tr><td>${escapeHtml(name)}</td><td>${fwFmtDelta(a.delta_mean)}</td><td>${fwFmtCI(a.ci95)}</td><td>${a.p_sign_flip == null ? '—' : a.p_sign_flip}</td><td class="fw-v ${vv}">${escapeHtml(a.verdict || '—')}${note}</td></tr>`;
+  }).join('');
+  const reasons = (d.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
+  const nb = d.next_baseline || {};
+  el.innerHTML = `
+    <div class="fw-decision">
+      <span class="fw-verdict-badge ${action}">${escapeHtml((d.action || 'hold').toUpperCase())}</span>
+      ${d.human_gate ? '<span class="fw-human-gate">HUMAN GATE</span>' : ''}
+      <span class="fw-macro">macro &Delta; ${fwFmtDelta(v.macro_delta)} &nbsp;&middot;&nbsp; CI95 ${fwFmtCI(v.macro_ci95)}</span>
+    </div>
+    <div class="fw-section-label">Per-axis verdicts</div>
+    <table class="fw-table"><thead><tr><th>axis</th><th>&Delta; mean</th><th>CI95</th><th>p_flip</th><th>verdict</th></tr></thead><tbody>${rows || '<tr><td colspan="5">no axes</td></tr>'}</tbody></table>
+    <div class="fw-section-label">Reasons</div>
+    <ul class="fw-reasons">${reasons || '<li>—</li>'}</ul>
+    <div class="fw-meta">promoted: ${escapeHtml(d.promoted || '—')} &nbsp;|&nbsp; next baseline: ${escapeHtml(nb.model_id || nb.label || '—')}</div>
+    <div class="fw-meta">iteration: ${escapeHtml(m.iteration_id || '—')}</div>
+    <div class="fw-meta">manifest: ${escapeHtml(m.manifest_path || '—')}</div>`;
+}
+
+/** Validate the flywheel form, POST /api/flywheel, and start the iteration. */
+async function runFlywheel() {
+  if (S.running) { showStatus('A job is already running.', 'warn'); return; }
+  const req = {
+    base_model: fwVal('fw-base-model', 'qwen3.5:9b'),
+    candidate_model: fwVal('fw-candidate-model', '') || null,
+    families: fwVal('fw-families', 'math_logic'),
+    n_tasks: parseInt(fwVal('fw-n-tasks', '4'), 10),
+    difficulty: parseFloat(fwVal('fw-difficulty', '0.3')),
+    seeds: fwVal('fw-seeds', '17,29'),
+    max_tokens: parseInt(fwVal('fw-max-tokens', '640'), 10),
+    base_url: fwVal('fw-base-url', 'http://127.0.0.1:4004/v1'),
+    bootstrap_iters: parseInt(fwVal('fw-bootstrap-iters', '2000'), 10),
+    name: fwVal('fw-name', 'flywheel-ui'),
+  };
+  const mmd = fwVal('fw-min-macro-delta', '');
+  if (mmd !== '') req.min_macro_delta = parseFloat(mmd);
+  const vf = fwVal('fw-veredict-floor', '');
+  if (vf !== '') req.veredict_floor = parseFloat(vf);
+
+  // Reset the flywheel UI for a fresh run.
+  S.fwStages = {};
+  renderFwStages();
+  document.getElementById('fw-results').style.display = 'none';
+  document.getElementById('fw-results').innerHTML = '';
+  document.getElementById('fw-status').textContent = '';
+  setPipelineRunning(true);   // shared lock: disables Run Pipeline + Run Flywheel, shows Stop
+  clearLogs();
+  appendLog(`Flywheel: base=${req.base_model} candidate=${req.candidate_model || '(A/A control)'} families=${req.families} n_tasks=${req.n_tasks} seeds=${req.seeds}`, 'stage');
+  try {
+    const r = await authFetch('/api/flywheel', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(req)});
+    const d = await r.json();
+    if (d.error) {
+      appendLog(d.error, 'error');
+      showStatus(d.error, 'error');
+      setPipelineRunning(false);
+    }
+  } catch (e) {
+    appendLog(`Flywheel request failed: ${e.message}`, 'error');
+    showStatus(`Failed to start: ${e.message}`, 'error');
+    setPipelineRunning(false);
+  }
 }
 
 (async () => {
