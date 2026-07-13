@@ -81,12 +81,35 @@ async def verify_api_key(authorization: str = Header(default="")):
 
 app = FastAPI(title="Foundry")
 
+# Explicit CORS allowlist -- no wildcard. The UI is a single-page app served
+# from this same origin (index.html + static assets) and authenticates via a
+# Bearer token (FOUNDRY_API_KEY), never cookies, so allow_credentials is left
+# at its default (False): explicit origins + credentials is only needed for
+# cookie-based auth, which this app doesn't use.
+#
+# Origins come from FOUNDRY_UI_ORIGINS (comma-separated) when set, else a
+# built-in list covering loopback + this box's LAN addresses/hostname on the
+# UI port. Extend FOUNDRY_UI_ORIGINS if the box gets a new LAN IP.
+_UI_PORT = os.environ.get("FOUNDRY_UI_PORT", str(foundry_settings.ui_port))
+_default_origins = [
+    f"http://localhost:{_UI_PORT}", f"http://127.0.0.1:{_UI_PORT}",
+    f"http://192.168.0.29:{_UI_PORT}",      # eno1 (static LAN)
+    f"http://192.168.0.194:{_UI_PORT}",     # wlp195s0 (dynamic LAN)
+    f"http://masterserver:{_UI_PORT}",      # hostname
+    f"http://masterserver.local:{_UI_PORT}",
+]
+_env_origins = os.environ.get("FOUNDRY_UI_ORIGINS", "")
+ALLOWED_ORIGINS = (
+    [o.strip() for o in _env_origins.split(",") if o.strip()]
+    if _env_origins else _default_origins
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 FOUNDRY_DIR = Path(__file__).resolve().parent.parent
@@ -502,6 +525,25 @@ def _resolve_out(output_dir: str) -> Path:
     """Resolve output_dir the same way run_script does."""
     p = Path(output_dir)
     return p if p.is_absolute() else FOUNDRY_DIR / p
+
+
+def _assert_output_dir_contained(output_dir: str) -> None:
+    """Reject an output_dir that would escape the Foundry tree.
+
+    ``run_script`` writes a generated stage script + log into ``output_dir``
+    and then executes it with the venv Python — this is the actual
+    write+exec surface behind /api/run. An absolute path or a ``../`` relative
+    path here would let an authenticated LAN client write and run a script
+    anywhere the service user can reach. Resolve symlinks/``..`` and require
+    the result to stay under FOUNDRY_DIR.
+    """
+    resolved = _resolve_out(output_dir).resolve()
+    root = FOUNDRY_DIR.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise HTTPException(
+            status_code=400,
+            detail=f"output_dir must resolve inside {root} (got {resolved})",
+        )
 
 
 async def do_training(cfg: RunRequest) -> bool:
@@ -1533,6 +1575,7 @@ async def start_pipeline(cfg: RunRequest):
     Returns an error if a pipeline is already in progress.
     Uses an asyncio.Lock to prevent race conditions from rapid concurrent requests.
     """
+    _assert_output_dir_contained(cfg.training.output_dir)
     if _pipeline_lock.locked():
         return {"error": "Pipeline is already running"}
     async with _pipeline_lock:

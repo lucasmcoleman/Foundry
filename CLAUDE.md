@@ -41,8 +41,10 @@ ui/                       # FastAPI + WebSocket live log streaming UI
 tests/                    # Offline pytest suite + GPU integration test (gpu/slow markers)
 ```
 
-> NOTE: `datagen/` and `gardener/` have no tracked source (only stale
-> `__pycache__`/logs on disk); their optional `datagen` extras were removed from
+> NOTE: `datagen/` and `gardener/` were removed 2026-07-11 (the leftover
+> `__pycache__`/logs directories were deleted; their tracked source had already
+> been migrated out in April 2026 — see `git log -- datagen/ gardener/`,
+> commit `f6ed85f`). Their optional `datagen` extras were removed from
 > `pyproject.toml`. Restore from git history if you need them.
 
 ## Environment Setup
@@ -150,7 +152,7 @@ prompt/completion > text):
 
 A source whose rows disagree on shape fails loudly rather than training on a mix.
 
-Training data generators in `datagen/` (ZeroClaw tool-calls) and `gardener/` (NC gardening, uses Claude API).
+Training data generators formerly lived in `datagen/` (ZeroClaw tool-calls) and `gardener/` (NC gardening, uses Claude API); both were removed 2026-07-11 (see the NOTE above) — the generators now live at https://github.com/lucasmcoleman/training-data.
 
 ## Known Issues
 

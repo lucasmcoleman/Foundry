@@ -1,0 +1,77 @@
+{
+  "n": 100,
+  "seed_base": 1000,
+  "families": [
+    {
+      "family": "code_repair",
+      "n": 100,
+      "reference_threshold": 0.95,
+      "corrupted_threshold": 0.6,
+      "ref_mean": 1.0,
+      "ref_min": 1.0,
+      "ref_ok_count": 100,
+      "cor_mean": 0.23520454545454544,
+      "cor_max": 0.6,
+      "cor_ok_count": 100,
+      "violation_count": 0,
+      "violations": []
+    },
+    {
+      "family": "math_logic",
+      "n": 100,
+      "reference_threshold": 0.95,
+      "corrupted_threshold": 0.15,
+      "ref_mean": 1.0,
+      "ref_min": 1.0,
+      "ref_ok_count": 100,
+      "cor_mean": 0.1,
+      "cor_max": 0.1,
+      "cor_ok_count": 100,
+      "violation_count": 0,
+      "violations": []
+    },
+    {
+      "family": "orchestrator_planning",
+      "n": 100,
+      "reference_threshold": 0.95,
+      "corrupted_threshold": 0.2,
+      "ref_mean": 1.0,
+      "ref_min": 1.0,
+      "ref_ok_count": 100,
+      "cor_mean": 0.0,
+      "cor_max": 0.0,
+      "cor_ok_count": 100,
+      "violation_count": 0,
+      "violations": []
+    },
+    {
+      "family": "struct_extract",
+      "n": 100,
+      "reference_threshold": 0.95,
+      "corrupted_threshold": 0.2,
+      "ref_mean": 1.0,
+      "ref_min": 1.0,
+      "ref_ok_count": 100,
+      "cor_mean": 0.0,
+      "cor_max": 0.0,
+      "cor_ok_count": 100,
+      "violation_count": 0,
+      "violations": []
+    },
+    {
+      "family": "tool_orchestration",
+      "n": 100,
+      "reference_threshold": 0.95,
+      "corrupted_threshold": 0.35,
+      "ref_mean": 1.0,
+      "ref_min": 1.0,
+      "ref_ok_count": 100,
+      "cor_mean": 0.06666666666666667,
+      "cor_max": 0.3333333333333333,
+      "cor_ok_count": 100,
+      "violation_count": 0,
+      "violations": []
+    }
+  ],
+  "total_violations": 0
+}

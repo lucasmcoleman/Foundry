@@ -1,3 +1,6 @@
+> **HISTORICAL (superseded 2026-07-11).** Current architecture: `CLAUDE.md`;
+> ROCmFPX: `docs/rocmfpx.md`.
+
 # Foundry Map
 
 Generated: 2026-04-03 | Production Hardening Pass

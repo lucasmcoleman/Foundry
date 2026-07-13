@@ -1,6 +1,6 @@
 # Foundry
 
-ML fine-tuning and hybrid quantization pipeline for AMD ROCm. Provides a 7-stage workflow — QLoRA training, LoRA merge (export), Heretic abliteration, REAP MoE expert pruning, QAT-LoRA (quantization-aware training), MagicQuant hybrid quantization, and HuggingFace Hub upload — with a FastAPI web UI for orchestration. Heretic, REAP, and QAT are optional stages.
+ML fine-tuning and hybrid quantization pipeline for AMD ROCm. Provides an 8-stage workflow — QLoRA training, LoRA merge (export), Heretic abliteration, REAP MoE expert pruning, QAT-LoRA (quantization-aware training), MagicQuant hybrid quantization, ROCmFPX AMD-native quantization, and HuggingFace Hub upload — with a FastAPI web UI for orchestration. Heretic, REAP, QAT, and ROCmFPX are optional stages.
 
 Designed for AMD APU unified memory systems (Strix Halo, gfx1151) where CPU and GPU share system RAM via GTT. Uses custom streaming loaders that process models shard-by-shard to avoid the memory bottlenecks of standard HuggingFace `from_pretrained()`.
 
@@ -141,9 +141,9 @@ All settings can be configured via environment variables with `FOUNDRY_` prefix 
 
 ## Pipeline Stages
 
-The pipeline has seven stages; Heretic (3), REAP (4), and QAT (5) are optional
-and off by default. Enable them with `--heretic` / `--reap` / `--qat` on the CLI
-or via the UI.
+The pipeline has eight stages; Heretic (3), REAP (4), QAT (5), and ROCmFPX (7)
+are optional and off by default. Enable them with `--heretic` / `--reap` /
+`--qat` / `--rocmfpx` on the CLI or via the UI.
 
 ### 1. Training
 Custom fast QLoRA with shard-by-shard BnB 4-bit quantized loading. Uses completion-only loss masking (only assistant turns contribute to loss). Peak ~30 GB for 40B models.
@@ -165,7 +165,10 @@ Validated (confound-controlled, Qwen2.5-0.5B base, aggressive Q4_K-attention/MXF
 ### 6. MagicQuant
 Evolutionary per-tensor hybrid quantization. Generates tiered GGUF files (Q4/Q5/Q6) with different size-quality tradeoffs. See [MagicQuant](../MagicQuant/) for details.
 
-### 7. Upload
+### 7. ROCmFPX (optional, off by default)
+AMD-native uniform-quant GGUFs via [ciru-ai/ROCmFPX](https://github.com/ciru-ai/ROCmFPX) (a git-cloned, compiled llama.cpp fork — not a pip package), producing ROCmFP3/4/6/8 GGUFs tuned for this box's Strix Halo (gfx1151) hardware. Two modes: uniform presets (straight + tool-calling/JSON-safe "agent" variants) and MagicQuant-hybrid (`mq-q4`/`mq-q5`/`mq-q6`), which reproduces a MagicQuant tier's per-group precision layout in ROCmFPX-family types via `llama-quantize --tensor-type-file`. Experimental upstream research build; enable with `--rocmfpx` or the UI ROCmFPX card. Writes GGUFs to `<output>/rocmfpx/`. See [docs/rocmfpx.md](docs/rocmfpx.md).
+
+### 8. Upload
 Uploads artifacts to HuggingFace Hub with auto-generated model card, progress reporting, and dry-run validation.
 
 ### Resume / re-run
