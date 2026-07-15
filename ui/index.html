@@ -690,7 +690,7 @@ const S = {
     qat: { config_source: '', tier: 'Q4', dataset: '', lora_r: 32, lora_alpha: 64.0, epochs: 1.0, max_steps: -1, lr: 0.0002, max_seq_len: 512 },
     magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, iq_schemes: false, seed: null, use_imatrix: false, imatrix_corpus: null, enable_kl: false, kl_weight: 0.1, enable_speed_bench: false, measurement_chunks: null, stream_aware: false, head_aggressive: false, speed_aware: false, speed_metric: 'bytes', speed_weight: null, use_bytes_tps: false, calibration_source: '', write_calibration: false },
     rocmfpx: { formats: ['rocmfp4-agent','rocmfp6-agent','rocmfp8-agent'], rocmfpx_hint: '', source_model: '', imatrix: '' },
-    upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
+    upload: { repo_id: '', repo_id_auto: true, private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
   mqTiers: ['Q2','Q3','Q4','Q5','Q6','Q8'],
   rcFormats: ['rocmfp3','rocmfp3-agent','rocmfp4','rocmfp4-agent','rocmfp6','rocmfp6-agent','rocmfp8','rocmfp8-agent','mq-q4','mq-q5','mq-q6'],
@@ -1141,6 +1141,7 @@ function suggestRepoId() {
   const hasHeretic = stages.has('heretic');
   const hasReap = stages.has('reap');
   const hasMQ = stages.has('magicquant');
+  const hasFPX = stages.has('rocmfpx');
 
   // Resolve the base model name from the first available source
   let modelName = '';
@@ -1150,6 +1151,8 @@ function suggestRepoId() {
     modelName = S.config.export.source_model;
   } else if (hasMQ && S.config.magicquant.source_model) {
     modelName = S.config.magicquant.source_model;
+  } else if (hasFPX && S.config.rocmfpx.source_model) {
+    modelName = S.config.rocmfpx.source_model;
   } else {
     modelName = S.config.training.model_name;
   }
@@ -1186,11 +1189,16 @@ function suggestRepoId() {
     if (tags.length) dataTag = '-' + tags.join('-');
   }
 
-  // Build suffix from active post-training stages
+  // Build suffix from active post-training stages. Quant-family suffixes match
+  // the sibling-repo convention in core/hf_upload.py plan_gguf_repos(): with
+  // both families enabled the upload splits "<base>-GGUF" into
+  // -MagicQuant-GGUF / -ROCmFPX-GGUF siblings itself.
   const parts = [];
   if (hasHeretic) parts.push('Heretic-Uncensored');
   if (hasReap) parts.push('Pruned');
-  if (hasMQ) parts.push('GGUF');
+  if (hasMQ && hasFPX) parts.push('GGUF');
+  else if (hasMQ) parts.push('MagicQuant-GGUF');
+  else if (hasFPX) parts.push('ROCmFPX-GGUF');
   else if (exportOn) parts.push('GGUF');
   else parts.push('LoRA');
 
@@ -1484,6 +1492,12 @@ function renderUpload() {
   const c = S.config.upload;
   const on = S.enabledStages.has('upload');
   const suggested = suggestRepoId();
+  // Auto-naming: keep repo_id synced to the suggestion (model + enabled
+  // stages) until the user types a custom value; clearing the field re-arms it.
+  if (c.repo_id_auto !== false && c.repo_id !== suggested) {
+    c.repo_id = suggested;
+    saveFormState();
+  }
   const trainingOn = S.enabledStages.has('training');
   const exportOn = S.enabledStages.has('export');
   const mqOn = S.enabledStages.has('magicquant');
@@ -1496,8 +1510,10 @@ function renderUpload() {
   <div class="${on?'':'stage-content-disabled'}">
   ${uploadHints.length ? depBanner('info', uploadHints.join('<br>') + '<br>Make sure the output directory contains artifacts from a previous run, or enable the upstream stages.') : ''}
   <div class="form-grid">
-    <div class="form-group span-2">${L('Repository ID','HuggingFace repo in the format username/model-name. Will be created if it doesn&apos;t exist.')}<input class="form-input" data-key="upload.repo_id" value="${c.repo_id}" placeholder="${S.hfUsername ? suggested : 'your-username/' + suggested}">
-    ${!c.repo_id ? `<div class="form-hint">Suggested name: <span style="color:var(--amber);cursor:pointer" onclick="document.querySelector('[data-key=\\'upload.repo_id\\']').value='${suggested}';S.config.upload.repo_id='${suggested}';saveFormState();renderStageContent()">${suggested}</span> (click to use)</div>` : ''}</div>
+    <div class="form-group span-2">${L('Repository ID','HuggingFace repo in the format username/model-name. Will be created if it doesn&apos;t exist. Auto-named from the model + enabled stages until you type a custom value; clear the field to re-enable auto-naming.')}<input class="form-input" data-key="upload.repo_id" value="${c.repo_id}" placeholder="${S.hfUsername ? suggested : 'your-username/' + suggested}" oninput="S.config.upload.repo_id_auto=(this.value==='');saveFormState()">
+    ${c.repo_id_auto !== false
+      ? `<div class="form-hint">Auto-named from model + stages (type to override, clear to re-enable)</div>`
+      : `<div class="form-hint">Custom name. Suggested: <span style="color:var(--amber);cursor:pointer" onclick="S.config.upload.repo_id_auto=true;S.config.upload.repo_id='';saveFormState();renderStageContent()">${suggested}</span> (click to re-enable auto-naming)</div>`}</div>
     <div class="form-group">${L('License','Leave blank to auto-detect from the base model. Or enter an SPDX identifier: apache-2.0, mit, llama3, cc-by-nc-4.0')}<input class="form-input" data-key="upload.license" value="${c.license}" placeholder="Auto-detect from base model"></div>
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.private" ${c.private?'checked':''}><span class="form-label" data-tip="Private repos are only visible to you and collaborators you explicitly add." style="margin:0">Private repository</span></label></div>
     <div class="form-divider"></div><div class="form-section-label">What to upload</div>
