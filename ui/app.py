@@ -295,6 +295,9 @@ class ROCmFPXCfg(BaseModel):
 
 class UploadCfg(BaseModel):
     repo_id: str = ""
+    # Auto-derive repo_id from model + enabled stages on every render; a manual
+    # edit turns this off (clearing the field turns it back on).
+    repo_id_auto: bool = True
     private: bool = True
     license: str = ""  # empty = auto-detect from base model
     upload_gguf: bool = True
@@ -1136,6 +1139,40 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
     return ok
 
 
+def derive_base_model(cfg: RunRequest, out_abs: Path) -> str:
+    """Resolve the true source model for card attribution / license detection.
+
+    Prefers the export stage's persisted resolution (``_export_entry.cfg.json``
+    — the ground truth for what the uploaded artifacts were actually built
+    from, refreshed whenever export runs), then falls back to live config in
+    the same order the export stage resolves it. Never trusts
+    ``training.model_name`` when training is disabled: the UI form persists it
+    across runs, so it can name a *previous* run's model (this put a
+    ThinkingCap attribution on a Tess-4 card, 2026-07-15).
+    """
+    export_cfg = out_abs / "_export_entry.cfg.json"
+    if export_cfg.exists():
+        try:
+            persisted = json.loads(export_cfg.read_text()).get("base_model_id", "")
+            if persisted:
+                return persisted
+        except (json.JSONDecodeError, OSError):
+            pass
+    if "training" in cfg.enabled_stages:
+        return cfg.training.model_name
+    ec = cfg.export
+    if ec and ec.source_model:
+        adapter_cfg = Path(ec.source_model) / "adapter_config.json"
+        if adapter_cfg.exists():
+            try:
+                return json.loads(adapter_cfg.read_text()).get(
+                    "base_model_name_or_path", ec.source_model)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return ec.source_model
+    return cfg.training.model_name
+
+
 async def do_upload(cfg: RunRequest) -> bool:
     """Upload pipeline artifacts (GGUF, LoRA, merged) to HuggingFace Hub.
 
@@ -1157,13 +1194,16 @@ async def do_upload(cfg: RunRequest) -> bool:
     out_abs = _resolve_out(out)
 
     enabled = set(cfg.enabled_stages)
+    base_model = derive_base_model(cfg, out_abs)
+    await state.log(f"Base model (derived from run source): {base_model}")
+
     # Auto-detect license from base model if not explicitly set
     license_id = uc.license
     if not license_id or license_id == "auto":
         await state.log("Detecting license from base model...")
         try:
             from huggingface_hub import model_info as _mi
-            _info = _mi(tc.model_name)
+            _info = _mi(base_model)
             for _tag in (_info.tags or []):
                 if _tag.startswith("license:"):
                     license_id = _tag.split(":", 1)[1]
@@ -1184,7 +1224,7 @@ async def do_upload(cfg: RunRequest) -> bool:
         upload_lora=uc.upload_lora,
         upload_merged=uc.upload_merged,
         upload_dataset=uc.upload_dataset,
-        base_model=tc.model_name,
+        base_model=base_model,
         dataset_name=tc.datasets[0] if tc.datasets else "",
         did_training="training" in enabled,
         did_heretic="heretic" in enabled,
