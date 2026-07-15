@@ -200,7 +200,9 @@ def test_model_card_adds_mtp_section_with_serve_command(tmp_path, stub_gguf_sour
     assert "~1.6-1.9x" in card
     assert "2x the model's memory" in card
     assert "--spec-type draft-mtp" in card
-    assert str(gguf) in card
+    # Public card must reference the repo filename, never box-local paths
+    assert gguf.name in card
+    assert str(gguf) not in card
 
 
 def test_model_card_mtp_section_picks_first_mtp_gguf_among_several(tmp_path, stub_gguf_source, fixed_server_bin):
@@ -217,8 +219,8 @@ def test_model_card_mtp_section_picks_first_mtp_gguf_among_several(tmp_path, stu
     card = hf_upload.generate_model_card(cfg, [(plain, plain.name), (mtp, mtp.name)])
 
     assert "## Serving: MTP Speculative Decoding" in card
-    assert str(mtp) in card
-    assert str(plain) not in card.split("## Serving")[1]
+    assert mtp.name in card.split("## Serving")[1]
+    assert plain.name not in card.split("## Serving")[1]
 
 
 # ── /api/serve-command UI endpoint ──────────────────────────────────────────────
