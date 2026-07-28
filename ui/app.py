@@ -33,6 +33,7 @@ from pydantic import BaseModel, ValidationError
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 import markers
 from config import settings as foundry_settings
+from preflight import check_system_memory
 from reap_common import REAP_SUPPORTED_ARCHS, detect_model_arch as _detect_model_arch
 from services import (
     TrainingService,
@@ -597,10 +598,33 @@ def _assert_output_dir_contained(output_dir: str) -> None:
         )
 
 
+async def _mem_preflight(stage: str) -> bool:
+    """System-memory preflight gate, wired at the top of the heavy stage runners.
+
+    ``check_system_memory`` (core/preflight.py) takes a synchronous log
+    callback, but the UI's log sink (``state.log``) is a coroutine — buffer
+    the check's log lines and replay them through ``state.log`` afterward so
+    the failure reason (or the GTT informational warning) lands in the
+    WebSocket log stream, not just stdout. Marks the stage FAILED on the
+    caller's behalf when the gate fails, mirroring the existing failure
+    pattern in each do_* function.
+    """
+    buffered: list[tuple[str, str]] = []
+    ok = check_system_memory(stage, log=lambda msg, level="info": buffered.append((msg, level)))
+    for msg, level in buffered:
+        await state.log(msg, level)
+    if not ok:
+        await state.set_stage(stage, StageStatus.FAILED)
+    return ok
+
+
 async def do_training(cfg: RunRequest) -> bool:
     """Run the QLoRA training stage. Skips if LoRA adapters already exist."""
     tc = cfg.training
     out = _resolve_out(tc.output_dir)
+
+    if not await _mem_preflight("training"):
+        return False
 
     # Completion-marker resume: skip only when a valid marker matches the config
     # AND the key adapter file (adapter_model.safetensors) is present and
@@ -663,6 +687,9 @@ async def do_export(cfg: RunRequest) -> bool:
     out_abs = _resolve_out(out)
     training_enabled = "training" in cfg.enabled_stages
     mq_enabled = "magicquant" in cfg.enabled_stages
+
+    if not await _mem_preflight("export"):
+        return False
 
     # Completion-marker resume (audit M-skip-marker): skip only when a valid
     # marker matches AND the key artifact is present + non-empty.
@@ -748,6 +775,9 @@ async def do_heretic(cfg: RunRequest) -> bool:
     out = cfg.training.output_dir
     out_abs = _resolve_out(out)
     hc = cfg.heretic
+
+    if not await _mem_preflight("heretic"):
+        return False
 
     # Completion-marker resume (audit M-skip-marker).
     heretic_dir = out_abs / "heretic_model"
@@ -1000,6 +1030,9 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     mc = cfg.magicquant
     export_enabled = "export" in cfg.enabled_stages
 
+    if not await _mem_preflight("magicquant"):
+        return False
+
     # Completion-marker resume (audit M-skip-marker).
     mq_dir = out_abs / "magicquant"
     mq_hash = markers.config_hash({
@@ -1095,6 +1128,9 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
     if rc_cfg is None:
         await state.log("ROCmFPX stage enabled but no ROCmFPX config provided", "error")
         await state.set_stage("rocmfpx", StageStatus.FAILED)
+        return False
+
+    if not await _mem_preflight("rocmfpx"):
         return False
 
     # Completion-marker resume (mirrors do_magicquant).
