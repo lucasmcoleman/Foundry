@@ -23,7 +23,16 @@ def write_string(f, s):
 
 
 def read_value(f, vtype):
-    """Read a GGUF value and return (value, raw_bytes)."""
+    """Read a GGUF value and return (value, raw_bytes).
+
+    NOTE: the numeric ``vtype`` literals below (8=string, 4=uint32, ...) are
+    an independent, hand-typed copy of the same GGUF value-type tags
+    MagicQuant's ``magicquant/gguf/writer.py`` (``_GGUF_TYPE_*``) derives
+    from the installed ``gguf`` package's ``gguf.constants.GGUFValueType``
+    enum. writer.py is the canonical source for these; this standalone
+    script is deliberately not restructured to import from it (or from
+    `gguf`) -- kept in sync by hand if the format ever changes.
+    """
     start = f.tell()
     if vtype == 8:  # string
         val = read_string(f)

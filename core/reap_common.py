@@ -8,9 +8,12 @@ Centralizes three things the CLI and UI previously duplicated:
 """
 
 import json
+import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
+
+_log = logging.getLogger(__name__)
 
 # REAP-supported architectures.
 #
@@ -32,6 +35,117 @@ REAP_SUPPORTED_ARCHS = frozenset({
     "GptOssForCausalLM",
     "Glm4MoeForCausalLM",
 })
+
+
+# ---------------------------------------------------------------------------
+# Upstream drift check: REAP_SUPPORTED_ARCHS above is Foundry POLICY (hand-
+# curated, deliberately fixed to use real class names -- see the frozenset's
+# preceding comment and test_reap_arch.py's test_repo_id_entries_are_gone /
+# test_gpt_oss_class_name_present), NOT a value that should be silently
+# replaced by whatever reap.model_util.MODEL_ATTRS currently contains.
+#
+# reap.model_util.MODEL_ATTRS is a genuine upstream FACT (what the reap
+# package itself has registered) but is known to mix real HF architecture
+# class names with repo-id-shaped keys ("gpt-oss-20b",
+# "Qwen3-Coder-30B-A3B-Instruct") that can never equal detect_model_arch()'s
+# output (config.json's architectures[0] is always a valid Python class
+# name / identifier) -- and, as of the reap source tree checked at
+# /server/programming/reap/src, MODEL_ATTRS has no entry at all for
+# GptOssForCausalLM or DeepseekV3ForCausalLM even though Foundry has
+# separately verified REAP support for both. Blindly deriving
+# REAP_SUPPORTED_ARCHS from MODEL_ATTRS would therefore both add dead
+# entries and silently DROP two real, working architectures -- worse than
+# the hand-curated literal, not more correct.
+#
+# So: policy (REAP_SUPPORTED_ARCHS) stays local and authoritative. When the
+# `reap` package's model_util module happens to be importable in this
+# process, we opportunistically diff its MODEL_ATTRS keys against the
+# literal and log a warning naming any disagreement, so a human notices and
+# re-verifies -- never to change behavior on its own.
+# ---------------------------------------------------------------------------
+
+def _reap_supported_archs_diff(model_util_module) -> Optional[Dict[str, List[str]]]:
+    """Pure comparison of REAP_SUPPORTED_ARCHS against a
+    reap.model_util-shaped module object's MODEL_ATTRS registry.
+
+    ``model_util_module`` need only duck-type reap.model_util (expose a
+    ``MODEL_ATTRS`` mapping) -- tests inject a fake module object rather
+    than requiring the real (heavy, optional) ``reap`` package to be
+    installed.
+
+    Returns ``None`` if ``model_util_module`` has no ``MODEL_ATTRS``
+    attribute (not a valid model_util module). Otherwise returns
+    ``{"missing_from_literal": [...], "extra_in_literal": [...]}`` (each
+    possibly empty, sorted). Never logs, never raises -- callers decide
+    what to do with the result (see :func:`warn_if_reap_supported_archs_stale`).
+
+    ``missing_from_literal`` is restricted to identifier-shaped upstream
+    keys (``str.isidentifier()``): a HF architecture class name is always a
+    valid Python identifier, so a non-identifier upstream key (the known
+    repo-id-shaped quirks above) can never match anything
+    :func:`detect_model_arch` produces and is not a meaningful "missing"
+    diff.
+    """
+    attrs = getattr(model_util_module, "MODEL_ATTRS", None)
+    if attrs is None:
+        return None
+    upstream = frozenset(attrs)
+    missing = sorted(k for k in (upstream - REAP_SUPPORTED_ARCHS) if k.isidentifier())
+    extra = sorted(REAP_SUPPORTED_ARCHS - upstream)
+    return {"missing_from_literal": missing, "extra_in_literal": extra}
+
+
+def warn_if_reap_supported_archs_stale(model_util_module=None) -> None:
+    """Best-effort diagnostic: log a warning naming any disagreement between
+    REAP_SUPPORTED_ARCHS (Foundry policy) and the installed ``reap``
+    package's own reap.model_util.MODEL_ATTRS registry (upstream fact).
+
+    Never changes REAP_SUPPORTED_ARCHS and never raises. If
+    ``model_util_module`` is not given, tries ``import reap.model_util`` and
+    silently does nothing (the normal case) if that fails -- reap's src tree
+    is only put on sys.path (and its heavy optional deps stubbed) inside a
+    generated REAP subprocess script (see :func:`install_reap_stubs` /
+    :func:`reap_stub_block`), so it is not importable in most processes that
+    import this module. This makes the derive/compare path opportunistic:
+    it activates whenever reap happens to be importable, and is a silent
+    no-op otherwise -- the hand-curated literal is always what's actually
+    used by :func:`stage_reap` and the UI.
+    """
+    if model_util_module is None:
+        try:
+            import reap.model_util as model_util_module  # type: ignore[import-not-found]
+        except ImportError:
+            return
+    diff = _reap_supported_archs_diff(model_util_module)
+    if not diff:
+        return
+    missing, extra = diff["missing_from_literal"], diff["extra_in_literal"]
+    if not missing and not extra:
+        return
+    parts = []
+    if missing:
+        parts.append(
+            f"reap.model_util.MODEL_ATTRS has {missing} that "
+            f"REAP_SUPPORTED_ARCHS is missing"
+        )
+    if extra:
+        parts.append(
+            f"REAP_SUPPORTED_ARCHS has {extra} not present in "
+            f"reap.model_util.MODEL_ATTRS"
+        )
+    _log.warning(
+        "REAP_SUPPORTED_ARCHS (core/reap_common.py, hand-curated policy) "
+        "may be stale relative to the installed reap package's own "
+        "registry: %s. Re-verify before changing the literal -- "
+        "reap.model_util.MODEL_ATTRS is known to mix real class names with "
+        "repo-id-shaped keys that can never match a detected architecture "
+        "(see the comment above REAP_SUPPORTED_ARCHS).",
+        "; ".join(parts),
+    )
+
+
+# Opportunistic: a no-op unless `reap` is already importable in this process.
+warn_if_reap_supported_archs_stale()
 
 # Default location of the REAP source tree. Overridable via FOUNDRY_REAP_SRC.
 DEFAULT_REAP_SRC = "/server/programming/reap/src"
