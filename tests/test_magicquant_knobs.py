@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+import ppl_smoke
 from services import MagicQuantService
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1085,3 +1086,164 @@ def test_stage_magicquant_honors_source_model_override():
     assert "source = mc.source_model" in stage
     # The override must be decided BEFORE falling back to the resolver.
     assert stage.index("if mc.source_model:") < stage.index("resolve_artifact_source(")
+
+
+# ── Change 1: always convert safetensors sources to BF16 GGUF ────────────────
+#
+# should_convert_source_to_gguf is the pure predicate _magicquant_entry.run()
+# refactored the conversion decision into, so it's testable without spawning
+# a real conversion. The task requirement: a directory (safetensors) source
+# converts regardless of `measured`; only llamacpp-unavailable (None) and an
+# already-GGUF source stay unconverted.
+
+def test_should_convert_source_to_gguf_dir_with_llamacpp():
+    import _magicquant_entry as entry
+
+    assert entry.should_convert_source_to_gguf(True, "/fake/llamacpp") is True
+
+
+def test_should_convert_source_to_gguf_dir_without_llamacpp_falls_back():
+    import _magicquant_entry as entry
+
+    assert entry.should_convert_source_to_gguf(True, None) is False
+
+
+def test_should_convert_source_to_gguf_non_dir_source_never_converts():
+    """A non-directory resolved source (already .gguf, or a bare single-file
+    override) is left alone regardless of llamacpp availability -- there is
+    nothing for this predicate to convert."""
+    import _magicquant_entry as entry
+
+    assert entry.should_convert_source_to_gguf(False, "/fake/llamacpp") is False
+    assert entry.should_convert_source_to_gguf(False, None) is False
+
+
+def test_entry_converts_directory_source_even_when_not_measured(
+    fake_orchestrator, tmp_path, monkeypatch,
+):
+    """Change 1's core behavioral requirement: a safetensors DIRECTORY source
+    must be converted to BF16 GGUF even under prediction-only search
+    (measured=False) -- previously conversion was gated on measured=True."""
+    src_dir = tmp_path / "merged_model"
+    src_dir.mkdir()
+    (src_dir / "model.safetensors").write_bytes(b"x")
+
+    calls = []
+
+    def _fake_ensure(llamacpp_dir, source, out_dir):
+        calls.append((llamacpp_dir, source, out_dir))
+        return str(tmp_path / "model-bf16.gguf")
+
+    monkeypatch.setattr(fake_orchestrator, "_ensure_bf16_gguf", _fake_ensure)
+    cfg_path = _write_cfg(tmp_path, src_dir, measured=False)
+
+    fake_orchestrator.run(str(cfg_path))
+
+    assert len(calls) == 1
+    assert calls[0][1] == str(src_dir)
+
+
+def test_entry_converts_directory_source_when_measured_too(
+    fake_orchestrator, tmp_path, monkeypatch,
+):
+    """Same as above with measured=True -- conversion must still happen (this
+    was already true pre-change; guards against a refactor accidentally
+    dropping the measured=True case)."""
+    src_dir = tmp_path / "merged_model"
+    src_dir.mkdir()
+    (src_dir / "model.safetensors").write_bytes(b"x")
+
+    calls = []
+
+    def _fake_ensure(llamacpp_dir, source, out_dir):
+        calls.append((llamacpp_dir, source, out_dir))
+        return str(tmp_path / "model-bf16.gguf")
+
+    monkeypatch.setattr(fake_orchestrator, "_ensure_bf16_gguf", _fake_ensure)
+    cfg_path = _write_cfg(tmp_path, src_dir, measured=True)
+
+    fake_orchestrator.run(str(cfg_path))
+
+    assert len(calls) == 1
+
+
+def test_entry_dir_source_llamacpp_unavailable_warns_and_falls_back(
+    fake_orchestrator, tmp_path, monkeypatch, capsys,
+):
+    """When llama.cpp discovery/install fails (ensure_llamacpp -> None), a
+    directory source must be passed straight through (old pre-Change-1
+    behavior) with a loud warning naming the SafetensorsSource-drift risk --
+    not a hard failure (MagicQuant's own arch gate is the backstop)."""
+    monkeypatch.setattr(fake_orchestrator, "ensure_llamacpp", lambda hint="": None)
+    src_dir = tmp_path / "merged_model"
+    src_dir.mkdir()
+    (src_dir / "model.safetensors").write_bytes(b"x")
+    cfg_path = _write_cfg(tmp_path, src_dir, measured=False)
+
+    fake_orchestrator.run(str(cfg_path))
+
+    out = capsys.readouterr().out
+    assert "WARNING: llama.cpp unavailable" in out
+    assert "SafetensorsSource" in out
+    inst = _FakeOrchestrator.instances[-1]
+    assert inst.init_kwargs["source_model_path"] == str(src_dir)
+
+
+def test_magicquant_entry_run_body_converts_before_measured_only_gate_removed():
+    """Static guard: the conversion call in run() must no longer be gated
+    behind `if measured and ...` -- regression guard for Change 1 in case a
+    future edit reintroduces the old gate."""
+    src = (ROOT / "core" / "_magicquant_entry.py").read_text()
+    run_body = src[src.index("def run("):src.index('if __name__ == "__main__"')]
+    assert "if measured and llamacpp" not in run_body
+    assert "should_convert_source_to_gguf(is_dir_source, llamacpp)" in run_body
+
+
+# ── Change 2: post-generation PPL smoke gate ─────────────────────────────────
+
+def test_entry_aborts_when_ppl_smoke_fails(fake_orchestrator, tmp_path, monkeypatch):
+    src_file = tmp_path / "src.safetensors"
+    src_file.write_bytes(b"x")
+    cfg_path = _write_cfg(tmp_path, src_file, measured=False)
+    monkeypatch.setattr(ppl_smoke, "smoke_test_gguf", lambda *a, **k: False)
+
+    with pytest.raises(SystemExit) as exc:
+        fake_orchestrator.run(str(cfg_path))
+    assert exc.value.code == 1
+
+
+def test_entry_completes_when_ppl_smoke_passes(fake_orchestrator, tmp_path, monkeypatch):
+    src_file = tmp_path / "src.safetensors"
+    src_file.write_bytes(b"x")
+    cfg_path = _write_cfg(tmp_path, src_file, measured=False)
+    monkeypatch.setattr(ppl_smoke, "smoke_test_gguf", lambda *a, **k: True)
+
+    fake_orchestrator.run(str(cfg_path))  # must not raise
+
+
+def test_entry_ppl_smoke_gate_skips_when_no_binary_found(
+    fake_orchestrator, tmp_path, capsys,
+):
+    """Default fixture state: llamacpp="/fake/llamacpp" doesn't exist on disk,
+    so find_perplexity_bin resolves nothing -- the gate must skip (advisory),
+    not fail the stage, when nothing is monkeypatched."""
+    src_file = tmp_path / "src.safetensors"
+    src_file.write_bytes(b"x")
+    cfg_path = _write_cfg(tmp_path, src_file, measured=False)
+
+    fake_orchestrator.run(str(cfg_path))  # must not raise
+
+    out = capsys.readouterr().out
+    assert "PPL smoke test SKIPPED" in out
+    assert "PIPELINE_STAGE_COMPLETE=magicquant" in out
+
+
+def test_magicquant_entry_run_body_smoke_gate_before_stage_complete():
+    """Static guard: the smoke gate must run (and be able to sys.exit(1))
+    strictly before the PIPELINE_STAGE_COMPLETE marker prints."""
+    src = (ROOT / "core" / "_magicquant_entry.py").read_text()
+    run_body = src[src.index("def run("):src.index('if __name__ == "__main__"')]
+    assert "ppl_smoke.smoke_test_gguf" in run_body
+    gate_idx = run_body.index("ppl_smoke.smoke_test_gguf")
+    assert "sys.exit(1)" in run_body[gate_idx:]
+    assert gate_idx < run_body.index('print("PIPELINE_STAGE_COMPLETE=magicquant"')
