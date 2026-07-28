@@ -137,6 +137,47 @@ def test_resolve_source_absolute_gguf_file_override(tmp_path):
     assert entry.resolve_source(str(gguf), out, str(tmp_path)) == str(gguf)
 
 
+# ── resolve_source: LoRA-adapter-dir disclosure ─────────────────────────────
+#
+# Mirrors _magicquant_entry's fix (rsLoRA audit, 2026-07-28):
+# resolve_source()'s plain-safetensors-dir fallback also matches a LoRA
+# ADAPTER directory (adapter_model.safetensors IS a *.safetensors file).
+# Behavior stays the same (still return the dir), but resolve_source() now
+# calls _disclose_if_lora_adapter_dir() to print a loud NOTE instead of
+# silently treating the unmerged adapter as a full model.
+
+def test_resolve_source_discloses_lora_adapter_dir(tmp_path, capsys):
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "adapter_model.safetensors").write_bytes(b"x")
+    (out / "adapter_config.json").write_text(json.dumps({
+        "r": 16, "lora_alpha": 32, "base_model_name_or_path": "/models/base-model",
+    }))
+
+    result = entry.resolve_source("", out, str(tmp_path))
+
+    # Behavior-preserving: the adapter dir is still returned, not refused.
+    assert result == str(out)
+    err_out = capsys.readouterr().out
+    assert "LoRA ADAPTER" in err_out
+    assert "/models/base-model" in err_out
+    assert str(out) in err_out
+
+
+def test_resolve_source_plain_safetensors_dir_has_no_disclosure(tmp_path, capsys):
+    """The common case (a real merged-model dir, no adapter_config.json)
+    must NOT print the adapter disclosure."""
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "model.safetensors").write_bytes(b"x")
+
+    result = entry.resolve_source("", out, str(tmp_path))
+
+    assert result == str(out)
+    err_out = capsys.readouterr().out
+    assert "LoRA ADAPTER" not in err_out
+
+
 # ── MagicQuant-hybrid mode: spec parsing ────────────────────────────────────
 
 @pytest.mark.parametrize("spec,tier", [
