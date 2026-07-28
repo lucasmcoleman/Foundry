@@ -413,8 +413,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Pinned llama.cpp ref for reproducible auto-install (audit L-supply-chain).
 # Bump deliberately; clone uses --branch so it pins a tag, not the default branch.
-LLAMACPP_REPO = "https://github.com/ggml-org/llama.cpp.git"
-LLAMACPP_PIN = "gguf-v0.19.0"  # known-good release tag
+#
+# Single-sourced from core/_magicquant_entry.py (stdlib-only importable, see
+# that module's docstring) rather than a second hand-typed literal here --
+# pipeline.py's own llama.cpp auto-install (below) and
+# _magicquant_entry.py's need to agree on exactly the same pin, and a second
+# copy is a drift hazard the moment one gets bumped without the other.
+try:
+    from _magicquant_entry import LLAMACPP_REPO, LLAMACPP_PIN
+except ImportError:  # pragma: no cover - package-import fallback
+    from core._magicquant_entry import LLAMACPP_REPO, LLAMACPP_PIN
 
 
 def _services():
@@ -923,13 +931,18 @@ def stage_heretic(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 # ── Stage: REAP (expert pruning) ─────────────────────────────────────────────
 #
 # Router-weighted Expert Activation Pruning for MoE models.
-# Only supports the specific architectures in reap.model_util.MODEL_ATTRS.
 # Unsupported architectures (dense models, Granite MoE, etc.) are skipped
 # silently with a warning so the rest of the pipeline can continue.
-
-# Architectures supported by reap.model_util.MODEL_ATTRS (mirrors that dict).
-# REAP-supported architectures and arch detection live in the shared
-# reap_common module so the CLI and UI agree (audit L-source-dup / L-reap-archlist).
+#
+# The supported-architecture set (REAP_SUPPORTED_ARCHS) and arch detection
+# live in the shared reap_common module -- core/reap_common.py is the single
+# source of truth (so the CLI and UI agree, audit L-source-dup /
+# L-reap-archlist). It is a hand-curated policy list, NOT a straight mirror
+# of reap.model_util.MODEL_ATTRS (that upstream dict mixes real class names
+# with repo-id-shaped keys and is missing entries Foundry has separately
+# verified) -- see the comment above REAP_SUPPORTED_ARCHS in reap_common.py
+# for why, and warn_if_reap_supported_archs_stale() there for the
+# opportunistic drift check against the installed reap package.
 try:
     from reap_common import (
         REAP_SUPPORTED_ARCHS, detect_model_arch as _detect_model_arch,

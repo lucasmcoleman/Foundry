@@ -11,6 +11,13 @@ Module import is stdlib-only; the MagicQuant package is imported lazily inside
 llama.cpp auto-install is pinned to a known-good release tag (audit
 L-supply-chain): ``LLAMACPP_PIN`` + ``--branch`` rather than a bare
 default-branch clone.
+
+``LLAMACPP_REPO``/``LLAMACPP_PIN`` are defined here (this module is
+stdlib-only importable) and re-exported by ``core/pipeline.py``, which
+imports them rather than keeping a second hand-typed copy -- both call
+sites' llama.cpp auto-install must agree on exactly the same pin, and a
+second literal is a drift hazard the moment one gets bumped without the
+other. Bump the pin only here; pipeline.py picks it up automatically.
 """
 
 from __future__ import annotations

@@ -65,6 +65,17 @@ def test_llamacpp_clone_is_pinned():
     assert "--branch" in entry_src
 
 
+def test_llamacpp_pin_is_single_sourced():
+    """R3: pipeline.py must import LLAMACPP_REPO/LLAMACPP_PIN from
+    _magicquant_entry.py rather than keeping its own literal copy -- same
+    object, not just an equal-valued duplicate, so bumping the pin in one
+    place can never leave the other stale."""
+    import _magicquant_entry
+
+    assert pipeline.LLAMACPP_PIN is _magicquant_entry.LLAMACPP_PIN
+    assert pipeline.LLAMACPP_REPO is _magicquant_entry.LLAMACPP_REPO
+
+
 def test_rocmfpx_clone_is_pinned():
     """Same supply-chain-pin convention for the ROCmFPX auto-install (a git
     clone + compile, not a pip package) -- pinned commit, checked out
