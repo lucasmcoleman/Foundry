@@ -27,6 +27,23 @@ def parse_config(cfg_path: str) -> dict:
     return json.loads(Path(cfg_path).read_text())
 
 
+def apply_dequant_env(cfg: dict, environ) -> bool:
+    """Propagate ``allow_dequant_source`` into MAGICQUANT_ALLOW_DEQUANT_SOURCE.
+
+    MagicQuant normally hard-requires BF16/F16/F32 source weights; the env var
+    opts every ``open_model_source`` call site (and any subprocess that
+    inherits ``environ``) into dequantizing an already-quantized GGUF source
+    instead. A no-op (returns False, ``environ`` untouched) unless
+    ``cfg["allow_dequant_source"]`` is truthy. stdlib-only and pure w.r.t.
+    ``environ`` (a plain dict works for tests) so it's unit-testable without
+    the magicquant package.
+    """
+    if not cfg.get("allow_dequant_source"):
+        return False
+    environ["MAGICQUANT_ALLOW_DEQUANT_SOURCE"] = "1"
+    return True
+
+
 def find_llamacpp(hint: str = "") -> str | None:
     """Return a llama.cpp dir that contains the converter or quantize binary.
 
@@ -268,6 +285,15 @@ def run(cfg_path: str | None = None) -> None:
         bindir = str(Path(rocmfpx_dir) / "build-strix-rocmfp4" / "bin")
         os.environ["MAGICQUANT_LIBGGML_DIR"] = bindir
         print(f"MagicQuant libggml -> {bindir} (ROCmFPX fork types enabled)", flush=True)
+
+    if apply_dequant_env(cfg, os.environ):
+        print(
+            "WARNING: allow_dequant_source is on -- an already-quantized GGUF "
+            "source will be DOUBLE-quantized. Output quality is bounded by the "
+            "source quant's error floor; tiers at/above the source's precision "
+            "are pointless. Disclose this on the model card.",
+            flush=True,
+        )
 
     from magicquant.orchestrator import MagicQuantOrchestrator
 

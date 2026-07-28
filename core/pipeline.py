@@ -174,6 +174,19 @@ class MagicQuantConfig:
     # logged and never blocks a successful search from completing).
     calibration_source: str = ""
     write_calibration: bool = False
+    # source_model: explicit source override -- path to a GGUF file or merged
+    # safetensors dir. Empty = auto-resolve from the output dir (reap >
+    # heretic > merged > bf16 gguf). Required for a GGUF-only release used
+    # with allow_dequant_source below (the resolver only finds pipeline
+    # artifacts, never an arbitrary downloaded GGUF).
+    source_model: str = ""
+    # allow_dequant_source: opt-in dequantization of already-quantized GGUF
+    # sources (normally MagicQuant hard-requires BF16/F16/F32 source weights).
+    # Double-quantization -- output quality is bounded by the source quant's
+    # error floor -- so this only makes sense for models published GGUF-only
+    # (no safetensors/BF16 release); disclose on the model card. Propagated to
+    # MagicQuant via the MAGICQUANT_ALLOW_DEQUANT_SOURCE env var.
+    allow_dequant_source: bool = False
 
 
 @dataclass
@@ -189,6 +202,10 @@ class ROCmFPXConfig:
     source_model: str = ""  # when export is skipped: path to GGUF or merged model dir
     rocmfpx_hint: str = ""  # path to an existing ROCmFPX/llama.cpp-fork build
     imatrix: str = ""  # optional path to an imatrix GGUF
+    # allow_requantize: pass --allow-requantize to llama-quantize so an
+    # already-quantized GGUF source can be requantized. Double-quantization --
+    # output quality is bounded by the source quant's error floor.
+    allow_requantize: bool = False
 
 
 @dataclass
@@ -1120,20 +1137,27 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     """
     log("Starting MagicQuant evolutionary quantization", "stage")
 
-    # Determine source via the shared artifact-priority resolver
-    # (reap > heretic > merged > bf16 gguf). Pass it to the service as an
-    # explicit override so the in-subprocess resolution lands on the same model.
-    try:
-        from reap_common import resolve_artifact_source
-    except ImportError:  # pragma: no cover
-        from core.reap_common import resolve_artifact_source
-    source = resolve_artifact_source(artifacts.output_dir, require_safetensors=False)
+    mc = config.magicquant
+
+    # Determine source: an explicit source_model override wins (the only way
+    # to point the stage at an arbitrary GGUF, e.g. a GGUF-only release used
+    # with allow_dequant_source); otherwise the shared artifact-priority
+    # resolver (reap > heretic > merged > bf16 gguf). Pass it to the service
+    # as an explicit override so the in-subprocess resolution lands on the
+    # same model. Mirrors stage_rocmfpx's source_model handling.
+    if mc.source_model:
+        source = mc.source_model
+    else:
+        try:
+            from reap_common import resolve_artifact_source
+        except ImportError:  # pragma: no cover
+            from core.reap_common import resolve_artifact_source
+        source = resolve_artifact_source(artifacts.output_dir, require_safetensors=False)
     if source is None:
-        log("No merged model or BF16 GGUF found — run export first", "error")
+        log("No merged model or BF16 GGUF found — run export first, or set "
+            "MagicQuant source_model", "error")
         return False
     log(f"Source: {source}")
-
-    mc = config.magicquant
 
     cfg_hash = _markers().config_hash({
         "src": str(source), "generations": mc.generations,
@@ -1151,6 +1175,7 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         "speed_weight": mc.speed_weight, "use_bytes_tps": mc.use_bytes_tps,
         "calibration_source": mc.calibration_source,
         "write_calibration": mc.write_calibration,
+        "allow_dequant_source": mc.allow_dequant_source,
     })
     existing = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.magicquant_dir / "_placeholder.gguf")
@@ -1191,6 +1216,7 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         use_bytes_tps=mc.use_bytes_tps,
         calibration_source=mc.calibration_source,
         write_calibration=mc.write_calibration,
+        allow_dequant_source=mc.allow_dequant_source,
     )
 
     rc = _run_stage_script(
@@ -1246,6 +1272,7 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     cfg_hash = _markers().config_hash({
         "src": str(source), "formats": rc_cfg.formats, "imatrix": rc_cfg.imatrix,
+        "allow_requantize": rc_cfg.allow_requantize,
     })
     existing = sorted(artifacts.rocmfpx_dir.glob("*.gguf")) if artifacts.rocmfpx_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.rocmfpx_dir / "_placeholder.gguf")
@@ -1266,6 +1293,7 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         formats_json=_json.dumps(rc_cfg.formats),
         model_name=model_name,
         imatrix=rc_cfg.imatrix,
+        allow_requantize=rc_cfg.allow_requantize,
     )
 
     rc = _run_stage_script(
@@ -1649,6 +1677,20 @@ def main(argv: Optional[list[str]] = None) -> int:
                              "speed_metric=bytes, speed_weight=0.35, "
                              "use_bytes_tps=True) -- override any of these "
                              "individually with the flags above")
+    parser.add_argument("--magicquant-source-model", type=str, default="",
+                        help="Explicit MagicQuant source: path to a GGUF file or "
+                             "merged safetensors dir (default: auto-resolve "
+                             "reap > heretic > merged > bf16 gguf from the output "
+                             "dir). Required for a GGUF-only release used with "
+                             "--magicquant-dequant-source")
+    parser.add_argument("--magicquant-dequant-source", action="store_true",
+                        help="Allow MagicQuant to dequantize an already-quantized "
+                             "GGUF source instead of requiring BF16/F16/F32 "
+                             "(MAGICQUANT_ALLOW_DEQUANT_SOURCE). Double-quantization "
+                             "-- output quality is bounded by the source quant's "
+                             "error floor -- so only use this for models published "
+                             "GGUF-only (no safetensors/BF16 release); disclose on "
+                             "the model card")
     parser.add_argument("--rocmfpx", action="store_true",
                         help="Enable ROCmFPX stage (AMD-tuned GGUF quants; default off)")
     parser.add_argument("--no-rocmfpx", action="store_true",
@@ -1662,6 +1704,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--rocmfpx-hint", type=str, default="",
                         help="Path to an existing ROCmFPX/llama.cpp-fork build "
                              "(default: auto-detect or auto-install)")
+    parser.add_argument("--rocmfpx-allow-requantize", action="store_true",
+                        help="Pass --allow-requantize to llama-quantize so an "
+                             "already-quantized GGUF source can be requantized. "
+                             "Double-quantization -- output quality is bounded by "
+                             "the source quant's error floor")
     parser.add_argument("--upload-to", type=str, help="HF repo ID")
     parser.add_argument("--llamacpp-path", type=str)
     parser.add_argument("--dry-run", action="store_true",
@@ -1755,10 +1802,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             cfg.magicquant.calibration_source = args.magicquant_calibration_source
         if args.magicquant_write_calibration:
             cfg.magicquant.write_calibration = True
+        if args.magicquant_source_model:
+            cfg.magicquant.source_model = args.magicquant_source_model
+        if args.magicquant_dequant_source:
+            cfg.magicquant.allow_dequant_source = True
     if args.rocmfpx and not args.no_rocmfpx:
         cfg.rocmfpx = ROCmFPXConfig(
             source_model=args.rocmfpx_source_model,
             rocmfpx_hint=args.rocmfpx_hint,
+            allow_requantize=args.rocmfpx_allow_requantize,
             **({"formats": args.rocmfpx_formats} if args.rocmfpx_formats else {}),
         )
     if args.no_rocmfpx:

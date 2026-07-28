@@ -955,6 +955,88 @@ def test_find_llamacpp_prefers_rocmfpx_fork_over_stock(tmp_path, monkeypatch):
     assert entry.find_llamacpp(str(stock)) == str(stock)
 
 
+# ── allow_dequant_source: opt-in dequant of already-quantized GGUF sources ────
+
+def test_magicquant_config_allow_dequant_source_default():
+    pl = _pipeline()
+    mc = pl.MagicQuantConfig()
+    assert mc.allow_dequant_source is False
+
+
+def test_magicquant_dequant_source_cli_flag_wires_into_config(monkeypatch):
+    pl = _pipeline()
+    captured = {}
+
+    def _fake_run_pipeline(cfg, **kwargs):
+        captured["cfg"] = cfg
+        return {"magicquant": True}
+
+    monkeypatch.setattr(pl, "run_pipeline", _fake_run_pipeline)
+
+    pl.main(["--model", "org/m", "--no-export", "--no-heretic", "--no-reap"])
+    assert captured["cfg"].magicquant.allow_dequant_source is False
+
+    pl.main([
+        "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
+        "--magicquant-dequant-source",
+    ])
+    assert captured["cfg"].magicquant.allow_dequant_source is True
+
+
+def test_stage_magicquant_hash_source_includes_allow_dequant_source():
+    src = (ROOT / "core" / "pipeline.py").read_text()
+    hash_block = src[src.index('def stage_magicquant'):src.index('existing = sorted(artifacts.magicquant_dir')]
+    assert '"allow_dequant_source": mc.allow_dequant_source' in hash_block
+
+
+def test_magicquant_build_config_allow_dequant_source_default_false():
+    svc = MagicQuantService(ROOT, "python")
+    cfg = svc.build_config(
+        llamacpp_hint="", pipeline_root_str="/repo", mq_source_override="/src",
+        out_abs_str="/o", generations=5, population_size=10,
+        target_base_quant="IQ4_NL", tiers_json="{}", model_name="m",
+    )
+    assert cfg["allow_dequant_source"] is False
+
+
+def test_magicquant_build_config_allow_dequant_source_explicit_true():
+    svc = MagicQuantService(ROOT, "python")
+    cfg = svc.build_config(
+        llamacpp_hint="", pipeline_root_str="/repo", mq_source_override="/src",
+        out_abs_str="/o", generations=5, population_size=10,
+        target_base_quant="IQ4_NL", tiers_json="{}", model_name="m",
+        allow_dequant_source=True,
+    )
+    assert cfg["allow_dequant_source"] is True
+    assert json.loads(json.dumps(cfg)) == cfg
+
+
+# ── core/_magicquant_entry.py: apply_dequant_env ──────────────────────────────
+
+def test_apply_dequant_env_noop_when_key_missing():
+    import _magicquant_entry as entry
+
+    environ = {}
+    assert entry.apply_dequant_env({}, environ) is False
+    assert environ == {}
+
+
+def test_apply_dequant_env_noop_when_key_false():
+    import _magicquant_entry as entry
+
+    environ = {}
+    assert entry.apply_dequant_env({"allow_dequant_source": False}, environ) is False
+    assert environ == {}
+
+
+def test_apply_dequant_env_sets_env_when_key_true():
+    import _magicquant_entry as entry
+
+    environ = {}
+    assert entry.apply_dequant_env({"allow_dequant_source": True}, environ) is True
+    assert environ == {"MAGICQUANT_ALLOW_DEQUANT_SOURCE": "1"}
+
+
 def test_pipeline_help_does_not_crash():
     """argparse expands help via '<help> % params', so a literal '%' in a help
     string (e.g. '+18% gen speed') raises TypeError and breaks --help entirely.
@@ -963,3 +1045,43 @@ def test_pipeline_help_does_not_crash():
     with pytest.raises(SystemExit) as exc:  # --help exits 0, never TypeError
         pl.main(["--help"])
     assert exc.value.code == 0
+
+
+# ── source_model: explicit MagicQuant source override ────────────────────────
+
+def test_magicquant_config_source_model_default():
+    pl = _pipeline()
+    assert pl.MagicQuantConfig().source_model == ""
+
+
+def test_magicquant_source_model_cli_flag_wires_into_config(monkeypatch):
+    pl = _pipeline()
+    captured = {}
+
+    def _fake_run_pipeline(cfg, **kwargs):
+        captured["cfg"] = cfg
+        return {"magicquant": True}
+
+    monkeypatch.setattr(pl, "run_pipeline", _fake_run_pipeline)
+
+    pl.main(["--model", "org/m", "--no-export", "--no-heretic", "--no-reap"])
+    assert captured["cfg"].magicquant.source_model == ""
+
+    pl.main([
+        "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
+        "--magicquant-source-model", "/models/release-q8_0.gguf",
+    ])
+    assert captured["cfg"].magicquant.source_model == "/models/release-q8_0.gguf"
+
+
+def test_stage_magicquant_honors_source_model_override():
+    """The stage must prefer mc.source_model over artifact resolution --
+    without this, --magicquant-dequant-source's sole use case (a GGUF-only
+    release, which the artifact resolver can never find) is unreachable
+    from the CLI. Static source check, matching the hash-block tests above."""
+    src = (ROOT / "core" / "pipeline.py").read_text()
+    stage = src[src.index("def stage_magicquant"):src.index("def stage_rocmfpx")]
+    assert "if mc.source_model:" in stage
+    assert "source = mc.source_model" in stage
+    # The override must be decided BEFORE falling back to the resolver.
+    assert stage.index("if mc.source_model:") < stage.index("resolve_artifact_source(")

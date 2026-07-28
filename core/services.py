@@ -329,6 +329,7 @@ class MagicQuantService:
         use_bytes_tps: bool = False,
         calibration_source: str = "",
         write_calibration: bool = False,
+        allow_dequant_source: bool = False,
     ) -> dict:
         """Build the JSON config consumed by core/_magicquant_entry.py."""
         return {
@@ -362,6 +363,7 @@ class MagicQuantService:
             "use_bytes_tps": use_bytes_tps,
             "calibration_source": calibration_source,
             "write_calibration": write_calibration,
+            "allow_dequant_source": allow_dequant_source,
         }
 
     def build_script(self, **kwargs) -> str:
@@ -451,6 +453,7 @@ class ROCmFPXService:
         formats_json: str,
         model_name: str,
         imatrix: str = "",
+        allow_requantize: bool = False,
     ) -> dict:
         """Build the JSON config consumed by core/_rocmfpx_entry.py."""
         return {
@@ -462,6 +465,7 @@ class ROCmFPXService:
             "formats_json": formats_json,
             "model_name": model_name,
             "imatrix": imatrix,
+            "allow_requantize": allow_requantize,
         }
 
     def build_script(self, **kwargs) -> str:

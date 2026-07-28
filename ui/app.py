@@ -264,6 +264,7 @@ class MagicQuantCfg(BaseModel):
     use_bytes_tps: bool = False      # score the search objective's speed term from predicted size, not noisy speed_multiplier
     calibration_source: str = ""     # path to a noise_calibration.json to load (both search paths)
     write_calibration: bool = False  # measured-search only: emit <output>/noise_calibration.json from this run
+    allow_dequant_source: bool = False  # dequant already-quantized GGUF source (double-quantization opt-in)
 
 class QATCfg(BaseModel):
     """QAT-LoRA stage config.
@@ -292,6 +293,7 @@ class ROCmFPXCfg(BaseModel):
     rocmfpx_hint: str = ""  # path to an existing ROCmFPX/llama.cpp-fork build
     source_model: str = ""  # when export is skipped: path to GGUF or merged model dir
     imatrix: str = ""  # optional path to an imatrix GGUF
+    allow_requantize: bool = False  # pass --allow-requantize (quantized GGUF source, double-quantization opt-in)
 
 class UploadCfg(BaseModel):
     repo_id: str = ""
@@ -1015,6 +1017,7 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         "speed_weight": mc.speed_weight, "use_bytes_tps": mc.use_bytes_tps,
         "calibration_source": mc.calibration_source,
         "write_calibration": mc.write_calibration,
+        "allow_dequant_source": mc.allow_dequant_source,
     })
     existing_ggufs = sorted(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
     mq_key = existing_ggufs[0] if existing_ggufs else (mq_dir / "_placeholder.gguf")
@@ -1065,6 +1068,7 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         use_bytes_tps=mc.use_bytes_tps,
         calibration_source=mc.calibration_source,
         write_calibration=mc.write_calibration,
+        allow_dequant_source=mc.allow_dequant_source,
     )
     rc = await run_script(script, out)
     ok = rc == 0
@@ -1098,6 +1102,7 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
     rc_hash = markers.config_hash({
         "formats": rc_cfg.formats, "imatrix": rc_cfg.imatrix,
         "source_model": rc_cfg.source_model,
+        "allow_requantize": rc_cfg.allow_requantize,
     })
     existing_ggufs = sorted(rc_dir.glob("*.gguf")) if rc_dir.exists() else []
     rc_key = existing_ggufs[0] if existing_ggufs else (rc_dir / "_placeholder.gguf")
@@ -1123,6 +1128,7 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
         formats_json=json.dumps(rc_cfg.formats),
         model_name=model_name,
         imatrix=rc_cfg.imatrix,
+        allow_requantize=rc_cfg.allow_requantize,
     )
     rc = await run_script(script, out)
     ok = rc == 0
