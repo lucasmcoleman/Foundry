@@ -19,6 +19,8 @@ import json
 import sys
 from pathlib import Path
 
+import ppl_smoke
+
 LLAMACPP_REPO = "https://github.com/ggml-org/llama.cpp.git"
 LLAMACPP_PIN = "gguf-v0.19.0"  # known-good release tag; bump deliberately
 
@@ -190,6 +192,34 @@ def _ensure_bf16_gguf(llamacpp_dir: str, source: str, out_dir: Path) -> str:
     return str(cached)
 
 
+def should_convert_source_to_gguf(is_dir_source: bool, llamacpp: str | None) -> bool:
+    """Decide whether the resolved MagicQuant source should be converted to a
+    BF16 GGUF via llama.cpp's converter before search.
+
+    ALWAYS true for a directory (safetensors) source when llama.cpp is
+    available -- regardless of ``measured`` mode. This used to be gated on
+    ``measured`` (prediction-only search read safetensors directly via
+    MagicQuant's own SafetensorsSource), but that reader's HF->GGUF value
+    transforms silently drifted out of sync for the qwen3_5 arch and produced
+    garbage quants (fixed + gated in MagicQuant c169090). llama.cpp's
+    ``convert_hf_to_gguf.py`` is the single source of truth for HF->GGUF
+    semantics -- converting unconditionally means MagicQuant only ever reads
+    GGUF, closing off that whole class of drift for every arch, not just the
+    one that's been caught so far.
+
+    False for an already-GGUF source (nothing to convert) or when llama.cpp
+    discovery/install failed (``llamacpp is None``) -- the caller then falls
+    back to the pre-this-change behavior of passing the directory straight
+    through to SafetensorsSource, with a loud warning naming the risk;
+    MagicQuant's own arch gate (c169090) is the backstop in that fallback
+    path, not a substitute for conversion.
+
+    Pure/unit-testable: takes the already-computed ``is_dir_source`` bool
+    rather than touching the filesystem itself.
+    """
+    return is_dir_source and llamacpp is not None
+
+
 def _is_vision_model(source: str) -> bool:
     """True if the safetensors source is a multimodal (vision) model — detected
     by a preprocessor_config.json, or a vision_config in config.json."""
@@ -315,11 +345,40 @@ def run(cfg_path: str | None = None) -> None:
     if llamacpp and os.path.isdir(source):
         _maybe_generate_mmproj(llamacpp, source, out_dir, cfg.get("model_name", ""))
 
-    # Measured search needs a GGUF — convert safetensors to BF16 GGUF first
-    measured = cfg.get("measured", False)
-    if measured and llamacpp and not source.endswith(".gguf"):
+    # Convert a safetensors source to BF16 GGUF via llama.cpp's converter --
+    # ALWAYS, regardless of measured vs. prediction-only search (see
+    # should_convert_source_to_gguf's docstring: this is the single source of
+    # truth for HF->GGUF semantics, closing off the SafetensorsSource-drift
+    # failure mode that produced silent garbage quants for qwen3_5). The
+    # converted file is a full model-size BF16 GGUF written to
+    # <out_dir>/model-bf16.gguf and reused across runs (_ensure_bf16_gguf).
+    is_dir_source = os.path.isdir(source)
+    if should_convert_source_to_gguf(is_dir_source, llamacpp):
+        print(
+            "Conversion policy: safetensors sources are always converted to "
+            "BF16 GGUF before search (not just for measured runs) -- "
+            f"writing a model-size BF16 GGUF to {out_dir / 'model-bf16.gguf'} "
+            "(cached across runs).",
+            flush=True,
+        )
         source = _ensure_bf16_gguf(llamacpp, source, out_dir)
         print(f"MagicQuant GGUF source: {source}", flush=True)
+    elif is_dir_source:
+        # llamacpp discovery/install failed -- fall back to the old behavior
+        # (pass the safetensors dir straight through) rather than hard-fail;
+        # MagicQuant's own arch gate (c169090) is the backstop, but it only
+        # covers archs that gate has been taught about.
+        print(
+            "WARNING: llama.cpp unavailable -- passing safetensors source "
+            "through WITHOUT BF16 GGUF conversion. MagicQuant's "
+            "SafetensorsSource reader will be used directly; its HF->GGUF "
+            "value transforms have previously drifted out of sync for a given "
+            "arch and produced silent garbage quants (SafetensorsSource "
+            "drift -- see qwen3_5 / MagicQuant c169090). Only MagicQuant's "
+            "arch gate protects against this here, not a substitute for the "
+            "conversion this stage normally performs.",
+            flush=True,
+        )
 
     orch = MagicQuantOrchestrator(
         source_model_path=source,
@@ -415,6 +474,25 @@ def run(cfg_path: str | None = None) -> None:
         size = os.path.getsize(p) / 1e9
         print(f"  {Path(p).name} ({size:.1f} GB)", flush=True)
     print(f"Generated {len(valid)} hybrid GGUF files", flush=True)
+
+    # Post-generation PPL smoke gate: a cheap, automatic sanity check the
+    # pipeline itself lacked before this change -- the qwen3_5 garbage-quant
+    # incident was only caught by an operator running perplexity by hand,
+    # after the fact. Advisory-on-unknown (missing binary/corpus just skips
+    # with a warning) but a completed run that comes back pathological is a
+    # hard stage failure, not a warning.
+    perplexity_bin = ppl_smoke.find_perplexity_bin(llamacpp) if llamacpp else None
+    failed = [p for p in valid if not ppl_smoke.smoke_test_gguf(perplexity_bin, Path(p))]
+    if failed:
+        print(
+            f"Error: PPL smoke test FAILED for {len(failed)}/{len(valid)} "
+            f"file(s): {[Path(p).name for p in failed]} -- aborting before "
+            f"upload. Override with {ppl_smoke.SKIP_ENV}=1 if this is a known "
+            "false positive (not recommended).",
+            flush=True,
+        )
+        sys.exit(1)
+
     print("PIPELINE_STAGE_COMPLETE=magicquant", flush=True)
 
 

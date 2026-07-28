@@ -19,6 +19,8 @@ import json
 import sys
 from pathlib import Path
 
+import ppl_smoke
+
 ROCMFPX_REPO = "https://github.com/ciru-ai/ROCmFPX.git"
 ROCMFPX_PIN = "221402af8574faf652b101b6afe225a3f329561f"  # known-good commit; bump deliberately
 
@@ -480,6 +482,23 @@ def run(cfg_path: str | None = None) -> None:
         print("Error: no ROCmFPX GGUF files produced", flush=True)
         sys.exit(1)
     print(f"Generated {len(produced)} ROCmFPX GGUF files", flush=True)
+
+    # Post-generation PPL smoke gate (mirrors _magicquant_entry.run's -- see
+    # ppl_smoke module docstring for the incident this closes). Advisory on
+    # unknown binary/corpus; a completed run that comes back pathological
+    # hard-fails the stage before upload.
+    perplexity_bin = ppl_smoke.find_perplexity_bin(rocmfpx_dir)
+    failed = [p for p in produced if not ppl_smoke.smoke_test_gguf(perplexity_bin, Path(p))]
+    if failed:
+        print(
+            f"Error: PPL smoke test FAILED for {len(failed)}/{len(produced)} "
+            f"file(s): {[Path(p).name for p in failed]} -- aborting before "
+            f"upload. Override with {ppl_smoke.SKIP_ENV}=1 if this is a known "
+            "false positive (not recommended).",
+            flush=True,
+        )
+        sys.exit(1)
+
     print("PIPELINE_STAGE_COMPLETE=rocmfpx", flush=True)
 
 

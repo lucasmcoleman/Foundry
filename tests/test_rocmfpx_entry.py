@@ -401,3 +401,51 @@ def test_rocmfpx_build_config_allow_requantize_explicit_true():
     )
     assert cfg["allow_requantize"] is True
     assert json.loads(json.dumps(cfg)) == cfg
+
+
+# ── Change 2: post-generation PPL smoke gate ─────────────────────────────────
+#
+# The functional gate itself (parse/verdict/skip logic) is covered end-to-end
+# in tests/test_ppl_smoke.py; this file just confirms _rocmfpx_entry wires it
+# in the right place -- before the stage can report success -- matching the
+# existing static source-text-assertion convention used elsewhere in this
+# suite (see test_stage_magicquant_hash_source_includes_new_knobs etc.).
+
+def test_rocmfpx_entry_imports_ppl_smoke():
+    import _rocmfpx_entry
+
+    assert hasattr(_rocmfpx_entry, "ppl_smoke")
+
+
+def test_rocmfpx_entry_run_body_smoke_gate_before_stage_complete():
+    src = (ROOT / "core" / "_rocmfpx_entry.py").read_text()
+    run_body = src[src.index("def run("):src.index('if __name__ == "__main__"')]
+    assert "ppl_smoke.smoke_test_gguf" in run_body
+    gate_idx = run_body.index("ppl_smoke.smoke_test_gguf")
+    assert "sys.exit(1)" in run_body[gate_idx:]
+    assert gate_idx < run_body.index('print("PIPELINE_STAGE_COMPLETE=rocmfpx"')
+
+
+def test_rocmfpx_entry_run_body_uses_find_perplexity_bin_on_rocmfpx_dir():
+    """The perplexity binary must be looked up relative to rocmfpx_dir (the
+    discovered/installed ROCmFPX checkout), mirroring how quantize_bin is
+    already resolved (Path(rocmfpx_dir) / "build-strix-rocmfp4" / "bin" /
+    ...) -- not a hardcoded or unrelated path."""
+    src = (ROOT / "core" / "_rocmfpx_entry.py").read_text()
+    run_body = src[src.index("def run("):src.index('if __name__ == "__main__"')]
+    assert "ppl_smoke.find_perplexity_bin(rocmfpx_dir)" in run_body
+
+
+def test_find_perplexity_bin_resolves_real_rocmfpx_build_layout(tmp_path):
+    """End-to-end sanity check that ppl_smoke.find_perplexity_bin actually
+    resolves the exact build layout _rocmfpx_entry uses for llama-quantize
+    (build-strix-rocmfp4/bin/), given just the ROCmFPX checkout root -- the
+    same root variable (rocmfpx_dir) the entry passes to it."""
+    import ppl_smoke
+
+    bin_dir = tmp_path / "build-strix-rocmfp4" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "llama-quantize").write_text("")
+    (bin_dir / "llama-perplexity").write_text("")
+
+    assert ppl_smoke.find_perplexity_bin(str(tmp_path)) == bin_dir / "llama-perplexity"
