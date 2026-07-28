@@ -18,6 +18,7 @@ tool.
 
 import gc
 import json
+import math
 import os
 import re
 import shutil
@@ -172,13 +173,25 @@ def load_lora_weights(lora_dir: str):
 def build_lora_map(lora_config, lora_weights):
     """Build a map from base model weight name -> (lora_A, lora_B, scaling).
 
-    LoRA decomposes weight updates as: delta_W = (alpha/r) * B @ A
+    LoRA decomposes weight updates as: delta_W = scaling * B @ A
     where A is (r, in_features) and B is (out_features, r).
-    The scaling factor alpha/r controls the magnitude of the update.
+
+    scaling is alpha/r for plain LoRA, but PEFT computes alpha/sqrt(r)
+    instead when the adapter was trained with rsLoRA (rank-stabilized LoRA,
+    adapter_config.json's "use_rslora": true) -- see PEFT's LoraLayer.scaling.
+
+    INCIDENT: a differential test against PEFT's own merge_and_unload()
+    (tests/test_fast_export_peft_differential.py) caught this function
+    computing alpha/r unconditionally, silently ignoring use_rslora. Foundry's
+    own default training config sets use_rslora=True (core/pipeline.py
+    TrainingConfig.use_rslora), so exports of default-config adapters merged
+    LoRA deltas sqrt(r)x weaker than what was actually trained -- e.g. r=4
+    merges at alpha/4 instead of alpha/2, half the intended magnitude.
     """
     r = lora_config["r"]
     alpha = lora_config["lora_alpha"]
-    scaling = alpha / r
+    use_rslora = lora_config.get("use_rslora", False)
+    scaling = alpha / math.sqrt(r) if use_rslora else alpha / r
 
     lora_map = {}
 

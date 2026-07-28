@@ -16,6 +16,7 @@ a floating branch.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -23,6 +24,12 @@ import ppl_smoke
 
 ROCMFPX_REPO = "https://github.com/ciru-ai/ROCmFPX.git"
 ROCMFPX_PIN = "221402af8574faf652b101b6afe225a3f329561f"  # known-good commit; bump deliberately
+
+# Env override to bypass the runtime type-support probe (validate_types_supported)
+# entirely -- e.g. a CI sandbox with no real ROCmFPX binary at all. Advisory
+# only; the probe itself is already advisory-on-unknown (a --help that can't
+# be run warns and proceeds rather than blocking).
+SKIP_TYPE_PROBE_ENV = "FOUNDRY_SKIP_TYPE_PROBE"
 
 # A build lacking these doesn't carry the full ROCmFPX family (e.g. a plain
 # ROCmFP4-only rocmfp4-llama checkout) and is rejected as a discovery hit.
@@ -161,19 +168,113 @@ def parse_format_spec(spec: str) -> tuple[str, str]:
     return fmt, profile
 
 
-def _has_full_family(quantize_bin: Path) -> bool:
-    """True if this ``llama-quantize`` carries the full ROCmFPX family (not
-    just a ROCmFP4-only build, e.g. a plain rocmfp4-llama checkout).
+def _run_quantize_help(quantize_bin: Path) -> str | None:
+    """Return ``<quantize_bin> --help``'s stdout, or None if it couldn't be run
+    (missing binary, not executable, hung past the timeout). Shared probe seam
+    for both family discovery (``_has_full_family``) and per-run type-support
+    validation (``validate_types_supported``) -- one subprocess contract, not
+    two hand-rolled ones.
     """
     import subprocess
 
     try:
-        out = subprocess.run(
+        return subprocess.run(
             [str(quantize_bin), "--help"], capture_output=True, text=True, timeout=30,
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _has_full_family(quantize_bin: Path) -> bool:
+    """True if this ``llama-quantize`` carries the full ROCmFPX family (not
+    just a ROCmFP4-only build, e.g. a plain rocmfp4-llama checkout).
+    """
+    out = _run_quantize_help(quantize_bin)
+    if out is None:
         return False
     return all(t in out for t in REQUIRED_TYPES)
+
+
+def parse_quantize_help_types(help_text: str) -> set[str]:
+    """Extract the set of ggml type NAMES a ``llama-quantize`` build actually
+    supports from its own ``--help`` output, instead of hand-maintaining a
+    local list that can silently drift from the binary (mission: probe
+    binaries for facts about themselves rather than shadow them locally).
+
+    The "allowed quantization types" table lists one type per line as
+    ``  <numeric-id>  or  <NAME>  :  <description>`` (see the trimmed real
+    sample embedded in tests/test_rocmfpx_entry.py). Pure string parsing --
+    no dependency on the binary or on any local type-name registry.
+
+    NAMESPACE WARNING (read before touching the numeric ids): the table this
+    parses is llama-quantize's own listing of ``LLAMA_FTYPE`` values -- the
+    allowed values for the *positional* base-type argument
+    (``model-f32.gguf model-quant.gguf <type> [nthreads]``). Those numeric ids
+    (100-106, 110-115 on this fork; see the sample table) are LLAMA_FTYPE ids.
+    They are NOT the same namespace as the ggml type ids used internally when
+    the binary resolves a ``--tensor-type-file`` entry (``<regex>=<NAME>``,
+    written by ``build_tensor_type_lines``/``_quantize_mq_hybrid``) -- those
+    are looked up by a separate ggml-type-name table inside the binary with
+    its own (different) numeric ids. This function only ever extracts and
+    returns the NAME string (the regex capture group, ``\\S+`` after "or"),
+    never the numeric id, and both ``validate_types_supported`` call sites
+    (uniform preset base type + mq-hybrid base type/override types) only ever
+    check name membership -- so the two distinct id spaces happen to share
+    the same name strings for every type both paths care about today
+    (verified against a real full-family build; no false positive), and
+    nothing here parses or reuses the ids across the two tables. If a future
+    change starts threading a numeric id from this parse through to a
+    ``--tensor-type`` or ``--tensor-type-file`` call (instead of a name), stop
+    -- that would be conflating LLAMA_FTYPE ids with ggml type ids, two
+    different namespaces that just happen to overlap in the ids-discarded,
+    names-only path used here.
+    """
+    return set(re.findall(r"^\s*\d+\s+or\s+(\S+)", help_text, re.MULTILINE))
+
+
+def validate_types_supported(required_types, quantize_bin: Path) -> None:
+    """Raise ``RuntimeError`` if ``quantize_bin --help`` doesn't advertise
+    every type in ``required_types``.
+
+    Run BEFORE quantizing so an unsupported target type (a stale/partial
+    ROCmFPX build missing a newer fork type) surfaces as a clear, actionable
+    message here instead of an opaque llama-quantize failure deep in a run.
+    Advisory-on-unknown: if ``--help`` itself can't be run, warn and proceed
+    rather than blocking the stage on the probe's own failure. Set
+    ``FOUNDRY_SKIP_TYPE_PROBE=1`` to bypass the probe entirely.
+
+    NAMESPACE NOTE: ``required_types`` here (from callers) and the
+    ``supported`` set below (from ``parse_quantize_help_types``) are both
+    ggml type NAME strings, never LLAMA_FTYPE numeric ids -- see the
+    namespace warning on ``parse_quantize_help_types`` above.
+    ``required_types`` is used both as the positional base ftype (a
+    LLAMA_FTYPE by name) and as ``--tensor-type-file`` override values (a
+    ggml type by name); this function's name-only membership check is valid
+    for both because it never touches either side's numeric id, only the
+    name string each side happens to share.
+    """
+    import os
+
+    if os.environ.get(SKIP_TYPE_PROBE_ENV) == "1":
+        return
+    help_text = _run_quantize_help(quantize_bin)
+    if help_text is None:
+        print(
+            f"Warning: could not run {quantize_bin} --help to verify type "
+            "support -- proceeding without the probe",
+            flush=True,
+        )
+        return
+    supported = parse_quantize_help_types(help_text)
+    missing = sorted(t for t in required_types if t not in supported)
+    if missing:
+        raise RuntimeError(
+            f"llama-quantize at {quantize_bin} does not support type(s): "
+            f"{', '.join(missing)}. This ROCmFPX build is likely stale or "
+            f"missing the required fork commit (pinned: {ROCMFPX_PIN}) -- "
+            "rebuild/update the checkout. Set "
+            f"{SKIP_TYPE_PROBE_ENV}=1 to bypass this check (not recommended)."
+        )
 
 
 def find_rocmfpx(hint: str = "") -> str | None:
@@ -524,6 +625,11 @@ def _quantize_preset(spec, out_dir, model_name, quantize_bin, bf16_gguf, imatrix
         print(f"Warning: skipping ROCmFPX format {spec!r}: {e}", flush=True)
         return None
     ggml_type = FORMAT_TABLE[(fmt, profile)]
+    try:
+        validate_types_supported({ggml_type}, quantize_bin)
+    except RuntimeError as e:
+        print(f"Error: skipping ROCmFPX format {spec!r}: {e}", flush=True)
+        return None
     out_path = out_dir / f"{model_name}-{ggml_type}.gguf"
     cmd = _quantize_cmd_base(quantize_bin, allow_requantize)
     if imatrix:
@@ -588,7 +694,9 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
         group_patterns = TensorGroupClassifier.GROUP_PATTERNS
         lines = build_tensor_type_lines(config, group_patterns)
         base_type = pick_base_type(config)
-    except (FileNotFoundError, KeyError, ValueError) as e:
+        required_types = {base_type} | {translate_scheme(s) for s in config.values()}
+        validate_types_supported(required_types, quantize_bin)
+    except (FileNotFoundError, KeyError, ValueError, RuntimeError) as e:
         print(f"Error ({spec}): {e}", flush=True)
         return None
 
