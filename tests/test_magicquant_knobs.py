@@ -1247,3 +1247,73 @@ def test_magicquant_entry_run_body_smoke_gate_before_stage_complete():
     gate_idx = run_body.index("ppl_smoke.smoke_test_gguf")
     assert "sys.exit(1)" in run_body[gate_idx:]
     assert gate_idx < run_body.index('print("PIPELINE_STAGE_COMPLETE=magicquant"')
+
+
+# ── resolve_source: LoRA-adapter-dir disclosure (rsLoRA audit, 2026-07-28) ──
+#
+# resolve_source()'s plain-safetensors-dir fallback
+# (``any(c.glob("*.safetensors"))``) also matches a LoRA ADAPTER directory
+# (adapter_model.safetensors + adapter_config.json) -- adapter_model.safetensors
+# IS a *.safetensors file. Behavior must stay the same (still return the dir,
+# not refuse it -- MagicQuant's own open_model_source() legitimately supports
+# LoRA-merge-on-read against the adapter), but silently treating an unmerged
+# adapter as a full model is a footgun: a user who forgot the export stage
+# gets no signal. resolve_source() now calls _disclose_if_lora_adapter_dir()
+# to print a loud NOTE naming the base model (from adapter_config.json's
+# base_model_name_or_path) it will merge against.
+
+def test_resolve_source_discloses_lora_adapter_dir(tmp_path, capsys):
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "adapter_model.safetensors").write_bytes(b"x")
+    (out / "adapter_config.json").write_text(json.dumps({
+        "r": 16, "lora_alpha": 32, "base_model_name_or_path": "/models/base-model",
+    }))
+
+    import _magicquant_entry as entry
+
+    result = entry.resolve_source("", out, str(tmp_path))
+
+    # Behavior-preserving: the adapter dir is still returned, not refused.
+    assert result == str(out)
+    err_out = capsys.readouterr().out
+    assert "LoRA ADAPTER" in err_out
+    assert "/models/base-model" in err_out
+    assert str(out) in err_out
+
+
+def test_resolve_source_discloses_lora_adapter_dir_with_unresolvable_base_model(
+    tmp_path, capsys,
+):
+    """adapter_config.json missing/blank base_model_name_or_path still gets a
+    loud NOTE -- just naming the base model as unresolved instead of silently
+    omitting it or crashing."""
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "adapter_model.safetensors").write_bytes(b"x")
+    (out / "adapter_config.json").write_text(json.dumps({"r": 8, "lora_alpha": 16}))
+
+    import _magicquant_entry as entry
+
+    result = entry.resolve_source("", out, str(tmp_path))
+
+    assert result == str(out)
+    err_out = capsys.readouterr().out
+    assert "LoRA ADAPTER" in err_out
+    assert "unknown" in err_out.lower()
+
+
+def test_resolve_source_plain_safetensors_dir_has_no_disclosure(tmp_path, capsys):
+    """The common case (a real merged-model dir, no adapter_config.json)
+    must NOT print the adapter disclosure."""
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "model.safetensors").write_bytes(b"x")
+
+    import _magicquant_entry as entry
+
+    result = entry.resolve_source("", out, str(tmp_path))
+
+    assert result == str(out)
+    err_out = capsys.readouterr().out
+    assert "LoRA ADAPTER" not in err_out

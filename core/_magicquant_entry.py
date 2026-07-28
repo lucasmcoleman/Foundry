@@ -125,6 +125,49 @@ def ensure_llamacpp(hint: str = "") -> str | None:
     return None
 
 
+def _disclose_if_lora_adapter_dir(c: Path) -> None:
+    """Loudly flag when a resolve_source() candidate is a LoRA ADAPTER
+    directory (adapter_model.safetensors + adapter_config.json), not a
+    merged model.
+
+    INCIDENT (rsLoRA audit, 2026-07-28): resolve_source()'s plain-
+    safetensors-dir fallback (``any(c.glob("*.safetensors"))``) accepts an
+    adapter directory too -- ``adapter_model.safetensors`` IS a
+    ``*.safetensors`` file. Without this check, a user who forgot to run the
+    export stage (or pointed ``--magicquant-source``/the UI source override
+    straight at a training checkpoint dir) got silently routed into
+    MagicQuant's LoRAMergedSource with no indication the "source model" was
+    actually an unmerged adapter.
+
+    Behavior is UNCHANGED -- the adapter dir is still returned. Refusing it
+    outright would break the legitimate use: MagicQuant's own
+    ``open_model_source()`` supports LoRA-merge-on-read given an adapter dir
+    whose ``adapter_config.json`` resolves ``base_model_name_or_path`` to a
+    local directory. This only makes that choice loud instead of silent.
+    """
+    adapter_cfg = c / "adapter_config.json"
+    if not adapter_cfg.exists():
+        return
+    base_model = "<unknown -- adapter_config.json has no base_model_name_or_path>"
+    try:
+        cfg = json.loads(adapter_cfg.read_text())
+        candidate = cfg.get("base_model_name_or_path")
+        if candidate:
+            base_model = candidate
+    except Exception:
+        pass
+    print(
+        f"NOTE: MagicQuant source {c} is a LoRA ADAPTER directory "
+        f"(adapter_config.json + adapter_model.safetensors), not a merged "
+        f"model. It will be used as-is: MagicQuant will LoRA-merge it onto "
+        f"base model '{base_model}' on read (LoRAMergedSource), not "
+        f"quantize a pre-merged checkpoint. If you meant to quantize the "
+        f"fully-merged model instead, run the export stage first (produces "
+        f"merged_model/) or point the source at that directory explicitly.",
+        flush=True,
+    )
+
+
 def resolve_source(override: str, out_dir: Path, pipeline_root: str) -> str | None:
     """Resolve the MagicQuant source model (reap > heretic > merged > bf16 gguf).
 
@@ -147,6 +190,7 @@ def resolve_source(override: str, out_dir: Path, pipeline_root: str) -> str | No
                 if d.exists() and any(d.glob("*.safetensors")):
                     return str(d)
             if any(c.glob("*.safetensors")):
+                _disclose_if_lora_adapter_dir(c)
                 return str(c)
             gguf = c / "model-bf16.gguf"
             if gguf.exists():

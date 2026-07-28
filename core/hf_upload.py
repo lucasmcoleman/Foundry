@@ -10,6 +10,7 @@ Token is sourced from HF_TOKEN env var — never hardcoded.
 """
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -34,6 +35,15 @@ try:
     from serving import build_serve_command, detect_mtp, format_serve_command
 except ImportError:  # pragma: no cover - when imported as the `core` package
     from core.serving import build_serve_command, detect_mtp, format_serve_command
+
+# ROCmFPX fork pin for model-card usage snippets -- single-sourced from
+# core/_rocmfpx_entry.py (its own known-good commit) rather than a second
+# hand-typed SHA here, which would silently drift the moment the pin is
+# bumped in one place and not the other.
+try:
+    from _rocmfpx_entry import ROCMFPX_PIN, ROCMFPX_REPO
+except ImportError:  # pragma: no cover - when imported as the `core` package
+    from core._rocmfpx_entry import ROCMFPX_PIN, ROCMFPX_REPO
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -172,6 +182,35 @@ def plan_gguf_repos(output_dir: str, repo_id: str) -> list[tuple[str, str]]:
 
 # ── Model card generation ────────────────────────────────────────────────────
 
+def _pick_example_gguf(files_to_upload: list[tuple[Path, str]]) -> Optional[str]:
+    """Pick a real, already-planned GGUF filename for usage snippets.
+
+    Never fabricates a name (e.g. a synthesized ``"<repo>-Q5.gguf"`` that may
+    not exist in the repo) -- prefers the Q5-ish "middle" tier when the
+    filenames make one identifiable, else the first non-mmproj GGUF in
+    upload order. Returns None if no non-mmproj GGUF was planned.
+    """
+    gguf_names = [
+        repo_path for _, repo_path in files_to_upload
+        if repo_path.lower().endswith(".gguf") and "mmproj" not in repo_path.lower()
+    ]
+    if not gguf_names:
+        return None
+    for name in gguf_names:
+        if "q5" in name.lower():
+            return name
+    return gguf_names[0]
+
+
+def _find_mmproj(files_to_upload: list[tuple[Path, str]]) -> Optional[str]:
+    """Return the mmproj (vision projector) repo filename, if one was planned."""
+    return next(
+        (repo_path for _, repo_path in files_to_upload
+         if repo_path.lower().endswith(".gguf") and "mmproj" in repo_path.lower()),
+        None,
+    )
+
+
 def generate_model_card(
     cfg: HFUploadConfig,
     files_to_upload: list[tuple[Path, str]],
@@ -212,15 +251,31 @@ def generate_model_card(
             # Infer quant tier from filename
             quant_hint = ""
             name_lower = name.lower()
-            if "rocmfp" in name_lower:
+            mq_hybrid_tier = re.search(r"mq-q(\d+)", name_lower)
+            if mq_hybrid_tier:
+                # MagicQuant-hybrid ROCmFPX file (_rocmfpx_entry._quantize_mq_hybrid's
+                # "<model>-ROCMFPX-MQ-<tier>.gguf" convention): MagicQuant's
+                # per-group layout re-expressed in ROCmFPX types. There's no
+                # direct Qn->ROCmFPn mapping (e.g. MagicQuant Q5 rounds UP to
+                # FP6), so this must be matched explicitly rather than falling
+                # through to the ROCmFPn/Qn substring checks below -- those
+                # would leave the cell empty for exactly this case.
+                quant_hint = (
+                    f"MagicQuant Q{mq_hybrid_tier.group(1)} layout in "
+                    f"ROCmFPX types (hybrid, fork-only)"
+                )
+            elif "rocmfp" in name_lower:
                 for bits in ("3", "4", "6", "8"):
                     if f"q{bits}" in name_lower or f"rocmfp{bits}" in name_lower:
                         quant_hint = f"ROCmFP{bits} (fork-only)"
                         break
-                if "_agent" in name_lower:
-                    quant_hint += ", agent preset"
-                elif "_coherent" in name_lower:
-                    quant_hint += ", coherent preset"
+                if quant_hint:
+                    if "_agent" in name_lower:
+                        quant_hint += ", agent preset"
+                    elif "_coherent" in name_lower:
+                        quant_hint += ", coherent preset"
+                else:
+                    quant_hint = "hybrid (fork-only)"
             elif "q4" in name_lower:
                 quant_hint = "Q4 hybrid"
             elif "q5" in name_lower:
@@ -231,6 +286,8 @@ def generate_model_card(
                 quant_hint = "BF16 (unquantized)"
             elif "f16" in name_lower:
                 quant_hint = "F16 (unquantized)"
+            if not quant_hint:
+                quant_hint = "—"
             gguf_rows += f"| [{name}](./{name}) | {size_gb:.1f} GB | {quant_hint} |\n"
 
     # Non-GGUF files table
@@ -415,7 +472,7 @@ based on the methodology by **[magiccodingman](https://github.com/magiccodingman
 
     # ROCmFPX section (only for AMD-native fork builds)
     if rocmfpx:
-        body_sections.append("""## ROCmFPX (AMD-native, fork-only)
+        body_sections.append(f"""## ROCmFPX (AMD-native, fork-only)
 
 These GGUFs use AMD-native quantization schemes from the experimental
 **[ciru-ai/ROCmFPX](https://github.com/ciru-ai/ROCmFPX)** llama.cpp fork,
@@ -423,8 +480,16 @@ tuned for and benchmarked on AMD Strix Halo (Radeon 8060S iGPU, gfx1151, unified
 
 - `ROCmFP3/4/6/8` tensor types with straight and "agent" presets (agent presets keep
   tool-calling / JSON-structured output reliable at low bit-widths)
-- Files load **only** on the fork -- build it from source; it is an experimental
-  upstream research build, so pin a commit that works""")
+- Files load **only** on the fork -- it is an experimental upstream research
+  build, so build from the pinned commit that produced these files (the
+  default branch may have moved on since):
+
+```bash
+git clone {ROCMFPX_REPO} ROCmFPX
+cd ROCmFPX
+git checkout {ROCMFPX_PIN}
+# then build per the fork's own README
+```""")
 
     # Training details (only if training was done)
     if cfg.did_training:
@@ -455,24 +520,37 @@ than memorizing prompts.""")
     if files_section:
         body_sections.append(files_section.strip())
 
-    # Usage section (only if GGUF files present)
-    if has_gguf and rocmfpx:
-        example_gguf = next((rp for _, rp in files_to_upload
-                             if rp.endswith(".gguf") and "mmproj" not in rp.lower()), f"{repo_name}.gguf")
-        body_sections.append(f"""## Usage
+    # Usage section (only if GGUF files present). Snippets always use a real
+    # filename from files_to_upload -- never a synthesized "<repo>-Q5.gguf".
+    if has_gguf:
+        example_gguf = _pick_example_gguf(files_to_upload)
+        mmproj_name = _find_mmproj(files_to_upload)
+        vision_snippet = ""
+        if mmproj_name and example_gguf:
+            vision_snippet = f"""
+
+### Vision (image input)
+
+```bash
+llama-server -m {example_gguf} --mmproj {mmproj_name} -c 8192 --port 8080 -ngl 99 -fa on
+```"""
+        example_gguf = example_gguf or f"{repo_name}.gguf"
+
+        if rocmfpx:
+            body_sections.append(f"""## Usage
 
 Requires a from-source build of the [ROCmFPX fork](https://github.com/ciru-ai/ROCmFPX)
 (stock llama.cpp, LM Studio, and Ollama cannot load these files):
 
 ```bash
-# Interactive chat
-llama-cli -m {example_gguf} -c 8192 -cnv
+# Interactive chat (--jinja uses the model's embedded chat template)
+llama-cli -m {example_gguf} -c 8192 --jinja -cnv
 
 # Server mode
-llama-server -m {example_gguf} -c 8192 --port 8080 -ngl 99 -fa on
-```""")
-    elif has_gguf:
-        body_sections.append(f"""## Usage
+llama-server -m {example_gguf} -c 8192 --port 8080 -ngl 99 -fa on --jinja
+```{vision_snippet}""")
+        else:
+            body_sections.append(f"""## Usage
 
 ### LM Studio
 
@@ -484,14 +562,14 @@ llama-server -m {example_gguf} -c 8192 --port 8080 -ngl 99 -fa on
 ### llama.cpp
 
 ```bash
-# Interactive chat
-llama-cli -m {repo_name}-Q5.gguf -c 8192 --chat-template chatml -cnv
+# Interactive chat (--jinja uses the model's embedded chat template, not a hardcoded one)
+llama-cli -m {example_gguf} -c 8192 --jinja -cnv
 
 # Single prompt
-llama-cli -m {repo_name}-Q5.gguf -c 8192 -p "Your prompt here"
+llama-cli -m {example_gguf} -c 8192 -p "Your prompt here"
 
 # Server mode
-llama-server -m {repo_name}-Q5.gguf -c 8192 --port 8080
+llama-server -m {example_gguf} -c 8192 --port 8080 --jinja
 ```
 
 ### Python (llama-cpp-python)
@@ -499,14 +577,14 @@ llama-server -m {repo_name}-Q5.gguf -c 8192 --port 8080
 ```python
 from llama_cpp import Llama
 
-llm = Llama(model_path="./{repo_name}-Q5.gguf", n_ctx=8192)
+llm = Llama(model_path="./{example_gguf}", n_ctx=8192)
 output = llm.create_chat_completion(
     messages=[
         {{"role": "user", "content": "Hello, how are you?"}}
     ]
 )
 print(output["choices"][0]["message"]["content"])
-```""")
+```{vision_snippet}""")
 
     # MTP speculative decoding (only if a produced GGUF carries "nextn" draft tensors)
     if mtp_gguf_path is not None:

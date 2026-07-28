@@ -451,6 +451,40 @@ def ensure_rocmfpx(hint: str = "") -> str | None:
     return None
 
 
+def _disclose_if_lora_adapter_dir(c: Path) -> None:
+    """Loudly flag when a resolve_source() candidate is a LoRA ADAPTER
+    directory (adapter_model.safetensors + adapter_config.json), not a
+    merged model.
+
+    Mirrors ``_magicquant_entry._disclose_if_lora_adapter_dir`` -- see its
+    docstring for the incident (rsLoRA audit, 2026-07-28) this fixes.
+    Behavior is UNCHANGED (the adapter dir is still returned); this only
+    makes the choice loud instead of silent.
+    """
+    adapter_cfg = c / "adapter_config.json"
+    if not adapter_cfg.exists():
+        return
+    base_model = "<unknown -- adapter_config.json has no base_model_name_or_path>"
+    try:
+        cfg = json.loads(adapter_cfg.read_text())
+        candidate = cfg.get("base_model_name_or_path")
+        if candidate:
+            base_model = candidate
+    except Exception:
+        pass
+    print(
+        f"NOTE: ROCmFPX source {c} is a LoRA ADAPTER directory "
+        f"(adapter_config.json + adapter_model.safetensors), not a merged "
+        f"model. It will be used as-is, merged onto base model "
+        f"'{base_model}' (read from adapter_config.json) wherever "
+        f"downstream conversion/quantization expects a full checkpoint. If "
+        f"you meant to quantize the fully-merged model instead, run the "
+        f"export stage first (produces merged_model/) or point the source "
+        f"at that directory explicitly.",
+        flush=True,
+    )
+
+
 def resolve_source(override: str, out_dir: Path, pipeline_root: str) -> str | None:
     """Resolve the ROCmFPX source model (reap > heretic > merged > bf16 gguf).
 
@@ -472,6 +506,7 @@ def resolve_source(override: str, out_dir: Path, pipeline_root: str) -> str | No
                 if d.exists() and any(d.glob("*.safetensors")):
                     return str(d)
             if any(c.glob("*.safetensors")):
+                _disclose_if_lora_adapter_dir(c)
                 return str(c)
             gguf = c / "model-bf16.gguf"
             if gguf.exists():
