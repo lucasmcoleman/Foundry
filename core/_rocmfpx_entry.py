@@ -456,6 +456,7 @@ def run(cfg_path: str | None = None) -> None:
     formats = json.loads(cfg["formats_json"])
     imatrix = cfg.get("imatrix", "")
     model_name = cfg["model_name"]
+    allow_requantize = cfg.get("allow_requantize", False)
 
     import subprocess
 
@@ -465,11 +466,12 @@ def run(cfg_path: str | None = None) -> None:
         if tier is not None:
             out_path = _quantize_mq_hybrid(
                 spec, tier, out_dir, rocmfpx_out_dir, model_name,
-                quantize_bin, bf16_gguf, imatrix,
+                quantize_bin, bf16_gguf, imatrix, allow_requantize,
             )
         else:
             out_path = _quantize_preset(
                 spec, rocmfpx_out_dir, model_name, quantize_bin, bf16_gguf, imatrix,
+                allow_requantize,
             )
         if out_path is not None:
             produced.append(out_path)
@@ -481,7 +483,19 @@ def run(cfg_path: str | None = None) -> None:
     print("PIPELINE_STAGE_COMPLETE=rocmfpx", flush=True)
 
 
-def _quantize_preset(spec, out_dir, model_name, quantize_bin, bf16_gguf, imatrix):
+def _quantize_cmd_base(quantize_bin, allow_requantize: bool = False) -> list[str]:
+    """Base llama-quantize argv: the binary, plus --allow-requantize (double-
+    quantization of an already-quantized source) when opted in. llama-quantize
+    flags must precede its positionals, so this goes first; pure/testable.
+    """
+    cmd = [str(quantize_bin)]
+    if allow_requantize:
+        cmd.append("--allow-requantize")
+    return cmd
+
+
+def _quantize_preset(spec, out_dir, model_name, quantize_bin, bf16_gguf, imatrix,
+                     allow_requantize=False):
     """Run one uniform-preset quantize pass (rocmfp4-agent etc.)."""
     import subprocess
 
@@ -492,7 +506,7 @@ def _quantize_preset(spec, out_dir, model_name, quantize_bin, bf16_gguf, imatrix
         return None
     ggml_type = FORMAT_TABLE[(fmt, profile)]
     out_path = out_dir / f"{model_name}-{ggml_type}.gguf"
-    cmd = [str(quantize_bin)]
+    cmd = _quantize_cmd_base(quantize_bin, allow_requantize)
     if imatrix:
         cmd += ["--imatrix", imatrix]
     cmd += [str(bf16_gguf), str(out_path), ggml_type]
@@ -531,7 +545,7 @@ def _load_mq_tier_config(out_dir: Path, tier: str) -> dict:
 
 
 def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
-                        quantize_bin, bf16_gguf, imatrix):
+                        quantize_bin, bf16_gguf, imatrix, allow_requantize=False):
     """Produce a ROCmFPX hybrid matching MagicQuant's per-group config for ``tier``.
 
     Translates each group's MagicQuant scheme to a ROCmFPX-family type and
@@ -567,7 +581,8 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
     print(f"Quantizing {spec}: MagicQuant {tier} layout in ROCmFPX types", flush=True)
     print(f"  base={base_type}  groups={schemes}", flush=True)
 
-    cmd = [str(quantize_bin), "--tensor-type-file", str(type_file)]
+    cmd = _quantize_cmd_base(quantize_bin, allow_requantize)
+    cmd += ["--tensor-type-file", str(type_file)]
     if imatrix:
         cmd += ["--imatrix", imatrix]
     cmd += [str(bf16_gguf), str(out_path), base_type]

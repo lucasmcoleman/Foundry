@@ -110,6 +110,13 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
    explore AMD-native ROCmFPX fork types per group (needs a ROCmFPX build;
    output loads only on the fork). Persists `search_results.json` from both
    search paths (consumed by QAT and by ROCmFPX's mq-hybrid mode).
+   GGUF-only releases (no safetensors/BF16 published) can serve as the source
+   via `--magicquant-source-model <file.gguf> --magicquant-dequant-source`
+   (UI: MagicQuant card "Quantized GGUF source" toggle) — the output is then
+   **double-quantized**: quality is bounded by the source quant's error floor,
+   so a Q4 tier from a Q8_0 source ≈ Q4-from-BF16, while Q5/Q6 tiers are
+   largely pointless. Disclose double-quantization on the model card. ROCmFPX
+   from a quantized source likewise needs `--rocmfpx-allow-requantize`.
 7. **ROCmFPX** (optional, off by default): AMD-native quant GGUFs via
    [ciru-ai/ROCmFPX](https://github.com/ciru-ai/ROCmFPX) (a llama.cpp fork,
    git-cloned + compiled — not a pip package). Produces ROCmFP3/4/6/8 GGUFs

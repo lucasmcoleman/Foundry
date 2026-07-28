@@ -8,11 +8,22 @@ ROCmFPX checkout, network access, or torch -- everything here is stdlib-only,
 matching _rocmfpx_entry.py's own module-level import discipline.
 """
 
+import importlib
 import json
+from pathlib import Path
 
 import pytest
 
 import _rocmfpx_entry as entry
+from services import ROCmFPXService
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _pipeline():
+    import pipeline as pl
+
+    return importlib.reload(pl)
 
 
 # ── parse_format_spec ────────────────────────────────────────────────────────
@@ -308,3 +319,85 @@ def test_quantize_preset_returns_none_on_bad_spec(tmp_path):
         entry.Path("/nonexistent/llama-quantize"), entry.Path("/nonexistent/model-bf16.gguf"), "",
     )
     assert result is None
+
+
+# ── allow_requantize: --allow-requantize for already-quantized GGUF sources ──
+#
+# Double-quantization opt-in, mirroring MagicQuant's allow_dequant_source.
+# _quantize_cmd_base is the pure/testable seam _quantize_preset and
+# _quantize_mq_hybrid both build their llama-quantize argv from.
+
+def test_quantize_cmd_base_omits_flag_by_default():
+    cmd = entry._quantize_cmd_base(entry.Path("/bin/llama-quantize"))
+    assert cmd == ["/bin/llama-quantize"]
+
+
+def test_quantize_cmd_base_includes_flag_when_requested():
+    cmd = entry._quantize_cmd_base(entry.Path("/bin/llama-quantize"), allow_requantize=True)
+    assert cmd == ["/bin/llama-quantize", "--allow-requantize"]
+
+
+def test_quantize_cmd_base_flag_precedes_positionals_style():
+    """llama-quantize flags must precede positionals -- --allow-requantize is
+    always cmd[1], never appended after other args."""
+    cmd = entry._quantize_cmd_base(entry.Path("/bin/llama-quantize"), allow_requantize=True)
+    assert cmd[1] == "--allow-requantize"
+
+
+# ── core/pipeline.py: ROCmFPXConfig dataclass + CLI + cfg_hash ───────────────
+
+def test_rocmfpx_config_allow_requantize_default():
+    pl = _pipeline()
+    rc = pl.ROCmFPXConfig()
+    assert rc.allow_requantize is False
+
+
+def test_rocmfpx_allow_requantize_cli_flag_wires_into_config(monkeypatch):
+    pl = _pipeline()
+    captured = {}
+
+    def _fake_run_pipeline(cfg, **kwargs):
+        captured["cfg"] = cfg
+        return {"rocmfpx": True}
+
+    monkeypatch.setattr(pl, "run_pipeline", _fake_run_pipeline)
+
+    pl.main([
+        "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
+        "--rocmfpx",
+    ])
+    assert captured["cfg"].rocmfpx.allow_requantize is False
+
+    pl.main([
+        "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
+        "--rocmfpx", "--rocmfpx-allow-requantize",
+    ])
+    assert captured["cfg"].rocmfpx.allow_requantize is True
+
+
+def test_stage_rocmfpx_hash_source_includes_allow_requantize():
+    src = (ROOT / "core" / "pipeline.py").read_text()
+    hash_block = src[src.index('def stage_rocmfpx'):src.index('existing = sorted(artifacts.rocmfpx_dir')]
+    assert '"allow_requantize": rc_cfg.allow_requantize' in hash_block
+
+
+# ── core/services.py: ROCmFPXService.build_config carries allow_requantize ───
+
+def test_rocmfpx_build_config_allow_requantize_default_false():
+    svc = ROCmFPXService(ROOT, "python")
+    cfg = svc.build_config(
+        rocmfpx_hint="", pipeline_root_str="/repo", source_override="/src",
+        out_abs_str="/o", formats_json='["rocmfp4-agent"]', model_name="m",
+    )
+    assert cfg["allow_requantize"] is False
+
+
+def test_rocmfpx_build_config_allow_requantize_explicit_true():
+    svc = ROCmFPXService(ROOT, "python")
+    cfg = svc.build_config(
+        rocmfpx_hint="", pipeline_root_str="/repo", source_override="/src",
+        out_abs_str="/o", formats_json='["rocmfp4-agent"]', model_name="m",
+        allow_requantize=True,
+    )
+    assert cfg["allow_requantize"] is True
+    assert json.loads(json.dumps(cfg)) == cfg
