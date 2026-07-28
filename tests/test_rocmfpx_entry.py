@@ -436,6 +436,176 @@ def test_rocmfpx_entry_run_body_uses_find_perplexity_bin_on_rocmfpx_dir():
     assert "ppl_smoke.find_perplexity_bin(rocmfpx_dir)" in run_body
 
 
+# ── runtime type-support probe (parse_quantize_help_types / validate_types_supported) ──
+#
+# Whether the built llama-quantize actually supports each target type is a
+# fact about the BINARY, not a local assumption -- probe --help's own output
+# rather than hand-maintain a duplicate type list that can silently drift.
+# Trimmed but real sample captured from an actual full-family ROCmFPX build
+# (/home/lucas/ROCmFPX/build-strix-rocmfp4/bin/llama-quantize --help).
+
+_REAL_HELP_SAMPLE = """usage: /home/lucas/ROCmFPX/build-strix-rocmfp4/bin/llama-quantize [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]
+       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]
+       [--prune-layers] [--keep-split] [--override-kv] [--dry-run]
+       model-f32.gguf [model-quant.gguf] type [nthreads]
+
+  --allow-requantize
+                                      allow requantizing tensors that have already been quantized
+                                      WARNING: this can severely reduce quality compared to quantizing
+                                               from 16bit or 32bit!
+  --tensor-type-file tensor_types.txt
+                                      list of tensors to quantize to a specific ggml_type
+                                      this is an advanced option to selectively quantize a long list of tensors.
+                                      the file should use the same format as above, separated by spaces or newlines.
+
+note: --include-weights and --exclude-weights cannot be used together
+
+-----------------------------------------------------------------------------
+ allowed quantization types
+-----------------------------------------------------------------------------
+
+  40  or  Q1_0    :  1.125 bpw quantization
+   2  or  Q4_0    :  4.34G, +0.4685 ppl @ Llama-3-8B
+  100  or  Q4_0_ROCMFP4 :  4.50 bpw ROCmFP4 UE4M3-scale experimental
+  101  or  Q4_0_ROCMFP4_LEAN :  4.60 bpw ROCmFP4 + Q5_K token embeddings
+  102  or  Q4_0_ROCMFP4_COHERENT :  4.70 bpw ROCmFP4 + Q6_K token embeddings
+  103  or  Q4_0_ROCMFP4_FAST :  4.25 bpw ROCmFP4 single-scale speed layout
+  104  or  Q4_0_ROCMFP4_FAST_COHERENT :  ~4.45 bpw ROCmFP4 fast + Q6_K token embeddings
+  105  or  Q4_0_ROCMFP4_STRIX :  ~4.49 bpw ROCmFP4 Strix Halo attn-K/V quality recipe
+  106  or  Q4_0_ROCMFP4_STRIX_LEAN :  ~4.38 bpw ROCmFP4 Strix K/V + Q5_K token embeddings
+  112  or  Q3_0_ROCMFPX :  3.50 bpw ROCmFPx experimental, ROCm/Vulkan staging
+  110  or  Q6_0_ROCMFPX :  6.50 bpw ROCmFPx experimental, ROCm/Vulkan staging
+  111  or  Q8_0_ROCMFPX :  8.25 bpw ROCmFPx experimental, ROCm/Vulkan staging
+  113  or  Q3_0_ROCMFPX_AGENT :  agent/tool-call coherent ROCmFPx Q3 routing
+  114  or  Q6_0_ROCMFPX_AGENT :  agent/tool-call coherent ROCmFPx Q6 routing
+  115  or  Q8_0_ROCMFPX_AGENT :  agent/tool-call coherent ROCmFPx Q8 routing
+   3  or  Q4_1    :  4.78G, +0.4511 ppl @ Llama-3-8B
+  38  or  MXFP4_MOE :  MXFP4 MoE
+   7  or  Q8_0    :  7.96G, +0.0026 ppl @ Llama-3-8B
+   1  or  F16     : 14.00G, +0.0020 ppl @ Mistral-7B
+  32  or  BF16    : 14.00G, -0.0050 ppl @ Mistral-7B
+   0  or  F32     : 26.00G              @ 7B
+"""
+
+
+def test_parse_quantize_help_types_extracts_rocmfpx_family():
+    types = entry.parse_quantize_help_types(_REAL_HELP_SAMPLE)
+    for t in ("Q4_0_ROCMFP4", "Q3_0_ROCMFPX", "Q6_0_ROCMFPX", "Q8_0_ROCMFPX",
+              "Q3_0_ROCMFPX_AGENT", "Q6_0_ROCMFPX_AGENT", "Q8_0_ROCMFPX_AGENT",
+              "Q4_0_ROCMFP4_COHERENT"):
+        assert t in types
+
+
+def test_parse_quantize_help_types_extracts_stock_types_too():
+    types = entry.parse_quantize_help_types(_REAL_HELP_SAMPLE)
+    for t in ("Q8_0", "BF16", "F16", "F32", "MXFP4_MOE", "Q4_0", "Q4_1", "Q1_0"):
+        assert t in types
+
+
+def test_parse_quantize_help_types_excludes_non_table_tokens():
+    """Flag lines and prose above the table must not leak spurious 'types' in --
+    only lines lines matching the '<id> or <NAME>' table format count."""
+    types = entry.parse_quantize_help_types(_REAL_HELP_SAMPLE)
+    assert "tensor_types.txt" not in types
+    assert "cannot" not in types
+
+
+def test_parse_quantize_help_types_empty_on_no_table():
+    assert entry.parse_quantize_help_types("no table here at all") == set()
+
+
+def test_validate_types_supported_passes_for_known_types(monkeypatch):
+    monkeypatch.delenv(entry.SKIP_TYPE_PROBE_ENV, raising=False)
+    monkeypatch.setattr(entry, "_run_quantize_help", lambda p: _REAL_HELP_SAMPLE)
+    # Must not raise.
+    entry.validate_types_supported({"Q4_0_ROCMFP4", "Q8_0_ROCMFPX"}, entry.Path("/bin/llama-quantize"))
+
+
+def test_validate_types_supported_raises_naming_missing_type_and_binary(monkeypatch):
+    monkeypatch.delenv(entry.SKIP_TYPE_PROBE_ENV, raising=False)
+    monkeypatch.setattr(entry, "_run_quantize_help", lambda p: _REAL_HELP_SAMPLE)
+    qbin = entry.Path("/opt/rocmfpx/llama-quantize")
+    with pytest.raises(RuntimeError) as exc_info:
+        entry.validate_types_supported({"Q9_0_MADE_UP", "Q8_0_ROCMFPX"}, qbin)
+    msg = str(exc_info.value)
+    assert "Q9_0_MADE_UP" in msg
+    assert "Q8_0_ROCMFPX" not in msg  # only the missing one is named
+    assert str(qbin) in msg
+    assert entry.ROCMFPX_PIN in msg  # names the likely fix (rebuild to the pin)
+
+
+def test_validate_types_supported_env_skip_bypasses_probe(monkeypatch):
+    monkeypatch.setenv(entry.SKIP_TYPE_PROBE_ENV, "1")
+
+    def _boom(p):
+        raise AssertionError("--help should not be run when the skip env is set")
+
+    monkeypatch.setattr(entry, "_run_quantize_help", _boom)
+    # Must not raise even for a type no real build would support.
+    entry.validate_types_supported({"TOTALLY_FAKE_TYPE"}, entry.Path("/bin/llama-quantize"))
+
+
+def test_validate_types_supported_advisory_when_help_cannot_run(monkeypatch, capsys):
+    monkeypatch.delenv(entry.SKIP_TYPE_PROBE_ENV, raising=False)
+    monkeypatch.setattr(entry, "_run_quantize_help", lambda p: None)
+    # Must warn and proceed, not raise, when --help itself couldn't be run.
+    entry.validate_types_supported({"ANYTHING"}, entry.Path("/nonexistent/llama-quantize"))
+    out = capsys.readouterr().out
+    assert "Warning" in out
+
+
+def test_run_quantize_help_returns_none_on_missing_binary():
+    assert entry._run_quantize_help(entry.Path("/nonexistent/llama-quantize")) is None
+
+
+def test_has_full_family_uses_shared_help_runner(monkeypatch):
+    """_has_full_family should go through the same _run_quantize_help seam
+    validate_types_supported uses, not a second hand-rolled subprocess call."""
+    monkeypatch.setattr(entry, "_run_quantize_help", lambda p: _REAL_HELP_SAMPLE)
+    assert entry._has_full_family(entry.Path("/bin/llama-quantize")) is True
+
+    monkeypatch.setattr(entry, "_run_quantize_help", lambda p: None)
+    assert entry._has_full_family(entry.Path("/bin/llama-quantize")) is False
+
+
+# ── validate_types_supported wired into the quantize paths ─────────────────
+
+def test_quantize_preset_returns_none_on_unsupported_type(monkeypatch, tmp_path):
+    out_dir = tmp_path / "rocmfpx"
+    out_dir.mkdir()
+
+    def _boom(required, quantize_bin):
+        raise RuntimeError(f"llama-quantize at {quantize_bin} does not support type(s): Q4_0_ROCMFP4")
+
+    monkeypatch.setattr(entry, "validate_types_supported", _boom)
+    result = entry._quantize_preset(
+        "rocmfp4-agent", out_dir, "model",
+        entry.Path("/nonexistent/llama-quantize"), entry.Path("/nonexistent/model-bf16.gguf"), "",
+    )
+    assert result is None
+
+
+def test_quantize_mq_hybrid_returns_none_on_unsupported_type(monkeypatch, tmp_path):
+    out_dir = tmp_path / "output"
+    mq_dir = out_dir / "magicquant"
+    mq_dir.mkdir(parents=True)
+    mq_dir.joinpath("search_results.json").write_text(json.dumps({
+        "tiered": {"Q4": {"config": {"X": "MXFP4_MOE"}}}
+    }))
+    rocmfpx_out_dir = out_dir / "rocmfpx"
+    rocmfpx_out_dir.mkdir()
+
+    def _boom(required, quantize_bin):
+        raise RuntimeError("does not support type(s): Q4_0_ROCMFP4")
+
+    monkeypatch.setattr(entry, "validate_types_supported", _boom)
+    result = entry._quantize_mq_hybrid(
+        "mq-q4", "Q4", out_dir, rocmfpx_out_dir, "model",
+        entry.Path("/nonexistent/llama-quantize"), entry.Path("/nonexistent/model-bf16.gguf"), "",
+    )
+    assert result is None
+
+
 def test_find_perplexity_bin_resolves_real_rocmfpx_build_layout(tmp_path):
     """End-to-end sanity check that ppl_smoke.find_perplexity_bin actually
     resolves the exact build layout _rocmfpx_entry uses for llama-quantize
