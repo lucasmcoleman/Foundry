@@ -34,6 +34,11 @@ REAP_SUPPORTED_ARCHS = frozenset({
     "Ernie4_5_MoeForCausalLM",
     "GptOssForCausalLM",
     "Glm4MoeForCausalLM",
+    # poolside/Laguna-* (custom_code arch "laguna"). Fused 3D-nn.Parameter
+    # experts + a sigmoid router at .gate + an unpruned per-block shared expert;
+    # supported via the laguna entries in reap.model_util.MODEL_ATTRS and
+    # reap.observer.OBSERVER_CONFIG_REGISTRY.
+    "LagunaForCausalLM",
 })
 
 

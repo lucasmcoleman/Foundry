@@ -268,8 +268,22 @@ class ReapService:
         model_max_length: int,
         dataset_name: str,
         seed: int,
+        observer_only: bool = False,
     ) -> dict:
-        """Build the JSON config consumed by core/_reap_entry.py."""
+        """Build the JSON config consumed by core/_reap_entry.py.
+
+        ``observer_only`` (opt-in, default False): stops REAP after the
+        calibration/observation pass -- skips pruning, saving, and eval
+        entirely. Maps to ``reap.prune``'s own ``--run_observer_only`` flag.
+        For huge MoE models (e.g. Laguna-S) whose full-precision weights
+        don't fit in memory, this is meant to pair with a 4-bit calibration
+        load (``REAP_LOAD_IN_4BIT=1``, see reap.model_util) and/or an
+        unfused-expert architecture (see reap.laguna_unfused) upstream of
+        this entry point: observe cheaply, then prune out-of-band via
+        streaming safetensors surgery driven by the saved observations,
+        rather than pruning the same (possibly quantized/patched) in-memory
+        model REAP just calibrated.
+        """
         return {
             "pipeline_root": str(self.pipeline_root),
             "input_dir": input_dir,
@@ -281,6 +295,7 @@ class ReapService:
             "model_max_length": model_max_length,
             "dataset_name": dataset_name,
             "seed": seed,
+            "observer_only": observer_only,
         }
 
     def build_script(self, **kwargs) -> str:
