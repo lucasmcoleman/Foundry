@@ -23,7 +23,7 @@ from pathlib import Path
 import ppl_smoke
 
 ROCMFPX_REPO = "https://github.com/ciru-ai/ROCmFPX.git"
-ROCMFPX_PIN = "221402af8574faf652b101b6afe225a3f329561f"  # known-good commit; bump deliberately
+ROCMFPX_PIN = "68f23f34c12d7e61177a034b0d8d3fea2129565e"  # laguna-capable; bump deliberately
 
 # Env override to bypass the runtime type-support probe (validate_types_supported)
 # entirely -- e.g. a CI sandbox with no real ROCmFPX binary at all. Advisory
