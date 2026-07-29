@@ -28,6 +28,25 @@ def test_gpt_oss_class_name_present():
     assert "GptOssForCausalLM" in reap_common.REAP_SUPPORTED_ARCHS
 
 
+def test_laguna_class_name_present():
+    """poolside/Laguna-* (fused 3D-nn.Parameter experts). Supported via the
+    laguna entries in reap.model_util.MODEL_ATTRS /
+    reap.observer.OBSERVER_CONFIG_REGISTRY -- the arch string is the class name
+    from the repo's config.json ``architectures[0]``."""
+    assert "LagunaForCausalLM" in reap_common.REAP_SUPPORTED_ARCHS
+
+
+def test_laguna_arch_detected_from_config(tmp_path):
+    """The literal must match what detect_model_arch() actually reads out of a
+    Laguna config.json, otherwise stage_reap silently skips the model."""
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["LagunaForCausalLM"], "model_type": "laguna"}'
+    )
+    arch = reap_common.detect_model_arch(tmp_path)
+    assert arch == "LagunaForCausalLM"
+    assert arch in reap_common.REAP_SUPPORTED_ARCHS
+
+
 def test_cli_and_ui_share_one_object():
     """The CLI (pipeline) and UI (app) must reference the same shared set."""
     import pipeline

@@ -45,6 +45,11 @@ def build_argv(cfg: dict) -> list[str]:
         "--record_pruning_metrics_only", "true",
         "--overwrite_observations", "false",
         "--plot_clusters", "false",
+        # Opt-in (default False, ReapService.build_config): stop after the
+        # observer/calibration pass, skipping reap.prune.main()'s pruning,
+        # save_pretrained, and eval steps entirely. See run()'s handling
+        # below -- when set, there is no pruned_models/ output to relocate.
+        "--run_observer_only", "true" if cfg.get("observer_only", False) else "false",
     ]
 
 
@@ -95,6 +100,48 @@ def run(cfg_path: str | None = None) -> None:
     print(f"[reap] invoking reap.prune.main() with argv: {sys.argv[1:]}", flush=True)
     from reap.prune import main as _reap_main
     _reap_main()
+
+    if cfg.get("observer_only", False):
+        # reap.prune.main() returns right after the observer/calibration
+        # pass when --run_observer_only is set -- it never prunes, never
+        # calls save_pretrained, and writes no pruned_models/ directory.
+        # Relocate the saved observation file(s) instead (REAP writes
+        # <category>/observations_*.pt under its relative artifacts/ tree;
+        # preserve that per-category layout under reap_dir).
+        print(
+            f"[reap] observer_only=True: searching for observation files "
+            f"under {artifacts_root}",
+            flush=True,
+        )
+        obs_files = sorted(artifacts_root.rglob("observations_*.pt"))
+        if not obs_files:
+            print(
+                f"[reap] ERROR: no observation files (observations_*.pt) found "
+                f"under {artifacts_root}",
+                flush=True,
+            )
+            for p in sorted(artifacts_root.rglob("*"))[:50]:
+                print(f"  {p}", flush=True)
+            sys.exit(1)
+
+        dest = Path(reap_dir)
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in obs_files:
+            target = dest / f.relative_to(artifacts_root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(f), str(target))
+            print(f"[reap] moved observation file to: {target}", flush=True)
+
+        try:
+            shutil.rmtree(artifacts_root)
+            print(f"[reap] cleaned up {artifacts_root}", flush=True)
+        except Exception as e:
+            print(f"[reap] warning: cleanup of {artifacts_root} failed: {e}", flush=True)
+
+        print("PIPELINE_STAGE_COMPLETE=reap", flush=True)
+        return
 
     # Locate the pruned_models/<something>/ directory that REAP just wrote.
     print(f"[reap] searching for pruned model under {artifacts_root}", flush=True)
