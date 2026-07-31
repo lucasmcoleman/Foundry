@@ -466,7 +466,16 @@ def run(cfg_path: str | None = None) -> None:
     calibration_source = cfg.get("calibration_source", "")
 
     if measured:
-        best_configs, tiered = orch.run_measured_search(
+        # speed_aware: absent/null in cfg means "no explicit Foundry choice"
+        # (see MagicQuantService.build_config's speed_aware docstring) -- the
+        # kwarg is omitted entirely in that case so
+        # run_measured_search's OWN default (True, the 2026-07 fix) actually
+        # takes effect, instead of a stray explicit False (the old bug: cfg.
+        # get("speed_aware", False) always produced a concrete False, since
+        # the key was always present, permanently overriding the library
+        # default no matter what it was set to). An explicit True/False in
+        # cfg (a real user/CLI choice) is still forwarded and still wins.
+        measured_kwargs = dict(
             target_base_quant=target_base_quant,
             search_generations=generations,
             population_size=population_size,
@@ -483,13 +492,16 @@ def run(cfg_path: str | None = None) -> None:
             measurement_chunks=measurement_chunks,
             stream_aware=stream_aware,
             head_aggressive=head_aggressive,
-            speed_aware=cfg.get("speed_aware", False),
             speed_metric=cfg.get("speed_metric", "bytes"),
             speed_weight=speed_weight,
             use_bytes_tps=use_bytes_tps,
             write_calibration=cfg.get("write_calibration", False),
             calibration_source=calibration_source,
         )
+        cfg_speed_aware = cfg.get("speed_aware")
+        if cfg_speed_aware is not None:
+            measured_kwargs["speed_aware"] = cfg_speed_aware
+        best_configs, tiered = orch.run_measured_search(**measured_kwargs)
     else:
         best_configs, tiered = orch.run_full_search(
             target_base_quant=target_base_quant,

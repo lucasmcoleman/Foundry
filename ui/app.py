@@ -259,7 +259,7 @@ class MagicQuantCfg(BaseModel):
     measurement_chunks: Optional[int] = None  # cap perplexity/KL passes (both search paths)
     stream_aware: bool = False       # bias sampling toward BF16->Q8_0 on streamed groups
     head_aggressive: bool = False    # bias 'H' (LM head) group sampling toward smaller K-quants
-    speed_aware: bool = False        # measured-search only: prefer fastest near-tied candidate per tier
+    speed_aware: Optional[bool] = None  # measured-search only: prefer fastest near-tied candidate per tier. None = no explicit UI choice -> MagicQuantOrchestrator's own default (True) applies; True/False here pins an explicit override.
     speed_metric: str = "bytes"      # "bytes" (deterministic) | "bench" (measured tg); only meaningful when speed_aware
     speed_weight: Optional[float] = None  # tps-aware SEARCH objective weight (both search paths); None = unchanged weights
     use_bytes_tps: bool = False      # score the search objective's speed term from predicted size, not noisy speed_multiplier

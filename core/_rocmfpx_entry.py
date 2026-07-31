@@ -683,6 +683,17 @@ def _load_mq_tier_config(out_dir: Path, tier: str) -> dict:
     """Read the per-group config for ``tier`` from MagicQuant's search results.
 
     Raises with an actionable message if the file or tier is missing.
+
+    Compatibility: a search_results.json written before MagicQuant's 2026-07
+    TIER_SCHEME_VERSION fix has no ``tier_scheme_version`` field and its
+    tier labels follow the OLD, wider size-ratio boundaries (e.g. its "Q5"
+    entry can actually be Q6_K-sized -- see magicquant.quant.tiers' module
+    docstring). The config STILL LOADS -- the per-group scheme mapping
+    stored under a tier key is unaffected by which boundaries produced the
+    label -- but a non-fatal warning is printed so an ``mq-<tier>`` ROCmFPX
+    build (whose OUTPUT FILENAME bakes the tier string in, e.g.
+    "...-MQ-Q5.gguf") doesn't silently ship a file whose name no longer
+    matches what that tier means under the current scheme.
     """
     results_path = out_dir / "magicquant" / "search_results.json"
     if not results_path.exists():
@@ -692,6 +703,26 @@ def _load_mq_tier_config(out_dir: Path, tier: str) -> dict:
             f"both search paths), or drop the mq-* formats."
         )
     data = json.loads(results_path.read_text())
+
+    # Lazy import (magicquant is a heavier optional dependency; every other
+    # magicquant touchpoint in this module imports it function-local too --
+    # see _quantize_mq_hybrid).
+    from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION, tier_scheme_version
+
+    version = tier_scheme_version(data)
+    if version < CURRENT_TIER_SCHEME_VERSION:
+        print(
+            f"Warning: {results_path} was written under tier_scheme_version="
+            f"{version} (current: {CURRENT_TIER_SCHEME_VERSION}) -- its tier "
+            f"labels follow OLDER, wider size-ratio boundaries. The "
+            f"requested tier {tier!r} config still loads correctly, but the "
+            f"resulting mq-{tier} filename may not match what {tier!r} "
+            f"means under the current scheme (e.g. an old 'Q5' can be "
+            f"Q6_K-sized). Disclose this on the model card, or re-run the "
+            f"MagicQuant search for labels matching current semantics.",
+            flush=True,
+        )
+
     tiered = data.get("tiered") or {}
     if tier not in tiered:
         raise KeyError(

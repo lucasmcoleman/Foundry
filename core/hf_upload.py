@@ -211,6 +211,52 @@ def _find_mmproj(files_to_upload: list[tuple[Path, str]]) -> Optional[str]:
     )
 
 
+def _find_legacy_tier_scheme_note(files_to_upload: list[tuple[Path, str]]) -> str:
+    """Look for a sibling MagicQuant ``search_results.json`` next to this
+    run's planned files and, if found and written under an older
+    ``tier_scheme_version`` than current, return a disclosure suffix to
+    append to Q4/Q5/Q6 quant hints in the GGUF table.
+
+    Tier labels ("Q4"/"Q5"/"Q6") are, before the 2026-07 fix, SIZE BANDS
+    that didn't line up with the scheme they're named after (a "Q5" file
+    could actually be Q6_K-sized -- see magicquant.quant.tiers' module
+    docstring). This card generator infers quant hints purely from
+    filenames, which are correct for a FRESH run under the current
+    boundaries -- but a card generated for pre-existing output from an old
+    run must not silently claim the current meaning. Returns "" (no
+    disclosure) when no search_results.json is found or it's already
+    current -- this is best-effort, not a hard requirement (a card without
+    this note is still accurate for any freshly-generated run).
+    """
+    try:
+        from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION, tier_scheme_version
+    except ImportError:
+        return ""
+
+    candidate_dirs = set()
+    for local_path, _ in files_to_upload:
+        parent = local_path.parent
+        if parent.name in ("magicquant", "rocmfpx"):
+            candidate_dirs.add(parent.parent)
+
+    for output_dir in candidate_dirs:
+        results_path = output_dir / "magicquant" / "search_results.json"
+        if not results_path.is_file():
+            continue
+        try:
+            import json as _json
+            data = _json.loads(results_path.read_text())
+        except (OSError, ValueError):
+            continue
+        version = tier_scheme_version(data)
+        if version < CURRENT_TIER_SCHEME_VERSION:
+            return (
+                f" (legacy tier boundaries, tier_scheme_version={version} -- "
+                f"verify actual size before assuming today's Q4/Q5/Q6 meaning)"
+            )
+    return ""
+
+
 def generate_model_card(
     cfg: HFUploadConfig,
     files_to_upload: list[tuple[Path, str]],
@@ -237,6 +283,10 @@ def generate_model_card(
     gguf_rows = ""
     has_gguf = False
     mtp_gguf_path: Optional[Path] = None
+    # Computed once: "" for a fresh/current run, else a disclosure suffix
+    # appended to every MagicQuant-tier-derived quant hint below (see
+    # _find_legacy_tier_scheme_note's docstring).
+    legacy_tier_note = _find_legacy_tier_scheme_note(files_to_upload)
     for local_path, repo_path in files_to_upload:
         if repo_path.endswith(".gguf"):
             has_gguf = True
@@ -262,7 +312,7 @@ def generate_model_card(
                 # would leave the cell empty for exactly this case.
                 quant_hint = (
                     f"MagicQuant Q{mq_hybrid_tier.group(1)} layout in "
-                    f"ROCmFPX types (hybrid, fork-only)"
+                    f"ROCmFPX types (hybrid, fork-only){legacy_tier_note}"
                 )
             elif "rocmfp" in name_lower:
                 for bits in ("3", "4", "6", "8"):
@@ -277,11 +327,11 @@ def generate_model_card(
                 else:
                     quant_hint = "hybrid (fork-only)"
             elif "q4" in name_lower:
-                quant_hint = "Q4 hybrid"
+                quant_hint = f"Q4 hybrid{legacy_tier_note}"
             elif "q5" in name_lower:
-                quant_hint = "Q5 hybrid"
+                quant_hint = f"Q5 hybrid{legacy_tier_note}"
             elif "q6" in name_lower:
-                quant_hint = "Q6 hybrid"
+                quant_hint = f"Q6 hybrid{legacy_tier_note}"
             elif "bf16" in name_lower:
                 quant_hint = "BF16 (unquantized)"
             elif "f16" in name_lower:

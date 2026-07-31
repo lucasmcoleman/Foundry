@@ -321,6 +321,37 @@ def test_load_mq_tier_config_missing_tier(tmp_path):
         entry._load_mq_tier_config(tmp_path, "Q4")
 
 
+def test_load_mq_tier_config_legacy_file_still_loads_but_warns(tmp_path, capsys):
+    """A search_results.json with no tier_scheme_version (pre-2026-07 fix)
+    must still load correctly -- old artifacts keep working -- but prints a
+    warning, since the resulting mq-<tier> filename bakes the tier string in
+    and could now be misleading about actual size."""
+    mq = tmp_path / "magicquant"
+    mq.mkdir()
+    (mq / "search_results.json").write_text(json.dumps({
+        "tiered": {"Q4": {"config": {"E": "BF16", "X": "MXFP4_MOE"}}}
+    }))
+    cfg = entry._load_mq_tier_config(tmp_path, "Q4")
+    assert cfg == {"E": "BF16", "X": "MXFP4_MOE"}
+    out = capsys.readouterr().out
+    assert "Warning" in out and "tier_scheme_version" in out
+
+
+def test_load_mq_tier_config_current_version_does_not_warn(tmp_path, capsys):
+    from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
+
+    mq = tmp_path / "magicquant"
+    mq.mkdir()
+    (mq / "search_results.json").write_text(json.dumps({
+        "tier_scheme_version": CURRENT_TIER_SCHEME_VERSION,
+        "tiered": {"Q4": {"config": {"E": "BF16"}}},
+    }))
+    cfg = entry._load_mq_tier_config(tmp_path, "Q4")
+    assert cfg == {"E": "BF16"}
+    out = capsys.readouterr().out
+    assert "tier_scheme_version" not in out
+
+
 # ── graceful degradation on a single bad format (defects 1b & 2) ───────────
 #
 # One untranslatable/unparseable format spec must skip with a warning and
