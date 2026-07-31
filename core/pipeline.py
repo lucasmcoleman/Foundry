@@ -148,10 +148,16 @@ class MagicQuantConfig:
     # speed_aware/speed_metric: measured-search-only final-survivor selection
     # bias (see MagicQuantOrchestrator.run_measured_search / _speed_aware_pick).
     # Within a tier, prefer the fastest near-tied measured candidate instead of
-    # the flat quality-best. Off by default (unbiased selection, historical
-    # behavior); a no-op for prediction-only search (run_full_search never
-    # measures candidates for real, so there's nothing to re-rank).
-    speed_aware: bool = False
+    # the flat quality-best. A no-op for prediction-only search (run_full_
+    # search never measures candidates for real, so there's nothing to
+    # re-rank). None (default) means "no explicit choice made here" --
+    # MagicQuantService.build_config forwards that through as absent/null,
+    # so the actual behavior is whatever MagicQuantOrchestrator.
+    # run_measured_search defaults to (True since the 2026-07 fix) rather
+    # than Foundry silently pinning it to a stale False. Set True/False here
+    # (or via --magicquant-speed-aware) to pin an explicit choice that
+    # overrides the library default either way.
+    speed_aware: Optional[bool] = None
     speed_metric: str = "bytes"  # "bytes" (deterministic size) | "bench" (measured tg)
     # speed_weight/use_bytes_tps: tps-aware SEARCH objective (both search
     # paths -- see _build_objective_weights). speed_weight reserves this much

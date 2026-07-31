@@ -241,6 +241,74 @@ def test_rocmfpx_usage_also_uses_jinja(tmp_path):
     assert "chatml" not in card
 
 
+# ── generate_model_card: legacy tier_scheme_version disclosure ──────────
+
+def test_legacy_search_results_adds_disclosure_note(tmp_path):
+    """A pre-2026-07-fix search_results.json (no tier_scheme_version) next
+    to the planned MagicQuant GGUFs must get a disclosure note on its
+    Q4/Q5/Q6 quant hints -- those labels follow the OLD, wider size-ratio
+    boundaries and can be misleading (e.g. an old "Q5" can be Q6_K-sized)."""
+    import json as _json
+    mq_dir = tmp_path / "magicquant"
+    _touch(mq_dir / "Model-Q4_K_M.gguf")
+    (mq_dir / "search_results.json").write_text(_json.dumps({
+        "tiered": {"Q4": {"config": {"E": "BF16"}}},
+    }))
+    files = [(p, p.name) for p in sorted(mq_dir.glob("*.gguf"))]
+    cfg = _cfg(repo_id="user/Model-MagicQuant-GGUF")
+    cfg.did_magicquant = True
+    card = generate_model_card(cfg, files)
+    assert "legacy tier boundaries" in card
+    assert "tier_scheme_version=1" in card
+
+
+def test_current_search_results_adds_no_disclosure_note(tmp_path):
+    from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
+    import json as _json
+
+    mq_dir = tmp_path / "magicquant"
+    _touch(mq_dir / "Model-Q4_K_M.gguf")
+    (mq_dir / "search_results.json").write_text(_json.dumps({
+        "tier_scheme_version": CURRENT_TIER_SCHEME_VERSION,
+        "tiered": {"Q4": {"config": {"E": "BF16"}}},
+    }))
+    files = [(p, p.name) for p in sorted(mq_dir.glob("*.gguf"))]
+    cfg = _cfg(repo_id="user/Model-MagicQuant-GGUF")
+    cfg.did_magicquant = True
+    card = generate_model_card(cfg, files)
+    assert "legacy tier boundaries" not in card
+
+
+def test_no_search_results_json_adds_no_disclosure_note(tmp_path):
+    """No sibling search_results.json at all (e.g. a plain GGUF-only upload,
+    or a MagicQuant run whose search_results.json was deliberately not
+    shipped) -- best-effort, must not error or fabricate a note."""
+    out = Path(_out_with(tmp_path, mq=True))
+    files = [(p, p.name) for p in sorted((out / "magicquant").glob("*.gguf"))]
+    cfg = _cfg(repo_id="user/Model-MagicQuant-GGUF")
+    cfg.did_magicquant = True
+    card = generate_model_card(cfg, files)
+    assert "legacy tier boundaries" not in card
+
+
+def test_legacy_search_results_note_on_mq_hybrid_rocmfpx_files(tmp_path):
+    """Same disclosure, but for the mq-<tier> ROCmFPX-hybrid filename branch
+    (search_results.json lives under magicquant/, GGUFs under rocmfpx/)."""
+    import json as _json
+    mq_dir = tmp_path / "magicquant"
+    mq_dir.mkdir()
+    (mq_dir / "search_results.json").write_text(_json.dumps({
+        "tiered": {"Q5": {"config": {"E": "BF16"}}},
+    }))
+    fpx_dir = tmp_path / "rocmfpx"
+    p = fpx_dir / "Model-ROCMFPX-MQ-Q5.gguf"
+    _touch(p)
+    files = [(p, p.name)]
+    card = generate_model_card(_cfg(), files, rocmfpx=True)
+    assert "MagicQuant Q5 layout in ROCmFPX types (hybrid, fork-only)" in card
+    assert "legacy tier boundaries" in card
+
+
 def test_vision_section_present_iff_mmproj(tmp_path):
     """Defect 4: a 'Vision (image input)' snippet appears exactly when an
     mmproj file is part of the upload, pairing a real text quant with the

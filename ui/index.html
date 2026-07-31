@@ -688,7 +688,7 @@ const S = {
     heretic: { n_trials: 200, n_startup_trials: 60, quantization: 'bnb_4bit', kl_divergence_scale: 1.0, orthogonalize_direction: false, row_normalization: 'none' },
     reap: { compression_ratio: 0.25, prune_method: 'reap', samples_per_category: 512, model_max_length: 2048, dataset_name: 'theblackcat102/evol-codealpaca-v1', seed: 42 },
     qat: { config_source: '', tier: 'Q4', dataset: '', lora_r: 32, lora_alpha: 64.0, epochs: 1.0, max_steps: -1, lr: 0.0002, max_seq_len: 512 },
-    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, iq_schemes: false, seed: null, use_imatrix: false, imatrix_corpus: null, enable_kl: false, kl_weight: 0.1, enable_speed_bench: false, measurement_chunks: null, stream_aware: false, head_aggressive: false, speed_aware: false, speed_metric: 'bytes', speed_weight: null, use_bytes_tps: false, calibration_source: '', write_calibration: false, allow_dequant_source: false },
+    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, iq_schemes: false, seed: null, use_imatrix: false, imatrix_corpus: null, enable_kl: false, kl_weight: 0.1, enable_speed_bench: false, measurement_chunks: null, stream_aware: false, head_aggressive: false, speed_aware: null, speed_metric: 'bytes', speed_weight: null, use_bytes_tps: false, calibration_source: '', write_calibration: false, allow_dequant_source: false },
     rocmfpx: { formats: ['rocmfp4-agent','rocmfp6-agent','rocmfp8-agent'], rocmfpx_hint: '', source_model: '', imatrix: '', allow_requantize: false },
     upload: { repo_id: '', repo_id_auto: true, private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
@@ -703,7 +703,19 @@ const LS_KEY = 'foundry_form_state';
 // New fields are handled gracefully by the merge logic — they keep their
 // code defaults when absent from saved state. Only bump when keeping the
 // old saved value would cause breakage (e.g. wrong path, renamed field).
-const LS_VERSION = 6;
+const LS_VERSION = 7;
+
+// Keys whose SAVED value must be dropped when crossing a version boundary,
+// because the default's MEANING changed and a stale value silently defeats the
+// new behavior. Dropping only these preserves everything else the user
+// configured (paths, repo ids, tier choices) instead of wiping the whole form.
+//
+// v7: magicquant.speed_aware moved from a hardcoded false to null meaning
+// "use the library default" (size-aware tier selection, on). A browser holding
+// the old literal false would keep forwarding it and disable the fix.
+const LS_MIGRATIONS = {
+  7: ['magicquant.speed_aware'],
+};
 
 /**
  * Save the current form config and enabled stages to localStorage.
@@ -723,7 +735,8 @@ function saveFormState() {
 
 /**
  * Restore form config and enabled stages from localStorage on page load.
- * Discards saved state if the schema version doesn't match (defaults changed).
+ * Applies LS_MIGRATIONS for any version gap, dropping only the saved keys
+ * whose default changed meaning; everything else is merged as before.
  */
 function restoreFormState() {
   try {
@@ -734,6 +747,19 @@ function restoreFormState() {
     // that exist in the current schema, so new fields keep their defaults
     // and removed fields are ignored. No data is lost on version mismatch —
     // we always merge what we can.
+    const savedVersion = data.version || 0;
+    if (savedVersion < LS_VERSION && data.config) {
+      // Apply every migration between the saved version and the current one.
+      for (let v = savedVersion + 1; v <= LS_VERSION; v++) {
+        for (const path of (LS_MIGRATIONS[v] || [])) {
+          const [section, key] = path.split('.');
+          if (data.config[section] && key in data.config[section]) {
+            delete data.config[section][key];
+            console.info(`[form-state] migration v${v}: dropped stale ${path}`);
+          }
+        }
+      }
+    }
     if (data.config) {
       for (const section of Object.keys(S.config)) {
         if (!data.config[section]) continue;
@@ -1443,7 +1469,7 @@ function renderMagicQuant() {
           <div class="form-group">${L('Use Bytes-based TPS','Score the search objective\'s speed term deterministically from predicted size instead of the noisier speed_multiplier path. Both search paths. Recommended whenever Search Speed Weight is set.')}<label class="toggle"><input type="checkbox" data-key="magicquant.use_bytes_tps" ${c.use_bytes_tps?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
           <div class="form-group span-2">${L('Calibration Source','Load empirically calibrated noise factors/speed multipliers from this noise_calibration.json instead of the fixed calibration_results.json path. Both search paths.')}<input class="form-input" data-key="magicquant.calibration_source" value="${c.calibration_source}" placeholder="(fixed calibration_results.json)"></div>
           ${c.measured ? `
-          <div class="form-group">${L('Speed-aware Selection','Within each tier, prefer the fastest near-tied measured candidate instead of the flat quality-best. Measured search only.')}<label class="toggle"><input type="checkbox" data-key="magicquant.speed_aware" ${c.speed_aware?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
+          <div class="form-group">${L('Size-aware Selection (on by default)','Within each tier, among candidates whose measured quality is within measurement noise of the best, prefer the SMALLER file rather than taking the flat quality-best. Left unset it uses the library default, which is ON -- that default exists because size-blind selection was shipping ~19% larger files for no measurable quality gain. Untick to force the old quality-only behaviour. Measured search only.')}<label class="toggle"><input type="checkbox" data-key="magicquant.speed_aware" ${(c.speed_aware ?? true)?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
           <div class="form-group">${L('Speed Metric','How Speed-aware Selection measures \'fastest\': bytes = deterministic size (recommended default), bench = measured tokens/sec (needs Speed Bench above).')}<select class="form-input" data-key="magicquant.speed_metric"><option value="bytes" ${c.speed_metric==='bytes'?'selected':''}>bytes (deterministic)</option><option value="bench" ${c.speed_metric==='bench'?'selected':''}>bench (measured tg)</option></select></div>
           <div class="form-group span-2">${L('Write Calibration','After a successful Measured Search, fit + write <output>/noise_calibration.json from this run\'s measurements. Best-effort -- a fitting failure never blocks a successful search.')}<label class="toggle"><input type="checkbox" data-key="magicquant.write_calibration" ${c.write_calibration?'checked':''}><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
           ` : ''}

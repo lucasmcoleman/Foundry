@@ -338,7 +338,19 @@ class MagicQuantService:
         measurement_chunks: Optional[int] = None,
         stream_aware: bool = False,
         head_aggressive: bool = False,
-        speed_aware: bool = False,
+        # speed_aware: None (default) means "no explicit Foundry choice" --
+        # the emitted config carries speed_aware=null, and
+        # core/_magicquant_entry.py's run() omits the kwarg entirely so
+        # MagicQuantOrchestrator.run_measured_search's OWN default (True as
+        # of the 2026-07 fix) actually takes effect. A caller (CLI flag or
+        # UI toggle) that explicitly passes True/False here still wins --
+        # this is only about what happens when nobody asked for anything.
+        # Previously this defaulted to a hardcoded False that was ALWAYS
+        # forwarded, silently pinning every real run to speed_aware=False
+        # regardless of what the library's own default became -- see
+        # test_entry_speed_aware_omitted_lets_library_default_apply in
+        # tests/test_magicquant_knobs.py for the regression this guards.
+        speed_aware: Optional[bool] = None,
         speed_metric: str = "bytes",
         speed_weight: Optional[float] = None,
         use_bytes_tps: bool = False,
@@ -395,6 +407,17 @@ class QATService:
     ``search_results.json``). The heavy work lives in MagicQuant's
     ``magicquant.qat.run_qat``; this service builds the JSON config that the
     importable ``core/_qat_entry.py`` consumes — one source of truth for CLI + UI.
+
+    Audited against the 2026-07 tier-semantics fix (magicquant.quant.tiers'
+    TIER_SCHEME_VERSION): ``tier`` below is passed straight through as an
+    opaque dict key into WHATEVER ``search_results.json`` ``config_path``
+    points at (``magicquant.qat.config.load_hybrid_config`` does the actual
+    ``tiered[tier]["config"]`` lookup). That lookup is self-consistent and
+    version-agnostic -- it always reads the tier under the SAME file it was
+    requested from, never assumes "Q5" means the same thing across
+    different runs/files -- so no change was needed here. The compatibility
+    read path (warns, but still loads, when ``config_path`` predates
+    ``tier_scheme_version``) lives in ``load_hybrid_config`` itself.
     """
 
     def __init__(self, pipeline_root: Path, venv_python: str) -> None:

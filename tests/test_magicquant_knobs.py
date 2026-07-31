@@ -54,7 +54,11 @@ def test_magicquant_config_new_knob_defaults():
 def test_magicquant_config_new_speed_knob_defaults():
     pl = _pipeline()
     mc = pl.MagicQuantConfig()
-    assert mc.speed_aware is False
+    # None, not False: "no explicit Foundry choice" -> the actual behavior
+    # comes from MagicQuantOrchestrator.run_measured_search's own default
+    # (see core/services.py's speed_aware docstring and
+    # test_entry_speed_aware_omitted_lets_library_default_apply below).
+    assert mc.speed_aware is None
     assert mc.speed_metric == "bytes"
     assert mc.speed_weight is None
     assert mc.use_bytes_tps is False
@@ -207,7 +211,7 @@ def test_magicquant_speed_cli_flags_wire_into_config(monkeypatch):
 
     pl.main(["--model", "org/m", "--no-export", "--no-heretic", "--no-reap"])
     mc = captured["cfg"].magicquant
-    assert mc.speed_aware is False
+    assert mc.speed_aware is None  # no explicit choice -> library default applies
     assert mc.speed_metric == "bytes"
     assert mc.speed_weight is None
     assert mc.use_bytes_tps is False
@@ -246,14 +250,15 @@ def test_magicquant_speed_metric_applies_independently_of_speed_aware_flag(monke
 
     monkeypatch.setattr(pl, "run_pipeline", _fake_run_pipeline)
 
-    # Passed alone: speed_aware stays off, but the metric is still recorded
-    # (dormant, like imatrix_corpus without use_imatrix).
+    # Passed alone: speed_aware stays unset (no explicit choice), but the
+    # metric is still recorded (dormant, like imatrix_corpus without
+    # use_imatrix).
     pl.main([
         "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
         "--magicquant-speed-metric", "bench",
     ])
     mc = captured["cfg"].magicquant
-    assert mc.speed_aware is False
+    assert mc.speed_aware is None
     assert mc.speed_metric == "bench"
 
     # Composes with --magicquant-optimize-for-speed without needing a
@@ -391,7 +396,12 @@ def test_magicquant_build_config_speed_knobs_default():
         out_abs_str="/o", generations=5, population_size=10,
         target_base_quant="IQ4_NL", tiers_json="{}", model_name="m",
     )
-    assert cfg["speed_aware"] is False
+    # None (not False): "no explicit Foundry choice" -- the JSON emitted
+    # for _magicquant_entry.py carries speed_aware=null, and entry.run()
+    # omits the kwarg entirely so MagicQuantOrchestrator.run_measured_
+    # search's own default applies instead of a stale hardcoded False (see
+    # test_entry_speed_aware_omitted_lets_library_default_apply).
+    assert cfg["speed_aware"] is None
     assert cfg["speed_metric"] == "bytes"
     assert cfg["speed_weight"] is None
     assert cfg["use_bytes_tps"] is False
@@ -439,7 +449,13 @@ class _FakeOrchestrator:
         enable_rocmfpx=False, enable_iq=False, seed=None, use_imatrix=False,
         imatrix_corpus=None, enable_kl=False, kl_weight=0.1, enable_speed_bench=False,
         measurement_chunks=None, stream_aware=False, head_aggressive=False,
-        speed_aware=False, speed_metric="bytes", speed_weight=None,
+        # speed_aware=True mirrors the REAL MagicQuantOrchestrator.
+        # run_measured_search's own default (the 2026-07 fix) -- kept
+        # signature-faithful on purpose, see
+        # test_fake_orchestrator_speed_aware_default_matches_real_library,
+        # which cross-checks this literal against the installed library so
+        # this fake can't silently drift out of sync again.
+        speed_aware=True, speed_metric="bytes", speed_weight=None,
         use_bytes_tps=False, write_calibration=False, calibration_source="",
     ):
         self.run_measured_search_kwargs = dict(
@@ -514,7 +530,12 @@ def _write_cfg(tmp_path, src_file, **overrides):
         "measurement_chunks": None,
         "stream_aware": False,
         "head_aggressive": False,
-        "speed_aware": False,
+        # None (absent choice) here matches what a genuinely default Foundry
+        # config now emits (services.py's speed_aware default changed from a
+        # hardcoded False to None -- see test_entry_speed_aware_omitted_lets_
+        # library_default_apply). Tests that want an explicit True/False
+        # still override it below.
+        "speed_aware": None,
         "speed_metric": "bytes",
         "speed_weight": None,
         "use_bytes_tps": False,
@@ -676,7 +697,15 @@ def test_entry_run_measured_search_gets_all_speed_knobs(fake_orchestrator, tmp_p
     assert kw["calibration_source"] == "calib.json"
 
 
-def test_entry_speed_knobs_default_off(fake_orchestrator, tmp_path):
+def test_entry_speed_knobs_default_off_except_speed_aware(fake_orchestrator, tmp_path):
+    """All the OTHER speed knobs stay off by default. speed_aware is the one
+    exception: a default Foundry config carries speed_aware=None (no
+    explicit choice), entry.run() omits the kwarg entirely for that case
+    (see apply_dequant_env-style handling in run()), and the resolved value
+    is therefore whatever MagicQuantOrchestrator.run_measured_search's OWN
+    default is -- True, per the 2026-07 fix -- not a hardcoded False. See
+    test_entry_speed_aware_omitted_lets_library_default_apply for the
+    focused regression."""
     src_file = tmp_path / "src.safetensors"
     src_file.write_bytes(b"x")
     cfg_path = _write_cfg(tmp_path, src_file, measured=True)
@@ -684,12 +713,91 @@ def test_entry_speed_knobs_default_off(fake_orchestrator, tmp_path):
     fake_orchestrator.run(str(cfg_path))
 
     kw = _FakeOrchestrator.instances[-1].run_measured_search_kwargs
-    assert kw["speed_aware"] is False
+    assert kw["speed_aware"] is True
     assert kw["speed_metric"] == "bytes"
     assert kw["speed_weight"] is None
     assert kw["use_bytes_tps"] is False
     assert kw["write_calibration"] is False
     assert kw["calibration_source"] == ""
+
+
+def test_entry_speed_aware_omitted_lets_library_default_apply(fake_orchestrator, tmp_path):
+    """BLOCKER regression (2026-07): a default Foundry config must result in
+    speed-aware (size-aware) selection being ACTIVE, not merely "whatever
+    value happens to get passed through".
+
+    Before this fix: MagicQuantService.build_config declared
+    ``speed_aware: bool = False`` and ALWAYS injected the key into the
+    emitted config JSON; core/_magicquant_entry.py then did
+    ``speed_aware=cfg.get("speed_aware", False)`` -- since the key was
+    always present, the ``, False`` fallback never applied, and a default
+    Foundry config permanently pinned every real run to
+    ``speed_aware=False`` no matter what MagicQuantOrchestrator's own
+    default became. Proven to fail pre-fix: reverting either
+    MagicQuantService.build_config's default back to a bare ``False``
+    (always-inject) OR core/_magicquant_entry.py's kwarg construction back
+    to ``speed_aware=cfg.get("speed_aware", False)`` makes this test's
+    ``kw["speed_aware"] is True`` assertion fail (it becomes False),
+    exactly reproducing the blocker.
+
+    This exercises the real MagicQuantService.build_config -> JSON ->
+    entry.run() path (not a hand-built cfg dict), so it also catches a
+    regression in build_config's own default, not just entry.py's read
+    side.
+    """
+    from services import MagicQuantService
+
+    src_file = tmp_path / "src.safetensors"
+    src_file.write_bytes(b"x")
+
+    svc = MagicQuantService(ROOT, "python")
+    cfg = svc.build_config(
+        llamacpp_hint="", pipeline_root_str=str(ROOT),
+        mq_source_override=str(src_file), out_abs_str=str(tmp_path / "out"),
+        generations=5, population_size=10, target_base_quant="MXFP4_MOE",
+        tiers_json=json.dumps(["Q4"]), model_name="m",
+        measured=True,
+        # speed_aware deliberately NOT passed -- this is what a genuinely
+        # default Foundry config (CLI with no --magicquant-speed-aware flag,
+        # or a UI submission where the toggle was never touched) looks like.
+    )
+    assert cfg["speed_aware"] is None  # sanity: the JSON really is unset
+
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+
+    fake_orchestrator.run(str(cfg_path))
+
+    kw = _FakeOrchestrator.instances[-1].run_measured_search_kwargs
+    assert kw["speed_aware"] is True, (
+        "a DEFAULT Foundry config must result in speed-aware (size-aware) "
+        f"selection being ACTIVE -- got speed_aware={kw['speed_aware']!r}"
+    )
+
+
+def test_fake_orchestrator_speed_aware_default_matches_real_library():
+    """Guards _FakeOrchestrator.run_measured_search's speed_aware=True
+    default (used by the tests above) against silently drifting out of sync
+    with the REAL, installed magicquant package's own default -- otherwise
+    the tests above could pass for the wrong reason (a stale fake) even
+    after a future MagicQuant change flips the real default again."""
+    import inspect
+
+    from magicquant.orchestrator import MagicQuantOrchestrator
+
+    real_default = inspect.signature(
+        MagicQuantOrchestrator.run_measured_search
+    ).parameters["speed_aware"].default
+    fake_default = inspect.signature(
+        _FakeOrchestrator.run_measured_search
+    ).parameters["speed_aware"].default
+    assert real_default is True, (
+        "MagicQuantOrchestrator.run_measured_search's own speed_aware "
+        f"default changed to {real_default!r} -- update "
+        "_FakeOrchestrator's matching default (and this assertion) "
+        "to match"
+    )
+    assert fake_default == real_default
 
 
 # ── ui/app.py: MagicQuantCfg pydantic model ───────────────────────────────────
@@ -730,7 +838,7 @@ def test_magicquantcfg_new_speed_knob_defaults():
     import app as app_module
 
     c = app_module.MagicQuantCfg()
-    assert c.speed_aware is False
+    assert c.speed_aware is None  # no explicit UI choice -> library default applies
     assert c.speed_metric == "bytes"
     assert c.speed_weight is None
     assert c.use_bytes_tps is False
