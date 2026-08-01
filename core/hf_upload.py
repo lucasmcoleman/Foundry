@@ -715,6 +715,28 @@ without ``-md``/``--spec-type draft-mtp``.""")
     wait=wait_exponential(min=2, max=30),
     retry=retry_if_exception_type(requests.exceptions.RequestException),
 )
+def _resolve_hf_token() -> Optional[str]:
+    """HF token from the env var, else the standard HF credential store.
+
+    Only HF_TOKEN was consulted, which meant an upload failed with
+    "HF_TOKEN environment variable is not set" on a machine that was
+    perfectly well authenticated -- `huggingface-cli login` writes
+    ~/.cache/huggingface/token, and every download in the same pipeline had
+    just used it happily. Failing at the upload step, after hours of search,
+    is the worst possible place to discover that.
+
+    Env var still wins so a caller can override the logged-in identity.
+    """
+    env = os.environ.get("HF_TOKEN")
+    if env:
+        return env
+    try:
+        from huggingface_hub import get_token
+    except ImportError:
+        return None
+    return get_token()
+
+
 def _create_repo_with_retry(api, **kwargs):
     """Create or verify a HuggingFace repo with automatic retry on transient failures."""
     return api.create_repo(**kwargs)
@@ -791,7 +813,7 @@ def dry_run(
 
     # 1. Validate token
     log("Dry run: validating HF credentials", "stage")
-    hf_token = token or os.environ.get("HF_TOKEN")
+    hf_token = token or _resolve_hf_token()
     if not hf_token:
         report.errors.append("HF_TOKEN environment variable is not set")
         log("HF_TOKEN not set", "error")
@@ -915,7 +937,7 @@ def upload(
         log("huggingface_hub not installed (pip install huggingface_hub)", "error")
         return False
 
-    hf_token = token or os.environ.get("HF_TOKEN")
+    hf_token = token or _resolve_hf_token()
     if not hf_token:
         log("HF_TOKEN environment variable is not set", "error")
         return False
