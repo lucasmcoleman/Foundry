@@ -113,6 +113,74 @@ def translate_scheme(scheme: str) -> str:
     return SCHEME_TO_ROCMFPX[scheme]
 
 
+def predict_rendered_tier(config: dict, bf16_gguf: str) -> tuple:
+    """Predict which tier band a MagicQuant config will land in once rendered
+    into ROCmFPX types.
+
+    Returns ``(predicted_gib, baseline_gib, predicted_tier)``.
+
+    The ROCmFPX family is sparse -- ROCMFP3/4/6/8 at 3.5/4.5/6.5/8.25 bpw,
+    with **no 5-bit type**. ``SCHEME_TO_ROCMFPX`` therefore rounds Q5_K *up*
+    to Q6_0_ROCMFPX, so a Q5 tier can render larger than the Q6 tier of the
+    same model. Measured on Qwen3.6-35B-A3B: mq-q5 came out at 27.51 GiB
+    against mq-q6's 26.94 GiB, and measured worse (PPL 7.07 vs 6.77 for
+    mq-q4), i.e. strictly dominated on every axis.
+
+    Predicting rather than measuring after the fact matters: a 35B render
+    costs several minutes of quantize time, and the resulting file is
+    unshippable.
+
+    Bits-per-weight come from the block/size facts of each fork type rather
+    than a second hand-maintained table -- see ``magicquant.quant.ggml_facts``.
+    """
+    from magicquant.gguf.reader import GGUFReader
+    from magicquant.gguf.tensor_groups import TensorGroupClassifier
+    from magicquant.quant.ggml_facts import FORK_TYPES
+    from magicquant.quant.schemes import get_scheme_by_name
+
+    def _bpw(ggml_type: str) -> float:
+        fact = FORK_TYPES.get(ggml_type)
+        if fact:
+            return fact["size"] * 8.0 / fact["block"]
+        # Non-fork types keep their registry bpw (BF16/F32 groups pass through).
+        for name, mapped in SCHEME_TO_ROCMFPX.items():
+            if mapped == ggml_type:
+                scheme = get_scheme_by_name(name)
+                if scheme:
+                    return float(scheme.bits_per_weight)
+        return 16.0
+
+    reader = GGUFReader(bf16_gguf)
+    reader.open()
+    classifier = TensorGroupClassifier()
+    per_group: dict = {}
+    try:
+        for name in reader.get_tensor_names():
+            group = classifier.classify_tensor(name)
+            info = reader.get_tensor_info(name)
+            count = 1
+            for dim in info["shape"]:
+                count *= dim
+            per_group[group] = per_group.get(group, 0) + count
+    finally:
+        reader.close()
+
+    total = sum(per_group.values())
+    rendered_bits = 0.0
+    for group, count in per_group.items():
+        scheme = config.get(group)
+        if scheme is None:                     # untouched (norms etc.)
+            rendered_bits += count * 32.0
+            continue
+        rendered_bits += count * _bpw(translate_scheme(scheme))
+
+    predicted_gib = rendered_bits / 8.0 / 2 ** 30
+    baseline_gib = total * 16.0 / 8.0 / 2 ** 30
+
+    from magicquant.quant.tiers import classify_tier
+    return predicted_gib, baseline_gib, classify_tier(predicted_gib, baseline_gib)
+
+
 def pick_base_type(config: dict) -> str:
     """Pick the positional base ggml type for the quantize call.
 
@@ -757,6 +825,34 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
 
     try:
         config = _load_mq_tier_config(out_dir, tier)
+
+        # A tier name is a SIZE BAND. If rendering this config into the sparse
+        # ROCmFPX family lands it in a different band, the artifact would be
+        # mislabelled no matter how it is named -- refuse before spending the
+        # quantize. Checked by prediction, not by a hardcoded "q5 is bad" rule,
+        # so it also catches whatever the next sparse family or new scheme does.
+        try:
+            pred_gib, base_gib, pred_tier = predict_rendered_tier(config, bf16_gguf)
+            if pred_tier != tier:
+                print(
+                    f"Refusing {spec}: rendering MagicQuant's {tier} config into "
+                    f"ROCmFPX types predicts {pred_gib:.2f} GiB against a "
+                    f"{base_gib:.2f} GiB BF16 baseline (ratio "
+                    f"{pred_gib / base_gib:.4f}), which is the {pred_tier} band, "
+                    f"not {tier}.",
+                    flush=True,
+                )
+                print(
+                    f"  The ROCmFPX family has no type between "
+                    f"{4.5:.1f} and {6.5:.1f} bpw, so schemes round to the "
+                    f"nearest available and a tier can render outside its own "
+                    f"band. Skipping rather than shipping a mislabelled file.",
+                    flush=True,
+                )
+                return None
+        except Exception as exc:  # noqa: BLE001 -- advisory, never blocks a valid build
+            print(f"  (tier-band prediction unavailable: {exc})", flush=True)
+
         group_patterns = TensorGroupClassifier.GROUP_PATTERNS
         lines = build_tensor_type_lines(config, group_patterns)
         base_type = pick_base_type(config)
