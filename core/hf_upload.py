@@ -211,10 +211,8 @@ def _pick_example_gguf(files_to_upload: list[tuple[Path, str]]) -> Optional[str]
     filenames make one identifiable, else the first non-mmproj GGUF in
     upload order. Returns None if no non-mmproj GGUF was planned.
     """
-    gguf_names = [
-        repo_path for _, repo_path in files_to_upload
-        if repo_path.lower().endswith(".gguf") and "mmproj" not in repo_path.lower()
-    ]
+    gguf_names = [repo_path for _, repo_path in files_to_upload
+                  if _is_tier_gguf(repo_path)]
     if not gguf_names:
         return None
     for name in gguf_names:
@@ -278,12 +276,97 @@ def _find_legacy_tier_scheme_note(files_to_upload: list[tuple[Path, str]]) -> st
     return ""
 
 
+def _is_tier_gguf(name: str) -> bool:
+    """A published quant file whose NAME claims a tier -- mmproj excluded.
+
+    Single definition, because two different ones disagreed: the "don't claim
+    a tier is missing" pre-check filtered mmproj and required .gguf, while the
+    card audit re-derived the same question over every repo file including
+    README.md, so a stray tier-named JSON could make the audit assert a tier
+    "IS in the repo" when no GGUF for it existed.
+    """
+    low = name.lower()
+    return low.endswith(".gguf") and "mmproj" not in low
+
+
+def _tier_of(name: str) -> Optional[str]:
+    """The Qn tier a published filename claims, or None."""
+    m = re.search(r"(Q\d)", name)
+    return m.group(1) if m else None
+
+
+def _repo_tiers_present(names) -> set[str]:
+    """Tiers actually backed by a file, for "never claim a tier is absent"."""
+    return {t for n in names if _is_tier_gguf(n) for t in [_tier_of(n)] if t}
+
+
+def _resolve_size_bytes(
+    local_path: Path, repo_path: str, known_sizes: Optional[dict[str, int]]
+) -> Optional[int]:
+    """Resolve a file's size for the model card, preferring an authoritative
+    known_sizes entry over stat()ing the local path.
+
+    Regenerating a card after the cleanup stage deletes local GGUFs meant
+    stat()ing paths that no longer existed, which silently dropped every
+    file-table row but mmproj -- the repo still held the real GGUFs, but
+    files_to_upload's local Path was gone so the generator couldn't see them.
+    known_sizes (keyed by repo_path, the same string used as the table's file
+    name) lets a caller source sizes from the repo's own metadata instead
+    (e.g. HfApi().repo_info(..., files_metadata=True).siblings), so a row
+    survives even when nothing local backs it. Falls back to stat() when no
+    known_sizes entry exists, so the common in-run case is unchanged. Returns
+    None only when there is truly no size available anywhere -- callers skip
+    the row rather than fabricate a number.
+    """
+    if known_sizes and repo_path in known_sizes:
+        return known_sizes[repo_path]
+    try:
+        return local_path.stat().st_size
+    except OSError:
+        return None
+
+
+def card_rows_from_repo(
+    repo_files: "list", local_dir: Optional[Path] = None
+) -> tuple[list[tuple[Path, str]], dict[str, int]]:
+    """Build ``(files_to_upload, known_sizes)`` for a card sourced from the REPO.
+
+    ``generate_model_card``'s table iterates ``files_to_upload``, and the only
+    producer of that list -- ``discover_upload_files`` -- builds it by globbing
+    the local output dir. So after the cleanup stage deletes local GGUFs there
+    is no ROW for a size to attach to, and the table collapses to whatever
+    survived (in the incident: just mmproj). Supplying sizes alone cannot fix
+    that; the ROWS have to come from the repo too.
+
+    Pass HfApi().repo_info(repo_id, files_metadata=True).siblings (anything
+    with ``.rfilename`` and ``.size``, or plain ``(name, size)`` pairs). The
+    local paths returned point into ``local_dir`` when given, so a file that
+    IS still on disk keeps working for the parts of card generation that read
+    it (MTP detection, the legacy-tier-scheme probe); ones that are gone still
+    get a row, from the repo's own recorded size.
+    """
+    rows: list[tuple[Path, str]] = []
+    sizes: dict[str, int] = {}
+    base = Path(local_dir) if local_dir else Path(".")
+    for f in repo_files:
+        name = getattr(f, "rfilename", None)
+        size = getattr(f, "size", None)
+        if name is None:
+            name, size = f
+        rows.append((base / name, name))
+        if size is not None:
+            sizes[name] = int(size)
+    return rows, sizes
+
+
 def generate_model_card(
     cfg: HFUploadConfig,
     files_to_upload: list[tuple[Path, str]],
     dataset_repo_id: str = "",
     rocmfpx: bool = False,
     sibling_repo_id: str = "",
+    known_sizes: Optional[dict[str, int]] = None,
+    log: LogFn = _default_log,
 ) -> str:
     """Generate a complete model card with YAML front matter.
 
@@ -294,6 +377,13 @@ def generate_model_card(
     "does not load on stock llama.cpp" banner, ROCm tags, fork usage).
     ``sibling_repo_id`` cross-links the other quant family's repo when the
     upload was split into MagicQuant + ROCmFPX siblings.
+    ``known_sizes`` (optional, keyed by repo_path) supplies authoritative
+    sizes for entries whose local file may not exist -- see
+    ``_resolve_size_bytes`` and ``card_rows_from_repo``. Entries with neither
+    a live local file nor a known_sizes hit are skipped rather than crashing
+    or fabricating a size, and every such skip is logged: a card whose file
+    table silently shrank to just mmproj is what made that bug take a day to
+    notice.
     """
     repo_name = cfg.repo_id.split("/")[-1] if "/" in cfg.repo_id else cfg.repo_id
     base_model = cfg.base_model or "unknown"
@@ -317,7 +407,17 @@ def generate_model_card(
                         mtp_gguf_path = local_path
                 except Exception:
                     pass  # unreadable/partial GGUF — card just omits the MTP section
-            size_gb = local_path.stat().st_size / 1e9
+            size_bytes = _resolve_size_bytes(local_path, repo_path, known_sizes)
+            if size_bytes is None:
+                # No local file and no known_sizes entry. Dropping the row
+                # SILENTLY is what reduced a regenerated card's file table to
+                # just mmproj after cleanup deleted the GGUFs, so say it.
+                log(f"  Card: no size for '{repo_path}' (no local file at "
+                    f"{local_path}, no known_sizes entry) -- omitting its row. "
+                    f"Pass known_sizes (see card_rows_from_repo) to keep it.",
+                    "warn")
+                continue
+            size_gb = size_bytes / 1e9
             name = repo_path
             # Infer quant tier from filename
             quant_hint = ""
@@ -365,7 +465,12 @@ def generate_model_card(
     other_rows = ""
     for local_path, repo_path in files_to_upload:
         if not repo_path.endswith(".gguf"):
-            size_mb = local_path.stat().st_size / 1e6
+            size_bytes = _resolve_size_bytes(local_path, repo_path, known_sizes)
+            if size_bytes is None:
+                log(f"  Card: no size for '{repo_path}' -- omitting its row.",
+                    "warn")
+                continue
+            size_mb = size_bytes / 1e6
             other_rows += f"| {repo_path} | {size_mb:.0f} MB |\n"
 
     # Build a dynamic description based on which pipeline stages ran
@@ -556,9 +661,18 @@ the lowest measured perplexity loss -- which is the point of the search.""")
             if d.get("gib") and d.get("loss") is not None:
                 detail = f" It measured {d['gib']:.2f} GiB at {d['loss']:+.4f} loss"
                 if d.get("beaten_by"):
+                    # .get, not [...]: the ROCmFPX family compares on absolute
+                    # PPL and puts "ppl" here where MagicQuant puts "loss".
+                    # Indexing "loss" unconditionally would KeyError midway
+                    # through card generation the first time a ROCmFPX drop
+                    # entry carried a measured loss.
                     b = d["beaten_by"]
+                    metric = b.get("loss")
+                    shown = (f"{metric:+.4f}" if metric is not None
+                             else f"PPL {b['ppl']:.4f}" if b.get("ppl") is not None
+                             else "an unrecorded measurement")
                     detail += (f", against {b['tier']} at {b['gib']:.2f} GiB and "
-                               f"{b['loss']:+.4f}")
+                               f"{shown}")
                 detail += "."
             rows.append(f"- **{tier} was not published.** {why}{detail}")
         dropped_names = ", ".join(str(d.get("tier", "?")) for d in cfg.dropped_tiers)
@@ -566,30 +680,44 @@ the lowest measured perplexity loss -- which is the point of the search.""")
         # single dominance-shaped blurb ("a smaller tier already beats it")
         # was flatly untrue on a ROCmFPX card where the tier was dropped for
         # lack of a speed advantage, contradicting the bullet above it.
-        rules = {d.get("rule", "dominance") for d in cfg.dropped_tiers}
-        if rules == {"speed"}:
-            rationale = (
+        # Falling back to the dominance blurb for anything unrecognised is how
+        # a tier dropped for an unparseable perplexity got explained with "a
+        # smaller tier already beats it" -- false, and contradicting its own
+        # bullet. An unknown or mixed rule set gets a rationale that asserts
+        # only what is true in every case: which check failed is in the
+        # per-tier reason above.
+        rationales = {
+            "speed": (
                 "This is deliberate. ROCmFPX types exist to trade a little "
                 "quality for throughput on AMD hardware, so a ROCmFPX tier is "
                 "only worth publishing when it is measurably **faster** than "
                 "the equivalent MagicQuant tier. When it isn't, it would be "
                 "strictly worse: same size, lower quality, no speed."
-            )
-        elif rules == {"band"}:
-            rationale = (
+            ),
+            "band": (
                 "This is deliberate. A tier name here is a **size band**, and "
                 "a file that lands outside the band its name claims is "
                 "mislabelled -- so it is withheld rather than shipped under "
                 "the wrong name."
-            )
-        else:
-            rationale = (
+            ),
+            "dominance": (
                 "This is deliberate. Each tier is measured against the others "
                 "on **size and quality together**, and a tier is dropped when "
                 "another *smaller* tier in this same repo already matches or "
                 "beats it. Shipping it anyway would mean offering a bigger "
                 "download for no measurable gain."
-            )
+            ),
+        }
+        rules = {d.get("rule") or "unspecified" for d in cfg.dropped_tiers}
+        rationale = rationales.get(
+            next(iter(rules)) if len(rules) == 1 else "",
+            "This is deliberate. Every tier clears three checks before "
+            "release: it lands in the size band its name claims, it is not "
+            "beaten on quality by a smaller tier in this same repo, and -- "
+            "for ROCmFPX -- it is measurably faster than its MagicQuant "
+            "equivalent. The note on each file above says which of those it "
+            "did not clear.",
+        )
         body_sections.append(
             "## Why a tier is missing\n\n"
             + "\n".join(rows)
@@ -1178,19 +1306,15 @@ def upload(
         # an earlier run's file can still be sitting there (the uploader adds,
         # it does not reconcile), and a card contradicting its own file list
         # is worse than no note at all.
-        present = {
-            m.group(1)
-            for _, rp in files_to_upload
-            if rp.lower().endswith(".gguf") and "mmproj" not in rp.lower()
-            for m in [re.search(r"(Q\d)", rp)] if m
-        }
+        # Same tier-matching rule the post-push audit uses (_repo_tiers_present),
+        # so the check that suppresses a claim and the check that flags an
+        # unsuppressed one can never disagree about what counts as a file.
+        repo_files_now: list[str] = []
+        present = _repo_tiers_present(rp for _, rp in files_to_upload)
         try:
             from huggingface_hub import list_repo_files
-            present |= {
-                m.group(1) for f in list_repo_files(repo_id, token=hf_token)
-                if f.lower().endswith(".gguf") and "mmproj" not in f.lower()
-                for m in [re.search(r"(Q\d)", f)] if m
-            }
+            repo_files_now = list(list_repo_files(repo_id, token=hf_token))
+            present |= _repo_tiers_present(repo_files_now)
         except Exception:
             pass    # repo may not exist yet; the local set is enough
         suppressed = [d for d in fam_dropped if d.get("tier") in present]
@@ -1214,8 +1338,7 @@ def upload(
                 for s in HfApi().repo_info(repo_id, files_metadata=True,
                                            token=hf_token).siblings:
                     n = s.rfilename
-                    if (n.lower().endswith(".gguf")
-                            and "mmproj" not in n.lower() and n not in mine):
+                    if _is_tier_gguf(n) and n not in mine:
                         carried.append({"name": n,
                                         "gib": (s.size or 0) / 2 ** 30})
             except Exception:
@@ -1234,7 +1357,23 @@ def upload(
             dataset_repo_id=dataset_repo_id,
             rocmfpx=(family == "rocmfpx"),
             sibling_repo_id=sibling_repo_id,
+            log=log,
         )
+
+        # Audit BEFORE the card goes live, against what the repo holds now
+        # plus what this run is about to add. Auditing only after the push
+        # meant the contradicting card was already public by the time the
+        # warning printed, and the repo listing needed for it was already
+        # fetched above -- so there was nothing to gain by waiting.
+        try:
+            audit_card_against_repo(
+                card_content,
+                sorted(set(repo_files_now) | {rp for _, rp in files_to_upload}),
+                log=log, repo_id=repo_id,
+            )
+        except Exception as e:
+            log(f"  Pre-push card audit skipped: {e}", "warn")
+
         try:
             card = ModelCard(card_content)
             card.push_to_hub(repo_id, token=hf_token)
@@ -1265,7 +1404,120 @@ def upload(
 
         log(f"All files uploaded to https://huggingface.co/{repo_id}", "success")
 
+        # Post-upload self-audit: verify the card we just pushed doesn't
+        # contradict what the repo actually holds now that the upload is
+        # done. Detector only -- an upload that succeeded must not be
+        # reported as failed, so failures here are logged and swallowed.
+        try:
+            from huggingface_hub import list_repo_files
+            final_files = list_repo_files(repo_id, token=hf_token)
+            audit_card_against_repo(card_content, final_files, log=log, repo_id=repo_id)
+        except Exception as e:
+            log(f"  Card audit skipped (could not list repo files): {e}", "warn")
+
     return True
+
+
+# ── Post-upload card audit ───────────────────────────────────────────────────
+
+def audit_card_against_repo(
+    card_content: str,
+    repo_files: list[str],
+    log: LogFn = _default_log,
+    repo_id: str = "",
+) -> list[str]:
+    """Verify a just-pushed model card doesn't contradict the repo it describes.
+
+    Runs against the actual repo contents, not a log -- the previous
+    find_refusals() scraped log text with a regex, which broke the moment
+    logs were rotated, cleaned up, or reworded. This checks real artifacts.
+    Never raises and never fails the upload; it is purely a detector so this
+    class of bug (three of which reached public cards on 2026-08-0x) is
+    caught the moment it recurs instead of days later:
+      1. dropped_tiers computed for the wrong sibling repo -> a card claims
+         "<TIER> was not published" while a file for that tier is right there.
+      2. the uploader adds files but never reconciles -> an older file for a
+         tier survives a later run whose card still calls the tier missing.
+      3. a card regenerated after local GGUFs were cleaned up -> the file
+         table silently drops every row but mmproj.
+
+    Returns the list of warning strings (also emitted via ``log``) so callers
+    and tests can inspect findings without re-parsing logs.
+    """
+    warnings: list[str] = []
+    where = f" in {repo_id}" if repo_id else ""
+
+    # 1. Every .gguf in the repo must be ACCOUNTED FOR somewhere in the card
+    #    -- a table row, or a named entry under "Files from an earlier build".
+    #    Requiring a table row specifically was wrong: carried-over files are
+    #    deliberately disclosed in prose, not the table, so a card handling
+    #    the 23 GiB Q6 exactly right still got flagged, and that noise looked
+    #    identical to the one signal that matters (a table that collapsed
+    #    after cleanup deleted the local GGUFs).
+    table_names = set(re.findall(r"\[([^\]]+\.gguf)\]\(\./", card_content))
+    prose_names = set(re.findall(r"`([^`]+\.gguf)`", card_content))
+    accounted = table_names | prose_names
+    for f in repo_files:
+        if f.lower().endswith(".gguf") and f not in accounted:
+            warnings.append(
+                f"'{f}' is in the repo{where} but the card never mentions it "
+                f"-- no table row and no carried-over entry"
+            )
+
+    # 2. No claim that a tier is absent may be contradicted by a file for that
+    #    tier actually sitting in the repo. TWO claim shapes reach a page:
+    #    dropped tiers ("**Q5 was not published.**") and refused ones
+    #    ("- **Q5** -- ..." under "Tiers this build does not produce", which
+    #    goes further and promises the file "will not appear in a later build
+    #    either"). The second was unchecked, so the strongest contradiction in
+    #    the set was the one nothing looked for.
+    claimed_absent = [
+        (t, "was not published")
+        for t in re.findall(r"\*\*(.+?) was not published\.\*\*", card_content)
+    ]
+    refused_section = card_content.split(
+        "## Tiers this build does not produce", 1)
+    if len(refused_section) > 1:
+        body = refused_section[1].split("\n## ", 1)[0]
+        claimed_absent += [
+            (t, "is not produced by this build")
+            for t in re.findall(r"^- \*\*(.+?)\*\* --", body, re.M)
+        ]
+    #    Matched only against files that could actually BE that tier: bounded
+    #    (so "Q4" doesn't hit "Q40") and .gguf-only via _is_tier_gguf, because
+    #    a tier-named imatrix or search-results artifact is not a published
+    #    quant and must not suppress a true claim.
+    for tier, phrasing in claimed_absent:
+        boundary = re.compile(
+            rf"(?<![A-Za-z0-9]){re.escape(tier)}(?![A-Za-z0-9])", re.IGNORECASE
+        )
+        hit = next((f for f in repo_files
+                    if _is_tier_gguf(f) and boundary.search(f)), None)
+        if hit:
+            warnings.append(
+                f"card claims '{tier}' {phrasing}{where}, but "
+                f"'{hit}' matches that tier and IS in the repo"
+            )
+
+    # 3. Every "Files from an earlier build" entry must actually exist --
+    #    that section names files NOT in this run's own upload, so nothing
+    #    else in the pipeline guarantees they're real.
+    parts = card_content.split("## Files from an earlier build", 1)
+    if len(parts) > 1:
+        section = parts[1].split("\n## ", 1)[0]  # stop at the next heading
+        for name in re.findall(r"`([^`]+)`", section):
+            if name not in repo_files:
+                warnings.append(
+                    f"card lists '{name}' as carried over from an earlier "
+                    f"build{where}, but it is not in the repo"
+                )
+
+    for w in warnings:
+        log(f"  CARD AUDIT: {w}", "warn")
+    if not warnings:
+        log(f"  Card audit passed -- no mismatches found{where}", "info")
+
+    return warnings
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
