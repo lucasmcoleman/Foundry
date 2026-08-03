@@ -87,6 +87,12 @@ class HFUploadConfig:
     # card that describes only the latest.
     carried_over: list = field(default_factory=list)
 
+    # Tiers the pipeline REFUSED to build, as [{"tier", "reason", "family"}].
+    # Distinct from dropped_tiers (built, then rejected on measurement): a
+    # refusal means no file was produced at all, so a repo still holding an
+    # older one for that tier would otherwise imply a fresh build is pending.
+    refused_tiers: list = field(default_factory=list)
+
     # Training details (for the model card)
     lora_r: int = 32
     lora_alpha: int = 64
@@ -556,18 +562,60 @@ the lowest measured perplexity loss -- which is the point of the search.""")
                 detail += "."
             rows.append(f"- **{tier} was not published.** {why}{detail}")
         dropped_names = ", ".join(str(d.get("tier", "?")) for d in cfg.dropped_tiers)
+        # The closing paragraph must match the RULE that actually fired. A
+        # single dominance-shaped blurb ("a smaller tier already beats it")
+        # was flatly untrue on a ROCmFPX card where the tier was dropped for
+        # lack of a speed advantage, contradicting the bullet above it.
+        rules = {d.get("rule", "dominance") for d in cfg.dropped_tiers}
+        if rules == {"speed"}:
+            rationale = (
+                "This is deliberate. ROCmFPX types exist to trade a little "
+                "quality for throughput on AMD hardware, so a ROCmFPX tier is "
+                "only worth publishing when it is measurably **faster** than "
+                "the equivalent MagicQuant tier. When it isn't, it would be "
+                "strictly worse: same size, lower quality, no speed."
+            )
+        elif rules == {"band"}:
+            rationale = (
+                "This is deliberate. A tier name here is a **size band**, and "
+                "a file that lands outside the band its name claims is "
+                "mislabelled -- so it is withheld rather than shipped under "
+                "the wrong name."
+            )
+        else:
+            rationale = (
+                "This is deliberate. Each tier is measured against the others "
+                "on **size and quality together**, and a tier is dropped when "
+                "another *smaller* tier in this same repo already matches or "
+                "beats it. Shipping it anyway would mean offering a bigger "
+                "download for no measurable gain."
+            )
         body_sections.append(
             "## Why a tier is missing\n\n"
             + "\n".join(rows)
-            + f"\n\nThis is deliberate, and the {dropped_names} file is not "
-            "missing by accident or broken. Each tier is measured against the "
-            "others on **size and perplexity together**, and a tier is dropped "
-            "when another *smaller* tier in this same repo already matches or "
-            "beats it on quality. Shipping it anyway would mean offering a "
-            "bigger download for no measurable gain.\n\n"
+            + f"\n\n{rationale} The {dropped_names} file is not missing by "
+            "accident, and nothing here is broken.\n\n"
             "If you specifically want that size point, open an issue in the "
             "Community tab and I'll build it -- the search results are kept, "
             "so it's a rebuild rather than a re-search."
+        )
+
+    # Tiers the pipeline REFUSED to build at all (distinct from built-then-
+    # rejected above). Without this, a repo carrying an older file for that
+    # tier reads as though a fresh one is simply pending.
+    if getattr(cfg, "refused_tiers", None):
+        rows = [f"- **{r.get('tier', '?')}** -- {r.get('reason', '')}"
+                for r in cfg.refused_tiers]
+        body_sections.append(
+            "## Tiers this build does not produce\n\n"
+            + "\n".join(rows)
+            + "\n\nThese were not built at all. This is a property of how the "
+            "schemes round into the ROCmFPX type ladder for this particular "
+            "model, not a temporary gap, so a file for them will not appear "
+            "in a later build either."
+            + ("  Any file for them currently in this repo therefore comes "
+               "from an earlier run -- see below."
+               if getattr(cfg, "carried_over", None) else "")
         )
 
     # Files that predate this run. The uploader adds and never reconciles, so
@@ -1176,8 +1224,10 @@ def upload(
             log(f"  carried over from an earlier run: {c['name']} "
                 f"({c['gib']:.2f} GiB)", "warn")
 
+        fam_refused = [r for r in (getattr(cfg, "refused_tiers", None) or [])
+                       if r.get("family", family) == family]
         card_cfg = replace(cfg, repo_id=repo_id, dropped_tiers=fam_dropped,
-                           carried_over=carried)
+                           carried_over=carried, refused_tiers=fam_refused)
         card_content = generate_model_card(
             card_cfg,
             files_to_upload,

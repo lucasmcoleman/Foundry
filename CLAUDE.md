@@ -84,6 +84,13 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
 - **BitsAndBytes 0.49.2 works on ROCm** — GPU quantization kernels are functional (0.011s/tensor).
 - **BnB requires blocksize=128** on AMD (not the NVIDIA default of 64).
 - **LM Studio models consume GPU memory from the same pool** — unload them before training.
+- **GPU offload does NOT speed up perplexity measurement.** Measured twice: MoE
+  (same file, controlled) CPU 3.81 s/pass vs GPU 3.90; dense 27B baseline+KL
+  pass CPU 1061 s vs `-ngl 999` 1097 s. Unified memory means both engines read
+  the same DRAM at the same bandwidth, and the sweep is bandwidth-bound, so
+  offload changes which engine waits, not how long. **Never interrupt a running
+  measurement to "enable the GPU"** — the upside is zero and the cost is hours.
+  `MAGICQUANT_NGL` is only worth setting for reasons other than throughput.
 
 ## Architecture
 
