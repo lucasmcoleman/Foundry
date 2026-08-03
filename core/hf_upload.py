@@ -1081,7 +1081,40 @@ def upload(
         sibling_repo_id = ""
         if len(repo_plan) > 1:
             sibling_repo_id = next(r for r, _ in repo_plan if r != repo_id)
-        card_cfg = replace(cfg, repo_id=repo_id)
+        # dropped_tiers covers the WHOLE run, but a card is per sibling repo.
+        # Unpartitioned, the MagicQuant card claimed "Q5 was not published"
+        # using the ROCmFPX Q5's rejection reason -- on a repo where Q5 is
+        # published. Keep only this family's entries.
+        fam_dropped = [
+            d for d in (getattr(cfg, "dropped_tiers", None) or [])
+            if d.get("family", family) == family
+        ]
+        # And never claim a tier is absent when the repo actually has one:
+        # an earlier run's file can still be sitting there (the uploader adds,
+        # it does not reconcile), and a card contradicting its own file list
+        # is worse than no note at all.
+        present = {
+            m.group(1)
+            for _, rp in files_to_upload
+            if rp.lower().endswith(".gguf") and "mmproj" not in rp.lower()
+            for m in [re.search(r"(Q\d)", rp)] if m
+        }
+        try:
+            from huggingface_hub import list_repo_files
+            present |= {
+                m.group(1) for f in list_repo_files(repo_id, token=hf_token)
+                if f.lower().endswith(".gguf") and "mmproj" not in f.lower()
+                for m in [re.search(r"(Q\d)", f)] if m
+            }
+        except Exception:
+            pass    # repo may not exist yet; the local set is enough
+        suppressed = [d for d in fam_dropped if d.get("tier") in present]
+        for d in suppressed:
+            log(f"  NOT claiming {d.get('tier')} is missing -- a file for it "
+                f"is present in {repo_id} (likely from an earlier run)", "warn")
+        fam_dropped = [d for d in fam_dropped if d.get("tier") not in present]
+
+        card_cfg = replace(cfg, repo_id=repo_id, dropped_tiers=fam_dropped)
         card_content = generate_model_card(
             card_cfg,
             files_to_upload,
