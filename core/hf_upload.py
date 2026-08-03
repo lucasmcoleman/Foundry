@@ -438,6 +438,9 @@ def generate_model_card(
     # Measured quality per tier. Absent for prediction-only runs, in which case
     # the column is dropped entirely rather than shown empty or guessed at.
     measured_losses, measured_baseline_ppl = _find_measured_losses(files_to_upload)
+    # tier -> GiB, collected as rows render, so the recommendation below is
+    # sized from the same files the table lists rather than a second lookup.
+    gguf_sizes_gib: dict[str, float] = {}
     for local_path, repo_path in files_to_upload:
         if repo_path.endswith(".gguf"):
             has_gguf = True
@@ -514,6 +517,8 @@ def generate_model_card(
                 }
                 loss = None if name in carried_names else (
                     measured_losses.get(m.group(1)) if m else None)
+                if m and name not in carried_names:
+                    gguf_sizes_gib[m.group(1)] = size_bytes / 2 ** 30
                 if name in carried_names:
                     ppl_cell = " earlier build, not measured here |"
                 if loss is not None:
@@ -624,6 +629,18 @@ tags:
     # estimates would read as measurement.
     ppl_header = " Perplexity vs BF16 |" if measured_losses else ""
     ppl_sep = "--------------------|" if measured_losses else ""
+    # Which tier most people should take. Derived from the same measurements
+    # as the table, so it can never contradict the numbers printed above it.
+    recommended = None
+    if measured_losses and gguf_sizes_gib:
+        try:
+            from publish_criteria import recommend_tier
+        except ImportError:
+            from core.publish_criteria import recommend_tier
+        recommended = recommend_tier([
+            {"tier": t, "loss": loss, "gib": gguf_sizes_gib.get(t)}
+            for t, loss in measured_losses.items() if gguf_sizes_gib.get(t)
+        ])
     ppl_note = ""
     if measured_losses:
         ppl_note = (
@@ -634,6 +651,11 @@ tags:
             "These are the same measurements the tier selection is based on, so "
             "a tier that shipped is one that earned its size.\n"
         )
+        if recommended:
+            ppl_note += (
+                f"\n**Recommended: {recommended['tier']}"
+                f" ({recommended['gib']:.2f} GiB).** {recommended['reason']}\n"
+            )
     if has_gguf:
         files_section += f"""
 ## GGUF Files

@@ -416,3 +416,53 @@ def test_a_band_drop_entry_carries_the_size_that_identifies_its_file():
         BASELINE_GIB)
     assert [d["gib"] for d in result["drop"]] == [Q6_GIB]
     assert result["drop"][0]["rule"] == "band"
+
+
+# ── recommended tier ─────────────────────────────────────────────────────────
+#
+# The ladder alone under-serves a reader: FableFusion's Q5->Q6 step costs 18%
+# more bytes for 0.018 percentage points, below what the measurement resolves,
+# and most people will not derive that from three numbers in a table.
+
+def test_recommends_smallest_tier_statistically_tied_with_the_best():
+    """FableFusion's real numbers: Q6 measures best, but Q5 ties it."""
+    from core.publish_criteria import recommend_tier
+    r = recommend_tier([
+        {"tier": "Q4", "gib": 14.65, "loss": 0.016265},
+        {"tier": "Q5", "gib": 17.68, "loss": 0.002600},
+        {"tier": "Q6", "gib": 20.89, "loss": 0.002415},
+    ])
+    assert r["tier"] == "Q5", "Q6 is only 0.000185 better -- below the floor"
+    assert "18% larger" in r["reason"]
+    assert "below what this measurement can resolve" in r["reason"]
+
+
+def test_recommends_the_best_when_the_gap_is_real():
+    """ThinkingCap's real numbers: Q4->Q5 is a genuine 1.75pp, not noise."""
+    from core.publish_criteria import recommend_tier
+    r = recommend_tier([
+        {"tier": "Q4", "gib": 16.68, "loss": 0.018392},
+        {"tier": "Q5", "gib": 18.78, "loss": 0.000932},
+    ])
+    assert r["tier"] == "Q5"
+    assert "real" in r["reason"] and "1.75" in r["reason"]
+
+
+def test_no_recommendation_without_at_least_two_measured_tiers():
+    from core.publish_criteria import recommend_tier
+    assert recommend_tier([{"tier": "Q5", "gib": 17.68, "loss": 0.0026}]) is None
+    assert recommend_tier([
+        {"tier": "Q4", "gib": 14.65, "loss": None},
+        {"tier": "Q5", "gib": 17.68, "loss": 0.0026},
+    ]) is None
+
+
+def test_recommendation_never_picks_a_larger_tier_over_a_tied_smaller_one():
+    """Guards the direction: ties must resolve toward the smaller download."""
+    from core.publish_criteria import recommend_tier
+    r = recommend_tier([
+        {"tier": "Q4", "gib": 10.0, "loss": 0.0021},
+        {"tier": "Q5", "gib": 15.0, "loss": 0.0020},
+        {"tier": "Q6", "gib": 20.0, "loss": 0.0019},
+    ])
+    assert r["tier"] == "Q4", "all three within the floor -> smallest wins"
