@@ -27,6 +27,7 @@ _HF_CONFIG_KEYS = (
 # in-flight run.
 _HF_OPTIONAL_KEYS = (
     "dropped_tiers",
+    "carried_over",
 )
 
 
