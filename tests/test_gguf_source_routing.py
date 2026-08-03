@@ -14,6 +14,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
+# These three helpers are themselves torch-free, but fast_export imports
+# torch at module level (DEVICE, type annotations), so importing them needs
+# it. Guarding here rather than restructuring a module used for 40 GB
+# streaming merges; the cost is that this pure-path routing logic is not
+# covered in CI, only locally.
+pytest.importorskip("torch")
+
 from fast_export import detect_gguf_source, pick_best_gguf, resolve_gguf_source
 
 

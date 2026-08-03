@@ -2,6 +2,13 @@ name: CI
 
 # Offline, CPU-only checks. GPU/slow tests are never run here (deselected by
 # marker AND by --ignore of the integration module).
+#
+# The heavy ML stack (torch/transformers/peft/trl/datasets/bitsandbytes) is
+# deliberately NOT installed. Tests needing it must guard their imports with
+# pytest.importorskip so they SKIP: a bare module-level import of an absent
+# package raises during COLLECTION, and a collection error aborts the entire
+# run rather than skipping one file. That is how this workflow stayed red for
+# 40 consecutive runs while looking like an ordinary test failure.
 on:
   push:
   pull_request:
@@ -11,17 +18,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Foundry genuinely depends on MagicQuant -- core/publish_criteria.py
+      # uses its canonical tier boundaries rather than duplicating them, which
+      # is the right call and means CI needs it present. Checked out beside the
+      # repo and put on PYTHONPATH rather than pip-installed: installing it
+      # pulls llama-cpp-python, which compiles llama.cpp and would dominate
+      # this job. Only pure-python modules are imported from it.
+      - uses: actions/checkout@v4
+        with:
+          repository: lucasmcoleman/MagicQuant
+          path: .magicquant-src
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install test deps (no heavy ML stack)
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio httpx fastapi pydantic pydantic-settings pyyaml uvicorn
+          # UI / config stack
+          pip install pytest pytest-asyncio httpx fastapi pydantic \
+                      pydantic-settings pyyaml uvicorn
+          # hf_upload imports these at module level; their absence failed
+          # collection for every test touching the upload path.
+          pip install requests tenacity huggingface_hub
+          # what magicquant.quant.tiers transitively needs (no llama.cpp build)
+          # structlog: magicquant.logging imports it, and several Foundry tests
+          # compare against the real library's defaults.
+          pip install gguf numpy structlog
+
       - name: Lint (py_compile)
         run: make lint
+
       - name: Offline tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.magicquant-src
         run: |
           python -m pytest tests/ \
             --ignore=tests/test_training_integration.py \
-            -m "not slow and not gpu" -v
+            -m "not slow and not gpu" -q

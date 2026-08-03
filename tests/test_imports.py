@@ -26,6 +26,10 @@ def test_pipeline_stage_functions_import():
 
 def test_detect_response_template_is_gone():
     """L-dead-detect: the dead symbol must be removed (and not break imports)."""
+    # The assertion is about module attributes, but importing the module needs
+    # torch, which CI does not install. Skip rather than fail: this checks a
+    # dead symbol stays dead, not anything torch-related.
+    pytest.importorskip("torch")
     import fast_train_zeroclaw as ft
     assert not hasattr(ft, "detect_response_template")
     assert hasattr(ft, "fast_load_quantized_model")
