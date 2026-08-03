@@ -72,6 +72,14 @@ class HFUploadConfig:
     did_reap: bool = False
     did_magicquant: bool = True
 
+    # Tiers the publish stage built but deliberately did NOT ship, as
+    # [{"tier", "reason", "gib", "loss", "beaten_by"}]. A ladder with a gap in
+    # it reads as something having gone wrong, and users notice: removing a
+    # mislabeled ThinkingCap Q5 in Aug 2026 produced a "was it deleted, or is
+    # something wrong with it?" comment within a day. Saying so on the card is
+    # cheaper than answering it repeatedly, and honest either way.
+    dropped_tiers: list = field(default_factory=list)
+
     # Training details (for the model card)
     lora_r: int = 32
     lora_alpha: int = 64
@@ -516,9 +524,44 @@ based on the methodology by **[magiccodingman](https://github.com/magiccodingman
 
 - Tensors are classified into sensitivity groups (Embeddings, Head, Query, Key, Output, FFN Up/Down, MoE Experts, Router)
 - An evolutionary search finds the optimal quantization type per group, balancing size vs. perplexity
-- **Q4/Q5/Q6 tier targets** are produced with different size-quality tradeoffs
+- **Q4/Q5/Q6 tier targets** are searched, and each one ships only if it earns its place (see below)
 - Small-row tensors and sensitivity-critical layers (embeddings, output head, router) are kept at F32/F16/BF16
-- This is NOT a uniform quantization -- each tensor group gets its own optimal type""")
+- This is NOT a uniform quantization -- each tensor group gets its own optimal type
+
+A tier name here is a **size band**, not a promise that every tensor uses that
+exact type. A "Q5" is whatever mix of schemes landed in the Q5 size band with
+the lowest measured perplexity loss -- which is the point of the search.""")
+
+    # Explain any gap in the ladder, rather than leaving a hole for people to
+    # wonder about.
+    if getattr(cfg, "dropped_tiers", None):
+        rows = []
+        for d in cfg.dropped_tiers:
+            tier = d.get("tier", "?")
+            why = d.get("reason", "did not meet the publishing criteria")
+            detail = ""
+            if d.get("gib") and d.get("loss") is not None:
+                detail = f" It measured {d['gib']:.2f} GiB at {d['loss']:+.4f} loss"
+                if d.get("beaten_by"):
+                    b = d["beaten_by"]
+                    detail += (f", against {b['tier']} at {b['gib']:.2f} GiB and "
+                               f"{b['loss']:+.4f}")
+                detail += "."
+            rows.append(f"- **{tier} was not published.** {why}{detail}")
+        dropped_names = ", ".join(d.get("tier", "?") for d in cfg.dropped_tiers)
+        body_sections.append(
+            "## Why a tier is missing\n\n"
+            + "\n".join(rows)
+            + f"\n\nThis is deliberate, and the {dropped_names} file is not "
+            "missing by accident or broken. Each tier is measured against the "
+            "others on **size and perplexity together**, and a tier is dropped "
+            "when another *smaller* tier in this same repo already matches or "
+            "beats it on quality. Shipping it anyway would mean offering a "
+            "bigger download for no measurable gain.\n\n"
+            "If you specifically want that size point, open an issue in the "
+            "Community tab and I'll build it -- the search results are kept, "
+            "so it's a rebuild rather than a re-search."
+        )
 
     # ROCmFPX section (only for AMD-native fork builds)
     if rocmfpx:

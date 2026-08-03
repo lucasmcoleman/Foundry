@@ -21,6 +21,14 @@ _HF_CONFIG_KEYS = (
     "gradient_accumulation", "optimizer", "lr_scheduler",
 )
 
+# Keys forwarded only when PRESENT, so configs written before the key existed
+# still load. The required list above is indexed with cfg[k] and would raise a
+# KeyError on them -- including config files already sitting on disk from an
+# in-flight run.
+_HF_OPTIONAL_KEYS = (
+    "dropped_tiers",
+)
+
 
 def parse_config(cfg_path: str) -> dict:
     return json.loads(Path(cfg_path).read_text())
@@ -37,7 +45,10 @@ def run(cfg_path: str | None = None) -> None:
 
     from hf_upload import HFUploadConfig, upload
 
-    hf_cfg = HFUploadConfig(**{k: cfg[k] for k in _HF_CONFIG_KEYS})
+    hf_cfg = HFUploadConfig(
+        **{k: cfg[k] for k in _HF_CONFIG_KEYS},
+        **{k: cfg[k] for k in _HF_OPTIONAL_KEYS if k in cfg},
+    )
     ok = upload(hf_cfg, cfg["out_abs"])
     if ok:
         print("PIPELINE_STAGE_COMPLETE=upload", flush=True)
