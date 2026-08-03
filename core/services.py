@@ -330,7 +330,7 @@ class MagicQuantService:
         rocmfpx_schemes: bool = False,
         iq_schemes: bool = False,
         seed: Optional[int] = None,
-        use_imatrix: bool = False,
+        use_imatrix: bool = True,
         imatrix_corpus: Optional[str] = None,
         enable_kl: bool = False,
         kl_weight: float = 0.1,

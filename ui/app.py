@@ -251,7 +251,7 @@ class MagicQuantCfg(BaseModel):
     rocmfpx_schemes: bool = False    # explore AMD-native ROCmFPX fork types
     iq_schemes: bool = False         # explore sub-4-bit stock-ggml IQ schemes
     seed: Optional[int] = None       # optional RNG seed for a reproducible search
-    use_imatrix: bool = False        # capture/reuse an importance matrix (both search paths)
+    use_imatrix: bool = True         # capture/reuse an importance matrix (both search paths)
     imatrix_corpus: Optional[str] = None  # calibration corpus; None = bundled default
     enable_kl: bool = False          # measured-search only: real KL-divergence-to-base
     kl_weight: float = 0.1           # weight of |mean_kl| in measured-search selection
