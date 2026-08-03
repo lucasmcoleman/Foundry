@@ -267,6 +267,35 @@ def _find_measured_losses(
     return {}, None
 
 
+def _find_rocmfpx_measurements(
+    files_to_upload: list[tuple[Path, str]]
+) -> dict[str, dict]:
+    """Per-file ROCmFPX measurements from ``rocmfpx/_measurements.json``.
+
+    ROCmFPX tiers are not in search_results.json -- they are rendered from a
+    MagicQuant config afterwards and measured by the publish stage. Without
+    this the fork-only cards showed no numbers at all, which is backwards: this
+    family trades quality for throughput, so its tok/s is the single most
+    decision-relevant figure on the page.
+
+    Returns ``{repo_filename: {ppl, tg128, pp512, mq_peer_tg, ...}}``, empty
+    when the record is missing or unreadable.
+    """
+    for local_path, _ in files_to_upload:
+        parent = local_path.parent
+        if parent.name != "rocmfpx":
+            continue
+        rec = parent / "_measurements.json"
+        if not rec.is_file():
+            continue
+        try:
+            import json as _json
+            return {e["name"]: e for e in _json.loads(rec.read_text())}
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+    return {}
+
+
 def _find_legacy_tier_scheme_note(files_to_upload: list[tuple[Path, str]]) -> str:
     """Look for a sibling MagicQuant ``search_results.json`` next to this
     run's planned files and, if found and written under an older
@@ -441,6 +470,8 @@ def generate_model_card(
     # tier -> GiB, collected as rows render, so the recommendation below is
     # sized from the same files the table lists rather than a second lookup.
     gguf_sizes_gib: dict[str, float] = {}
+    # ROCmFPX numbers come from the publish stage, not the search.
+    fpx_measured = _find_rocmfpx_measurements(files_to_upload)
     for local_path, repo_path in files_to_upload:
         if repo_path.endswith(".gguf"):
             has_gguf = True
@@ -503,7 +534,17 @@ def generate_model_card(
             if not quant_hint:
                 quant_hint = "—"
             ppl_cell = ""
-            if measured_losses:
+            fpx_rec = fpx_measured.get(name)
+            if fpx_rec and fpx_rec.get("ppl"):
+                # ROCmFPX: throughput is why this family exists, so show it
+                # next to quality rather than making the reader guess.
+                _p = fpx_rec["ppl"]
+                _cell = f"{_p:.4f}"
+                if measured_baseline_ppl:
+                    _cell += f" ({(_p / measured_baseline_ppl - 1) * 100:+.2f}%)"
+                _tg = fpx_rec.get("tg128")
+                ppl_cell = f" {_cell} | {f'{_tg:.1f} tok/s' if _tg else 'n/a'} |"
+            elif measured_losses:
                 m = re.search(r"(Q\d)", name)
                 # NEVER attach this run's measurement to a file this run did
                 # not produce. A carried-over Q6 is a different file from the
@@ -520,14 +561,17 @@ def generate_model_card(
                 if m and name not in carried_names:
                     gguf_sizes_gib[m.group(1)] = size_bytes / 2 ** 30
                 if name in carried_names:
-                    ppl_cell = " earlier build, not measured here |"
+                    ppl_cell = (" earlier build, not measured here |"
+                                + (" |" if fpx_measured else ""))
                 if loss is not None:
                     ppl_cell = f" {loss * 100:+.2f}% |"
                     if measured_baseline_ppl:
                         ppl_cell = (f" {measured_baseline_ppl * (1 + loss):.4f} "
                                     f"({loss * 100:+.2f}%) |")
                 elif not ppl_cell:
-                    ppl_cell = " not measured |"
+                    ppl_cell = " not measured |" + (" |" if fpx_measured else "")
+            if not ppl_cell and (measured_losses or fpx_measured):
+                ppl_cell = " not measured |" + (" |" if fpx_measured else "")
             gguf_rows += (f"| [{name}](./{name}) | {size_gb:.1f} GB | "
                           f"{quant_hint} |{ppl_cell}\n")
 
@@ -627,8 +671,17 @@ tags:
     # The measured-quality column appears only when the run actually measured.
     # A prediction-only run has no honest number to put here, and a column of
     # estimates would read as measurement.
-    ppl_header = " Perplexity vs BF16 |" if measured_losses else ""
-    ppl_sep = "--------------------|" if measured_losses else ""
+    # ROCmFPX gets an extra Speed column: this family trades quality for
+    # throughput, so a card showing only perplexity would omit the one number
+    # that justifies choosing it over the stock-llama.cpp sibling.
+    if fpx_measured:
+        ppl_header = " Perplexity vs BF16 | Speed |"
+        ppl_sep = "--------------------|-------|"
+    elif measured_losses:
+        ppl_header = " Perplexity vs BF16 |"
+        ppl_sep = "--------------------|"
+    else:
+        ppl_header = ppl_sep = ""
     # Which tier most people should take. Derived from the same measurements
     # as the table, so it can never contradict the numbers printed above it.
     recommended = None
@@ -642,7 +695,31 @@ tags:
             for t, loss in measured_losses.items() if gguf_sizes_gib.get(t)
         ])
     ppl_note = ""
-    if measured_losses:
+    if fpx_measured:
+        _meas = [m for m in fpx_measured.values() if m.get("ppl")]
+        _base = f" of **{measured_baseline_ppl:.4f}**" if measured_baseline_ppl else ""
+        ppl_note = (
+            f"\n\nPerplexity measured on wikitext-2 (100 chunks, ctx 512) against "
+            f"the BF16 baseline{_base}; speed is llama-bench tg128 on this "
+            f"project's Strix Halo (gfx1151) box, fully offloaded.\n"
+        )
+        # The speed comparison against the stock-llama.cpp sibling is the whole
+        # reason to pick a file from this repo, so state it outright.
+        _fast = [m for m in _meas if m.get("tg128") and m.get("mq_peer_tg")]
+        if _fast:
+            _b = max(_fast, key=lambda m: m["tg128"] / m["mq_peer_tg"])
+            _ratio = _b["tg128"] / _b["mq_peer_tg"]
+            if _ratio > 1.0:
+                ppl_note += (
+                    f"\n**Recommended: {_b['tier']}"
+                    f" ({_b.get('gib', 0):.2f} GiB).** It generates at "
+                    f"{_b['tg128']:.1f} tok/s against {_b['mq_peer_tg']:.1f} for the "
+                    f"equivalent MagicQuant tier -- **{_ratio:.1f}x faster** -- which "
+                    f"is the reason to accept a fork-only file at all. If you would "
+                    f"rather have the quality and run on stock llama.cpp, use the "
+                    f"MagicQuant repo linked above.\n"
+                )
+    elif measured_losses:
         ppl_note = (
             "\n\nPerplexity measured on wikitext-2 (100 chunks, ctx 512) against "
             "the BF16 baseline"
