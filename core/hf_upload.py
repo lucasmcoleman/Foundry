@@ -577,7 +577,14 @@ the lowest measured perplexity loss -- which is the point of the search.""")
         rows = []
         for c in cfg.carried_over:
             size = f" ({c['gib']:.2f} GiB)" if c.get("gib") else ""
-            rows.append(f"- `{c.get('name', '?')}`{size}")
+            note = ""
+            if c.get("mislabeled"):
+                note = (f" -- **its size puts it in the {c['actual_band']} "
+                        f"band, not the {c['claimed_band']} its name claims.** "
+                        f"Treat the name as unreliable for this file.")
+            elif c.get("actual_band"):
+                note = f" -- size verified as {c['actual_band']} band"
+            rows.append(f"- `{c.get('name', '?')}`{size}{note}")
         body_sections.append(
             "## Files from an earlier build\n\n"
             "These files were produced by a **previous quantization run**, not "
@@ -1146,19 +1153,25 @@ def upload(
 
         # Anything on the hub this run did not upload came from an earlier
         # search. Disclose it rather than let one card speak for two runs.
-        mine = {rp for _, rp in files_to_upload}
-        carried = []
-        try:
-            from huggingface_hub import HfApi
-            for s in HfApi().repo_info(repo_id, files_metadata=True,
-                                       token=hf_token).siblings:
-                n = s.rfilename
-                if (n.lower().endswith(".gguf") and "mmproj" not in n.lower()
-                        and n not in mine):
-                    carried.append({"name": n,
-                                    "gib": (s.size or 0) / 2 ** 30})
-        except Exception:
-            pass    # new repo, or metadata unavailable: nothing to disclose
+        # A caller that ran reconciliation (see _publish_tiers.reconcile)
+        # supplies richer entries -- band verified against the current
+        # boundaries, mislabelled ones flagged. Fall back to a name+size scan
+        # so any caller still discloses something.
+        carried = [c for c in (getattr(cfg, "carried_over", None) or [])
+                   if c.get("family", family) == family]
+        if not carried:
+            mine = {rp for _, rp in files_to_upload}
+            try:
+                from huggingface_hub import HfApi
+                for s in HfApi().repo_info(repo_id, files_metadata=True,
+                                           token=hf_token).siblings:
+                    n = s.rfilename
+                    if (n.lower().endswith(".gguf")
+                            and "mmproj" not in n.lower() and n not in mine):
+                        carried.append({"name": n,
+                                        "gib": (s.size or 0) / 2 ** 30})
+            except Exception:
+                pass    # new repo or metadata unavailable: nothing to disclose
         for c in carried:
             log(f"  carried over from an earlier run: {c['name']} "
                 f"({c['gib']:.2f} GiB)", "warn")
