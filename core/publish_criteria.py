@@ -291,3 +291,70 @@ def decide_rocmfpx_tiers(fpx_tiers, mq_tiers, baseline_gib, baseline_ppl,
 
     ship = sorted(t for t in survivors if t not in dropped)
     return {"ship": ship, "drop": drop, "questions": questions}
+
+
+def recommend_tier(tiers, noise_margin=NOISE_MARGIN):
+    """Pick the tier most people should download, with a reason to show.
+
+    The rule: **the smallest tier whose measured loss is within the noise floor
+    of the best measured loss.** Once two tiers are statistically
+    indistinguishable on quality, the only thing separating them is download
+    size, and the smaller one wins by default.
+
+    This exists because the ladder alone under-serves the reader. FableFusion
+    ships Q4/Q5/Q6 at +1.63% / +0.26% / +0.24%: the jump from Q4 to Q5 buys a
+    real 1.4 points, while Q5 to Q6 costs 18% more bytes for 0.018 points --
+    below what a 100-chunk perplexity pass can even resolve. A table of three
+    numbers leaves everyone to derive that themselves, and most won't.
+
+    Args:
+        tiers: iterable of ``{"tier": "Q5", "gib": 17.68, "loss": 0.0026}``.
+            Entries with ``loss`` of ``None`` are ignored -- an unmeasured tier
+            cannot be recommended on measured grounds.
+        noise_margin: relative-loss floor below which two tiers count as equal.
+
+    Returns:
+        ``{"tier", "reason", "gib", "loss"}`` for the pick, or ``None`` when
+        fewer than two tiers carry measurements (nothing to choose between).
+    """
+    measured = [
+        t for t in tiers
+        if isinstance(t.get("loss"), (int, float)) and t.get("gib")
+    ]
+    if len(measured) < 2:
+        return None
+
+    best_loss = min(t["loss"] for t in measured)
+    # Every tier statistically tied with the best, then the smallest of them.
+    tied = [t for t in measured if t["loss"] - best_loss < noise_margin]
+    pick = min(tied, key=lambda t: t["gib"])
+
+    bigger = [
+        t for t in measured
+        if t["gib"] > pick["gib"] and t["loss"] - best_loss < noise_margin
+    ]
+    if bigger:
+        largest = max(bigger, key=lambda t: t["gib"])
+        pct = (largest["gib"] / pick["gib"] - 1) * 100
+        gap = (largest["loss"] - pick["loss"]) * 100
+        reason = (
+            f"It is the smallest tier that is statistically tied with the best "
+            f"measured quality here. {largest['tier']} is {pct:.0f}% larger for "
+            f"{abs(gap):.3f} percentage points of perplexity, which is below "
+            f"what this measurement can resolve -- so the extra bytes buy "
+            f"nothing you can detect."
+        )
+    else:
+        smaller = [t for t in measured if t["gib"] < pick["gib"]]
+        if smaller:
+            nxt = max(smaller, key=lambda t: t["gib"])
+            gap = (nxt["loss"] - pick["loss"]) * 100
+            reason = (
+                f"It has the best measured quality on offer, and the next size "
+                f"down ({nxt['tier']}) gives up a real {gap:.2f} percentage "
+                f"points of perplexity rather than a difference lost in noise."
+            )
+        else:
+            reason = "It has the best measured quality of the tiers published here."
+    return {"tier": pick["tier"], "reason": reason,
+            "gib": pick["gib"], "loss": pick["loss"]}
