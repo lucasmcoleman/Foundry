@@ -270,30 +270,18 @@ def _find_measured_losses(
 def _find_rocmfpx_measurements(
     files_to_upload: list[tuple[Path, str]]
 ) -> dict[str, dict]:
-    """Per-file ROCmFPX measurements from ``rocmfpx/_measurements.json``.
+    """Per-file ROCmFPX measurements, via the shared publish-records module.
 
-    ROCmFPX tiers are not in search_results.json -- they are rendered from a
-    MagicQuant config afterwards and measured by the publish stage. Without
-    this the fork-only cards showed no numbers at all, which is backwards: this
-    family trades quality for throughput, so its tok/s is the single most
-    decision-relevant figure on the page.
-
-    Returns ``{repo_filename: {ppl, tg128, pp512, mq_peer_tg, ...}}``, empty
-    when the record is missing or unreadable.
+    ROCmFPX tiers are absent from search_results.json -- they are rendered from
+    a MagicQuant config afterwards and measured by the publish stage. Reading
+    and writing live together in core/publish_records.py so the two halves of
+    the on-disk contract cannot drift.
     """
-    for local_path, _ in files_to_upload:
-        parent = local_path.parent
-        if parent.name != "rocmfpx":
-            continue
-        rec = parent / "_measurements.json"
-        if not rec.is_file():
-            continue
-        try:
-            import json as _json
-            return {e["name"]: e for e in _json.loads(rec.read_text())}
-        except (OSError, ValueError, KeyError, TypeError):
-            return {}
-    return {}
+    try:
+        from publish_records import find_measurements
+    except ImportError:  # pragma: no cover - when imported as the `core` package
+        from core.publish_records import find_measurements
+    return find_measurements(files_to_upload, family="rocmfpx")
 
 
 def _find_legacy_tier_scheme_note(files_to_upload: list[tuple[Path, str]]) -> str:
