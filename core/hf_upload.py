@@ -80,6 +80,13 @@ class HFUploadConfig:
     # cheaper than answering it repeatedly, and honest either way.
     dropped_tiers: list = field(default_factory=list)
 
+    # GGUFs already on the hub that THIS run did not produce, as
+    # [{"name", "gib"}]. The uploader adds files and never reconciles, so a
+    # repo accumulates artifacts across runs; without saying so, a download
+    # page silently mixes outputs from different searches under one model
+    # card that describes only the latest.
+    carried_over: list = field(default_factory=list)
+
     # Training details (for the model card)
     lora_r: int = 32
     lora_alpha: int = 64
@@ -548,7 +555,7 @@ the lowest measured perplexity loss -- which is the point of the search.""")
                                f"{b['loss']:+.4f}")
                 detail += "."
             rows.append(f"- **{tier} was not published.** {why}{detail}")
-        dropped_names = ", ".join(d.get("tier", "?") for d in cfg.dropped_tiers)
+        dropped_names = ", ".join(str(d.get("tier", "?")) for d in cfg.dropped_tiers)
         body_sections.append(
             "## Why a tier is missing\n\n"
             + "\n".join(rows)
@@ -561,6 +568,29 @@ the lowest measured perplexity loss -- which is the point of the search.""")
             "If you specifically want that size point, open an issue in the "
             "Community tab and I'll build it -- the search results are kept, "
             "so it's a rebuild rather than a re-search."
+        )
+
+    # Files that predate this run. The uploader adds and never reconciles, so
+    # a repo accumulates across searches; a card that describes only the
+    # latest run silently misrepresents them.
+    if getattr(cfg, "carried_over", None):
+        rows = []
+        for c in cfg.carried_over:
+            size = f" ({c['gib']:.2f} GiB)" if c.get("gib") else ""
+            rows.append(f"- `{c.get('name', '?')}`{size}")
+        body_sections.append(
+            "## Files from an earlier build\n\n"
+            "These files were produced by a **previous quantization run**, not "
+            "the one this card describes:\n\n"
+            + "\n".join(rows)
+            + "\n\nThey are kept because they are correctly sized for their "
+            "tier and remain usable. But they were selected by an earlier "
+            "version of the search, so their quality was not measured on the "
+            "same footing as the other files here, and the per-group scheme "
+            "breakdown above does not describe them.\n\n"
+            "If you are comparing tiers against each other, prefer the files "
+            "from the current run -- the comparison is only apples-to-apples "
+            "within a single search."
         )
 
     # ROCmFPX section (only for AMD-native fork builds)
@@ -1114,7 +1144,27 @@ def upload(
                 f"is present in {repo_id} (likely from an earlier run)", "warn")
         fam_dropped = [d for d in fam_dropped if d.get("tier") not in present]
 
-        card_cfg = replace(cfg, repo_id=repo_id, dropped_tiers=fam_dropped)
+        # Anything on the hub this run did not upload came from an earlier
+        # search. Disclose it rather than let one card speak for two runs.
+        mine = {rp for _, rp in files_to_upload}
+        carried = []
+        try:
+            from huggingface_hub import HfApi
+            for s in HfApi().repo_info(repo_id, files_metadata=True,
+                                       token=hf_token).siblings:
+                n = s.rfilename
+                if (n.lower().endswith(".gguf") and "mmproj" not in n.lower()
+                        and n not in mine):
+                    carried.append({"name": n,
+                                    "gib": (s.size or 0) / 2 ** 30})
+        except Exception:
+            pass    # new repo, or metadata unavailable: nothing to disclose
+        for c in carried:
+            log(f"  carried over from an earlier run: {c['name']} "
+                f"({c['gib']:.2f} GiB)", "warn")
+
+        card_cfg = replace(cfg, repo_id=repo_id, dropped_tiers=fam_dropped,
+                           carried_over=carried)
         card_content = generate_model_card(
             card_cfg,
             files_to_upload,
