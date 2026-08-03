@@ -230,6 +230,43 @@ def _find_mmproj(files_to_upload: list[tuple[Path, str]]) -> Optional[str]:
     )
 
 
+def _find_measured_losses(
+    files_to_upload: list[tuple[Path, str]]
+) -> tuple[dict[str, float], Optional[float]]:
+    """Per-tier measured perplexity loss from the run's ``search_results.json``.
+
+    The search measures every shipped tier against the BF16 baseline, and those
+    numbers decide what ships at all -- yet the card never showed them, so a
+    reader choosing between a 15.7 GB Q4 and a 19.0 GB Q5 had size alone to go
+    on. On a real 27B those two differ by 1.4 percentage points of perplexity
+    (+1.63% vs +0.26%), which is the whole basis for picking one.
+
+    Returns ``({tier: relative_loss}, baseline_ppl)``; empty when the run is
+    prediction-only, or its results are missing or unreadable. Absent numbers
+    simply omit the column rather than blocking the card.
+    """
+    for local_path, _ in files_to_upload:
+        parent = local_path.parent
+        if parent.name not in ("magicquant", "rocmfpx"):
+            continue
+        results_path = parent.parent / "magicquant" / "search_results.json"
+        if not results_path.is_file():
+            continue
+        try:
+            import json as _json
+            data = _json.loads(results_path.read_text())
+        except (OSError, ValueError):
+            continue
+        losses = {}
+        for tier, rec in (data.get("tiered_survivors") or {}).items():
+            loss = rec.get("measured_loss")
+            if isinstance(loss, (int, float)):
+                losses[tier] = float(loss)
+        if losses:
+            return losses, data.get("baseline_ppl")
+    return {}, None
+
+
 def _find_legacy_tier_scheme_note(files_to_upload: list[tuple[Path, str]]) -> str:
     """Look for a sibling MagicQuant ``search_results.json`` next to this
     run's planned files and, if found and written under an older
@@ -398,6 +435,9 @@ def generate_model_card(
     # appended to every MagicQuant-tier-derived quant hint below (see
     # _find_legacy_tier_scheme_note's docstring).
     legacy_tier_note = _find_legacy_tier_scheme_note(files_to_upload)
+    # Measured quality per tier. Absent for prediction-only runs, in which case
+    # the column is dropped entirely rather than shown empty or guessed at.
+    measured_losses, measured_baseline_ppl = _find_measured_losses(files_to_upload)
     for local_path, repo_path in files_to_upload:
         if repo_path.endswith(".gguf"):
             has_gguf = True
@@ -459,7 +499,32 @@ def generate_model_card(
                 quant_hint = "F16 (unquantized)"
             if not quant_hint:
                 quant_hint = "—"
-            gguf_rows += f"| [{name}](./{name}) | {size_gb:.1f} GB | {quant_hint} |\n"
+            ppl_cell = ""
+            if measured_losses:
+                m = re.search(r"(Q\d)", name)
+                # NEVER attach this run's measurement to a file this run did
+                # not produce. A carried-over Q6 is a different file from the
+                # Q6 that was measured -- on ThinkingCap the repo holds a
+                # 23.00 GiB Q6 from an earlier search while the measured one
+                # was the 20.89 GiB build that this run then rejected.
+                # Labelling the former with the latter's perplexity would be
+                # a fabricated number on a public page.
+                carried_names = {
+                    c.get("name") for c in (getattr(cfg, "carried_over", None) or [])
+                }
+                loss = None if name in carried_names else (
+                    measured_losses.get(m.group(1)) if m else None)
+                if name in carried_names:
+                    ppl_cell = " earlier build, not measured here |"
+                if loss is not None:
+                    ppl_cell = f" {loss * 100:+.2f}% |"
+                    if measured_baseline_ppl:
+                        ppl_cell = (f" {measured_baseline_ppl * (1 + loss):.4f} "
+                                    f"({loss * 100:+.2f}%) |")
+                elif not ppl_cell:
+                    ppl_cell = " not measured |"
+            gguf_rows += (f"| [{name}](./{name}) | {size_gb:.1f} GB | "
+                          f"{quant_hint} |{ppl_cell}\n")
 
     # Non-GGUF files table
     other_rows = ""
@@ -554,13 +619,28 @@ tags:
 
     # Files section
     files_section = ""
+    # The measured-quality column appears only when the run actually measured.
+    # A prediction-only run has no honest number to put here, and a column of
+    # estimates would read as measurement.
+    ppl_header = " Perplexity vs BF16 |" if measured_losses else ""
+    ppl_sep = "--------------------|" if measured_losses else ""
+    ppl_note = ""
+    if measured_losses:
+        ppl_note = (
+            "\n\nPerplexity measured on wikitext-2 (100 chunks, ctx 512) against "
+            "the BF16 baseline"
+            + (f" of **{measured_baseline_ppl:.4f}**" if measured_baseline_ppl else "")
+            + ". Lower is better; the percentage is the increase over BF16. "
+            "These are the same measurements the tier selection is based on, so "
+            "a tier that shipped is one that earned its size.\n"
+        )
     if has_gguf:
         files_section += f"""
 ## GGUF Files
 
-| File | Size | Quant |
-|------|------|-------|
-{gguf_rows}"""
+| File | Size | Quant |{ppl_header}
+|------|------|-------|{ppl_sep}
+{gguf_rows}{ppl_note}"""
 
     if other_rows:
         files_section += f"""
