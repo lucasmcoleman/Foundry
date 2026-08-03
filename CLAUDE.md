@@ -112,8 +112,15 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
    control). Recovery scales with quant aggressiveness; the final GGUF pack is
    exact-ggml. See MagicQuant's `docs/qat.md`.
 6. **MagicQuant**: Evolutionary search → 3-tier hybrid GGUFs (Q4/Q5/Q6).
+   **A tier name is a SIZE BAND, not a recipe** — see "Tier semantics" below.
    Prediction-only by default; `--magicquant-measured` runs the real-perplexity
-   Predict→Measure→Learn loop. `--magicquant-rocmfpx` lets the search also
+   Predict→Measure→Learn loop. **`use_imatrix` now defaults to TRUE**: the
+   bundled calibration corpus is ~1 MB across 18 languages plus code, math and
+   agentic prompts, verified disjoint from the perplexity eval corpus, with
+   capture bounded to 200 chunks (~35-40 min once per model, then cached).
+   `enable_imatrix` refuses outright if the calibration and eval corpora
+   resolve to the same file — calibrating on the text a run is scored against
+   makes every measured loss optimistic with nothing in the output showing it. `--magicquant-rocmfpx` lets the search also
    explore AMD-native ROCmFPX fork types per group (needs a ROCmFPX build;
    output loads only on the fork). Persists `search_results.json` from both
    search paths (consumed by QAT and by ROCmFPX's mq-hybrid mode).
@@ -136,6 +143,53 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
    `--rocmfpx` or the UI ROCmFPX card. Writes GGUFs to `<output>/rocmfpx/`.
    Experimental upstream research build — see `docs/rocmfpx.md`.
 8. **Upload**: HuggingFace Hub with model card generation
+
+## Tier Semantics (read before touching quantization)
+
+**A tier name is a SIZE BAND, never a claim about which schemes are inside.**
+A "Q5" is whatever mix of schemes landed in the Q5 size band with the lowest
+measured perplexity loss — it may contain zero Q5_K tensors. Bands come from
+`magicquant.quant.tiers.classify_tier` / `TIER_BOUNDARIES` as a ratio to the
+BF16 baseline.
+
+Never grade a build by whether it "contains N-bit tensors". Size and measured
+quality are the only criteria. Four published models once shipped a uniform
+Q6_K labelled "Q5" because the v1 Q5 band ran to ratio 0.45 and a genuine Q6
+fell inside it; `tools/reselect_tiers.py` re-derives any finished run's ladder
+from its stored measurements to catch exactly this.
+
+## Publishing Criteria
+
+Applied by `core/publish_criteria.py` (decision logic) via the publish stage.
+A built tier ships only if it passes all three:
+
+1. **BAND** — the file must land in the band its name claims, checked by size
+   ratio, never by inspecting which schemes it contains.
+2. **DOMINANCE** — dropped if a *smaller* shipped tier beats it on measured
+   loss by more than `NOISE_MARGIN` (0.001 relative loss). Sub-floor gaps are
+   coin flips, so both tiers ship and a QUESTION is raised instead: FableFusion's
+   Q6 beat its Q5 by 0.000185, which is noise, and an any-margin rule would
+   have deleted a good tier.
+3. **SPEED** (ROCmFPX only) — ROCmFPX trades quality for throughput, so a
+   ROCmFPX tier ships only if measurably faster than the MagicQuant tier of the
+   same band.
+
+Separately, the ROCmFPX **band guard** refuses to *build* a tier whose render
+would land outside its claimed band. The fork has no type between 4.5 and 6.5
+bpw, so schemes round to the nearest available and a tier can render out of
+band (FableFusion's mq-q5 predicted into Q6; ThinkingCap's mq-q4 into Q5).
+A refusal writes a structured record to `<output>/rocmfpx/_refusals.json`
+(`core/_rocmfpx_entry._record_refusal`), which is the publish stage's primary
+source for disclosing it; scraping the run log is a fallback for older runs
+only, since cleanup deletes logs. A tier that later builds successfully clears
+its own record, so a stale refusal can't outlive the condition that caused it.
+
+**Model cards must explain every gap.** Dropped tiers, refused tiers, and files
+carried over from an earlier run each get their own disclosed section.
+`audit_card_against_repo` cross-checks the card against the repo's real file
+list *before* the card is pushed (and again after upload), so a card that
+contradicts its own repo is caught while it is still private. A ladder with a
+silent gap reads as breakage and generates user questions.
 
 ### MagicQuant (MagicQuant/magicquant/)
 Classifies tensors into sensitivity groups (E=Embeddings, H=Head, Q=Query, K=Key, O=Output, U=FFN Up, D=FFN Down, X=MoE Experts, R=Router), then runs evolutionary search to find optimal per-group quantization. Supports BF16, Q8_0, Q6_K, Q5_K, Q4_K_M, IQ4_NL, MXFP4, Q3_K, Q2_K, and (opt-in, fork-only) the AMD-native ROCMFP3/4/6/8 schemes.
@@ -173,3 +227,16 @@ Training data generators formerly lived in `datagen/` (ZeroClaw tool-calls) and 
 - **Qwen3.5 hybrid architecture** has Mamba (linear_attention) layers with 48-element rows. Quantization types with block_size > 32 are incompatible — since 48 isn't 32-divisible either, the GGUF writer falls back to F32 for these (block-32 quants only apply to 32-divisible rows).
 - **GGUF files from MagicQuant need chat template patching** — the source reader pulls from tokenizer_config.json, which must contain `chat_template`. The streaming merge (core/fast_export.py) copies tokenizer files but may omit the template; verify and use `scripts/patch_gguf_metadata.py` if needed.
 - **`UNSLOTH_COMPILE_DISABLE=1`** may be needed for gfx1151 if training produces NaN losses (known Triton code generation issue on RDNA).
+- **IQ4_NL is gated behind imatrix availability.** Without calibration it lost
+  all 11 measured comparisons across two 27B models (3-20x worse than same-bpw
+  MXFP4/Q4_K_M) despite *better* isolated weight-reconstruction error — its
+  non-linear lookup places levels to minimise unweighted error, which optimises
+  the wrong thing. It is now excluded from the search pool when no imatrix is
+  present (`IMATRIX_DEPENDENT_SCHEME_NAMES`), and the mutation neighbour walk
+  skips *over* it rather than truncating, since it sits mid-chain
+  (Q5_K <-> IQ4_NL <-> MXFP4_MOE) and stopping would strand Q5_K.
+- **`output/` is gitignored.** Anything durable must live in tracked code, not
+  in a per-run scratch directory. Publishing criteria were once kept in
+  `output/_publish_tiers.py` and were consequently untested; several model-card
+  bugs reached public pages before anyone noticed. They now live in
+  `core/publish_criteria.py` with tests.

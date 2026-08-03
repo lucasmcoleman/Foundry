@@ -165,6 +165,20 @@ Validated (confound-controlled, Qwen2.5-0.5B base, aggressive Q4_K-attention/MXF
 ### 6. MagicQuant
 Evolutionary per-tensor hybrid quantization. Generates tiered GGUF files (Q4/Q5/Q6) with different size-quality tradeoffs. See [MagicQuant](../MagicQuant/) for details.
 
+**A tier name is a size band, not a recipe.** A "Q5" file is whatever mix of
+schemes landed in the Q5 size band with the lowest measured perplexity loss — it
+may contain no Q5_K tensors at all. That is the point of a per-group search: on
+a recent 27B, the winning Q5 put FFN-down at Q4_K_M and FFN-up at MXFP4 while
+holding everything else at Q8_0/BF16, for +0.09% perplexity.
+
+Tiers are published only if they earn it. Each is checked against its claimed
+size band, dropped when a *smaller* tier already beats it on measured quality by
+more than the measurement noise floor, and (for ROCmFPX) required to be
+measurably faster than its MagicQuant equivalent — throughput being the only
+reason to accept its quality tradeoff. When a tier is withheld, the generated
+model card says which rule dropped it and why, so a gap in the ladder is never
+left looking like a broken upload.
+
 ### 7. ROCmFPX (optional, off by default)
 AMD-native uniform-quant GGUFs via [ciru-ai/ROCmFPX](https://github.com/ciru-ai/ROCmFPX) (a git-cloned, compiled llama.cpp fork — not a pip package), producing ROCmFP3/4/6/8 GGUFs tuned for this box's Strix Halo (gfx1151) hardware. Two modes: uniform presets (straight + tool-calling/JSON-safe "agent" variants) and MagicQuant-hybrid (`mq-q4`/`mq-q5`/`mq-q6`), which reproduces a MagicQuant tier's per-group precision layout in ROCmFPX-family types via `llama-quantize --tensor-type-file`. Experimental upstream research build; enable with `--rocmfpx` or the UI ROCmFPX card. Writes GGUFs to `<output>/rocmfpx/`. See [docs/rocmfpx.md](docs/rocmfpx.md).
 

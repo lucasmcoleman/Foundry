@@ -803,6 +803,110 @@ def _load_mq_tier_config(out_dir: Path, tier: str) -> dict:
     return config
 
 
+REFUSALS_FILENAME = "_refusals.json"
+
+
+def _rewrite_refusals(rocmfpx_out_dir: Path, tier: str, family: str,
+                       entry: dict | None) -> None:
+    """Set (``entry``) or clear (``None``) this (tier, family)'s refusal record.
+
+    Advisory-only: a failure here (unwritable dir, races, disk full, a
+    hand-mangled file) must never fail an otherwise-successful build, so every
+    failure mode is caught and logged rather than raised.
+    """
+    record_path = rocmfpx_out_dir / REFUSALS_FILENAME
+    try:
+        existing = []
+        if record_path.exists():
+            try:
+                existing = json.loads(record_path.read_text())
+                if not isinstance(existing, list):
+                    raise ValueError(f"expected a list, got {type(existing).__name__}")
+            except (ValueError, UnicodeDecodeError) as exc:
+                # Loud, because the discarded content is disclosure: an
+                # unreadable file used to be silently replaced, which is how a
+                # previously-recorded refusal could vanish with nothing said --
+                # the same "disclosed nowhere" failure this record exists to fix.
+                print(
+                    f"Warning: {record_path} is unreadable ({type(exc).__name__}: "
+                    f"{exc}); starting a fresh record. Any refusal it held is "
+                    f"lost -- re-run the build to regenerate it.",
+                    flush=True,
+                )
+                existing = []
+
+        kept = [
+            e for e in existing
+            if not (isinstance(e, dict) and e.get("tier") == tier
+                     and e.get("family") == family)
+        ]
+        if entry is not None:
+            kept.append(entry)
+        elif len(kept) == len(existing):
+            return      # nothing recorded for this tier; no need to touch the file
+
+        if kept:
+            rocmfpx_out_dir.mkdir(parents=True, exist_ok=True)
+            record_path.write_text(json.dumps(kept, indent=2) + "\n")
+        elif record_path.exists():
+            record_path.unlink()
+    except Exception as exc:  # noqa: BLE001 -- advisory, never blocks a valid build
+        verb = "record" if entry is not None else "clear"
+        print(
+            f"Warning: could not {verb} refusal of {family} {tier} to "
+            f"{record_path}: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+
+def _record_refusal(rocmfpx_out_dir: Path, *, tier: str, family: str, reason: str,
+                     predicted_gib: float, baseline_gib: float,
+                     predicted_band: str, claimed_band: str) -> None:
+    """Append a build-time refusal to ``<out>/rocmfpx/_refusals.json``.
+
+    The "Refusing mq-qN: ..." log line above used to be the ONLY trace of a
+    band-guard refusal, and the publish stage recovered it by regex-scraping
+    run logs -- which breaks the moment logs are rotated, cleaned up (cleanup
+    DOES delete logs), or reworded. This is the machine-readable twin, read by
+    ``_publish_tiers.find_refusals()`` in preference to the logs: a refusal
+    record a public model card can still render after the log that produced it
+    is gone.
+
+    ``reason`` is the CARD-voice sentence, not the log line -- the consumer
+    renders it as "- **Q5** -- <reason>", where a "Refusing mq-q5: " prefix
+    would put build-log imperative voice on a public page and name the tier
+    twice. The log line is that same sentence with the prefix prepended, so
+    the human- and machine-readable copies still cannot drift.
+
+    Idempotent -- re-running a build replaces this tier's entry rather than
+    duplicating it, keyed on (tier, family) since a future non-ROCmFPX family
+    could in principle share this file.
+    """
+    _rewrite_refusals(rocmfpx_out_dir, tier, family, {
+        "tier": tier,
+        "family": family,
+        "reason": reason,
+        "predicted_gib": predicted_gib,
+        "baseline_gib": baseline_gib,
+        "predicted_band": predicted_band,
+        "claimed_band": claimed_band,
+    })
+
+
+def _clear_refusal(rocmfpx_out_dir: Path, *, tier: str, family: str) -> None:
+    """Drop a stale refusal once that tier actually builds.
+
+    A refusal depends on the MagicQuant config it was predicting against, so a
+    re-search can make a previously-refused tier buildable. Without this the
+    record keeps asserting "Q5 was not built" while the Q5 GGUF sits next to
+    it -- which is bug #2 (a card calling a tier unpublished with the file
+    right there in the repo) rebuilt inside the mechanism meant to prevent it,
+    and worse than the log scrape it replaced: a durable JSON asserts it
+    forever, where a deleted log at least went quiet.
+    """
+    _rewrite_refusals(rocmfpx_out_dir, tier, family, None)
+
+
 def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
                         quantize_bin, bf16_gguf, imatrix, allow_requantize=False):
     """Produce a ROCmFPX hybrid matching MagicQuant's per-group config for ``tier``.
@@ -834,20 +938,37 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
         try:
             pred_gib, base_gib, pred_tier = predict_rendered_tier(config, bf16_gguf)
             if pred_tier != tier:
-                print(
-                    f"Refusing {spec}: rendering MagicQuant's {tier} config into "
+                # Built once and reused for both the human-readable log line
+                # (byte-identical to before -- find_refusals' regex and other
+                # things match on it) and the machine-readable record below,
+                # so the two can never drift. The record stores the sentence
+                # WITHOUT the "Refusing {spec}: " prefix, because a card
+                # renders it as "- **Q5** -- <reason>" and the prefix would put
+                # build-log voice on a public page.
+                refusal_reason = (
+                    f"rendering MagicQuant's {tier} config into "
                     f"ROCmFPX types predicts {pred_gib:.2f} GiB against a "
                     f"{base_gib:.2f} GiB BF16 baseline (ratio "
                     f"{pred_gib / base_gib:.4f}), which is the {pred_tier} band, "
-                    f"not {tier}.",
-                    flush=True,
+                    f"not {tier}."
                 )
+                print(f"Refusing {spec}: {refusal_reason}", flush=True)
                 print(
                     f"  The ROCmFPX family has no type between "
                     f"{4.5:.1f} and {6.5:.1f} bpw, so schemes round to the "
                     f"nearest available and a tier can render outside its own "
                     f"band. Skipping rather than shipping a mislabelled file.",
                     flush=True,
+                )
+                _record_refusal(
+                    rocmfpx_out_dir,
+                    tier=tier,
+                    family="rocmfpx",
+                    reason=refusal_reason,
+                    predicted_gib=pred_gib,
+                    baseline_gib=base_gib,
+                    predicted_band=pred_tier,
+                    claimed_band=tier,
                 )
                 return None
         except Exception as exc:  # noqa: BLE001 -- advisory, never blocks a valid build
@@ -880,6 +1001,8 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
         print(f"Warning: {spec} quantize failed (exit {rc})", flush=True)
         return None
     print(f"  {out_path.name} ({out_path.stat().st_size / 1e9:.1f} GB)", flush=True)
+    # This tier built, so a refusal an earlier run recorded for it is stale.
+    _clear_refusal(rocmfpx_out_dir, tier=tier, family="rocmfpx")
     return out_path
 
 
