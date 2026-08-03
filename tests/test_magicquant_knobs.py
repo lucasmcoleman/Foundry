@@ -360,7 +360,12 @@ def test_magicquant_build_config_new_knobs_default():
         out_abs_str="/o", generations=5, population_size=10,
         target_base_quant="IQ4_NL", tiers_json="{}", model_name="m",
     )
-    assert cfg["use_imatrix"] is False
+    # Defaults ON since 4b14e6c: the bundled calibration corpus went from
+    # 13 KB English-only (~5 chunks) to ~1 MB across 18 languages plus code
+    # and math, verified disjoint from the perplexity eval corpus, with
+    # capture bounded to 200 chunks. Weighted quantization beats unweighted
+    # once the calibration is sound. imatrix_corpus stays None = bundled.
+    assert cfg["use_imatrix"] is True
     assert cfg["imatrix_corpus"] is None
     assert cfg["enable_kl"] is False
     assert cfg["kl_weight"] == 0.1
@@ -806,7 +811,8 @@ def test_magicquantcfg_new_knob_defaults():
     import app as app_module
 
     c = app_module.MagicQuantCfg()
-    assert c.use_imatrix is False
+    # See the note in test_magicquant_build_config_new_knobs_default.
+    assert c.use_imatrix is True
     assert c.imatrix_corpus is None
     assert c.enable_kl is False
     assert c.kl_weight == 0.1
