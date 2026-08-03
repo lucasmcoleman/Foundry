@@ -34,8 +34,13 @@ import copy
 import math
 
 import pytest
-import torch
-from torch import nn
+
+# torch is part of the heavy ML stack that CI deliberately does not install. A
+# bare `import torch` raised at COLLECTION time, and a collection error aborts
+# the whole pytest run instead of skipping one module -- so this line alone
+# turned every CI run red. Guard it like the importorskip below already does.
+torch = pytest.importorskip("torch")
+nn = torch.nn
 
 peft = pytest.importorskip("peft")
 from peft import LoraConfig, get_peft_model  # noqa: E402

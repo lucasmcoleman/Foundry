@@ -5,8 +5,16 @@ gfx1151/ROCm) lets packed samples attend across boundaries — cross-sample
 contamination, empirically confirmed. resolve_packing must force packing off
 whenever the chosen attention isn't packing-safe.
 """
-import sys, os
+import sys
+
+import pytest, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
+# fast_train_zeroclaw imports torch/transformers at module level, and CI
+# installs neither. Without this guard the import raised during COLLECTION,
+# which aborts the whole run instead of skipping this file.
+pytest.importorskip("torch")
+pytest.importorskip("transformers")
+
 from fast_train_zeroclaw import (
     resolve_attn_implementation, resolve_packing, _PACKING_SAFE_ATTN,
 )
