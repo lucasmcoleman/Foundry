@@ -95,12 +95,32 @@ def parse_mq_spec(spec: str) -> str | None:
     ``mq-q4`` -> ``"Q4"``, ``mq-q6`` -> ``"Q6"``. Case-insensitive. A plain
     preset spec (``rocmfp4-agent``) returns None so the caller routes it to
     the uniform-preset path.
+
+    Two BUDGET forms, for v2 size-target builds:
+
+    - ``mq-budget`` -> ``"BUDGET"``, a sentinel the caller resolves against
+      whichever ``BUDGET-*`` pseudo-tier key(s) are actually present in
+      ``search_results.json`` (see ``_resolve_budget_key``).
+    - ``mq-budget=<KEY>`` -> the literal ``<KEY>``, CASE-EXACT -- budget keys
+      are written by ``magicquant.v2.budget_tier_key`` as e.g.
+      ``"BUDGET-12.5GiB"`` and must be sliced from the ORIGINAL ``spec``
+      argument, not the lowercased comparison copy used for prefix matching,
+      or the "GiB" casing would be mangled into "GIB" and never match what's
+      actually in the file. This is why the budget-key form is handled before
+      the generic ``tier.upper()`` return below (which is correct for every
+      other ``mq-<tier>`` spec, where tiers like "Q4" have no meaningful case).
     """
-    s = spec.strip().lower()
+    original = spec.strip()
+    s = original.lower()
     if not s.startswith("mq-"):
         return None
     tier = s[len("mq-"):]
-    return tier.upper() if tier else None
+    if not tier:
+        return None
+    if tier.startswith("budget="):
+        key = original[len("mq-budget="):]
+        return key if key else None
+    return tier.upper()
 
 
 def translate_scheme(scheme: str) -> str:
@@ -111,6 +131,30 @@ def translate_scheme(scheme: str) -> str:
             f"Known: {sorted(SCHEME_TO_ROCMFPX)}"
         )
     return SCHEME_TO_ROCMFPX[scheme]
+
+
+def _type_bpw(ggml_type: str) -> float:
+    """Bits-per-weight for a rendered ggml/ROCmFPX-family type.
+
+    Derived from ``magicquant.quant.ggml_facts.FORK_TYPES``' block/size facts
+    -- and, for non-fork types, from the scheme registry's own bpw -- rather
+    than a second hand-maintained table. Shared by ``predict_rendered_tier``
+    (per-group) and ``predict_rendered_budget`` (per-tensor); factored out of
+    the former so both use exactly one copy.
+    """
+    from magicquant.quant.ggml_facts import FORK_TYPES
+    from magicquant.quant.schemes import get_scheme_by_name
+
+    fact = FORK_TYPES.get(ggml_type)
+    if fact:
+        return fact["size"] * 8.0 / fact["block"]
+    # Non-fork types keep their registry bpw (BF16/F32 groups pass through).
+    for name, mapped in SCHEME_TO_ROCMFPX.items():
+        if mapped == ggml_type:
+            scheme = get_scheme_by_name(name)
+            if scheme:
+                return float(scheme.bits_per_weight)
+    return 16.0
 
 
 def predict_rendered_tier(config: dict, bf16_gguf: str) -> tuple:
@@ -135,20 +179,6 @@ def predict_rendered_tier(config: dict, bf16_gguf: str) -> tuple:
     """
     from magicquant.gguf.reader import GGUFReader
     from magicquant.gguf.tensor_groups import TensorGroupClassifier
-    from magicquant.quant.ggml_facts import FORK_TYPES
-    from magicquant.quant.schemes import get_scheme_by_name
-
-    def _bpw(ggml_type: str) -> float:
-        fact = FORK_TYPES.get(ggml_type)
-        if fact:
-            return fact["size"] * 8.0 / fact["block"]
-        # Non-fork types keep their registry bpw (BF16/F32 groups pass through).
-        for name, mapped in SCHEME_TO_ROCMFPX.items():
-            if mapped == ggml_type:
-                scheme = get_scheme_by_name(name)
-                if scheme:
-                    return float(scheme.bits_per_weight)
-        return 16.0
 
     reader = GGUFReader(bf16_gguf)
     reader.open()
@@ -172,13 +202,57 @@ def predict_rendered_tier(config: dict, bf16_gguf: str) -> tuple:
         if scheme is None:                     # untouched (norms etc.)
             rendered_bits += count * 32.0
             continue
-        rendered_bits += count * _bpw(translate_scheme(scheme))
+        rendered_bits += count * _type_bpw(translate_scheme(scheme))
 
     predicted_gib = rendered_bits / 8.0 / 2 ** 30
     baseline_gib = total * 16.0 / 8.0 / 2 ** 30
 
     from magicquant.quant.tiers import classify_tier
     return predicted_gib, baseline_gib, classify_tier(predicted_gib, baseline_gib)
+
+
+def predict_rendered_budget(tensor_config: dict, bf16_gguf: str) -> tuple[float, float]:
+    """Per-TENSOR analog of ``predict_rendered_tier``, for a v2 budget
+    allocation (``{tensor_name: scheme}``, not ``{group: scheme}``).
+
+    ``predict_rendered_tier`` is per-group by construction and cannot price a
+    per-tensor map -- a budget allocation can (and typically does) assign two
+    tensors in the same group two different schemes, something a per-group
+    config has no way to represent.
+
+    Sums ``n_elems * bpw(translate_scheme(scheme))`` for each tensor present
+    in ``tensor_config``; a tensor NOT in it (untouched norms etc.) counts as
+    32-bit, the same convention ``predict_rendered_tier`` uses for groups
+    absent from its config.
+
+    Returns ``(predicted_gib, baseline_gib)`` -- no third ``tier`` element,
+    since a budget build claims a GiB target, not a size band, so there is no
+    band to classify into.
+    """
+    from magicquant.gguf.reader import GGUFReader
+
+    reader = GGUFReader(bf16_gguf)
+    reader.open()
+    rendered_bits = 0.0
+    total = 0
+    try:
+        for name in reader.get_tensor_names():
+            info = reader.get_tensor_info(name)
+            count = 1
+            for dim in info["shape"]:
+                count *= dim
+            total += count
+            scheme = tensor_config.get(name)
+            if scheme is None:                 # untouched (norms etc.)
+                rendered_bits += count * 32.0
+                continue
+            rendered_bits += count * _type_bpw(translate_scheme(scheme))
+    finally:
+        reader.close()
+
+    predicted_gib = rendered_bits / 8.0 / 2 ** 30
+    baseline_gib = total * 16.0 / 8.0 / 2 ** 30
+    return predicted_gib, baseline_gib
 
 
 def pick_base_type(config: dict) -> str:
@@ -218,6 +292,36 @@ def build_tensor_type_lines(config: dict, group_patterns: dict) -> list[str]:
         ggml_type = translate_scheme(config[group])
         for pat in patterns:
             lines.append(f"{pat}={ggml_type}")
+    return lines
+
+
+def build_tensor_type_lines_per_tensor(tensor_config: dict) -> list[str]:
+    """Emit ``<anchored-regex>=<TYPE>`` lines for a v2 PER-TENSOR allocation
+    (``{tensor_name: scheme}``, not ``build_tensor_type_lines``'s per-group
+    ``{group: scheme}``).
+
+    The ROCmFPX fork's ``--tensor-type-file`` parser splits each line's
+    tokens on WHITESPACE and matches the pattern with unanchored
+    ``std::regex_search`` -- so every line here must be (a) anchored
+    (``^...$``), so a substring of one tensor's name can't accidentally match
+    another; (b) regex-escaped, so literal ``.`` in a tensor name (e.g.
+    ``blk.0.ffn_up.weight``) doesn't become a wildcard; and (c)
+    whitespace-free, or the fork's split would misparse the line entirely.
+    Tensor names containing whitespace or ``=`` can't be expressed safely at
+    all and are refused loudly rather than silently emitting a line that
+    would corrupt or misparse the type file.
+    """
+    lines: list[str] = []
+    for name, scheme in tensor_config.items():
+        if any(ch.isspace() for ch in name) or "=" in name:
+            raise ValueError(
+                f"Tensor name {name!r} contains whitespace or '=' -- the "
+                f"ROCmFPX fork's --tensor-type-file parser splits lines on "
+                f"whitespace and uses '=' as the pattern/type separator, so "
+                f"this name cannot be expressed as a safe line."
+            )
+        ggml_type = translate_scheme(scheme)
+        lines.append(f"^{re.escape(name)}$={ggml_type}")
     return lines
 
 
@@ -669,7 +773,15 @@ def run(cfg_path: str | None = None) -> None:
     produced = []
     for spec in formats:
         tier = parse_mq_spec(spec)
-        if tier is not None:
+        if tier is not None and (tier == "BUDGET" or tier.startswith("BUDGET-")):
+            # A per-tensor v2 allocation cannot be read as a per-group
+            # config, so BUDGET/BUDGET-* specs get their own quantize path
+            # rather than _quantize_mq_hybrid's per-group one.
+            out_path = _quantize_mq_budget(
+                spec, tier, out_dir, rocmfpx_out_dir, model_name,
+                quantize_bin, bf16_gguf, imatrix, allow_requantize,
+            )
+        elif tier is not None:
             out_path = _quantize_mq_hybrid(
                 spec, tier, out_dir, rocmfpx_out_dir, model_name,
                 quantize_bin, bf16_gguf, imatrix, allow_requantize,
@@ -841,6 +953,75 @@ def _load_mq_tier_config(out_dir: Path, tier: str) -> dict:
     return config
 
 
+def _resolve_budget_key(out_dir: Path, requested: str) -> str:
+    """Resolve an ``mq-budget``/``mq-budget=<KEY>`` spec (``parse_mq_spec``'s
+    ``"BUDGET"`` sentinel or a literal key) against the ``BUDGET-*``
+    pseudo-tier keys actually present in ``search_results.json``.
+
+    ``requested == "BUDGET"`` (bare ``mq-budget``): exactly one ``BUDGET-*``
+    key must be present -- zero or multiple are both a loud error, since
+    silently picking one would build the wrong budget target. An explicit
+    ``requested`` (from ``mq-budget=<KEY>``) must name a key that actually
+    exists.
+    """
+    results_path = out_dir / "magicquant" / "search_results.json"
+    if not results_path.exists():
+        raise FileNotFoundError(
+            f"MagicQuant search_results.json not found at {results_path}. "
+            f"Run the MagicQuant stage with a size-target (budget_gib) "
+            f"search first, or drop the mq-budget format."
+        )
+    data = json.loads(results_path.read_text())
+    tiered = data.get("tiered") or {}
+    budget_keys = sorted(k for k in tiered if k.startswith("BUDGET-"))
+
+    if requested != "BUDGET":
+        if requested in tiered:
+            return requested
+        raise KeyError(
+            f"Budget tier {requested!r} not in search_results.json (available "
+            f"BUDGET-* tiers: {budget_keys or 'none'}). Use one of those, or "
+            f"re-run the MagicQuant budget search."
+        )
+
+    if len(budget_keys) == 1:
+        return budget_keys[0]
+    if not budget_keys:
+        raise FileNotFoundError(
+            f"No BUDGET-* tier found in {results_path} (have: "
+            f"{sorted(tiered)}). Run the MagicQuant stage with a budget_gib "
+            f"size target first, or drop the mq-budget format."
+        )
+    raise ValueError(
+        f"Multiple BUDGET-* tiers in {results_path}: {budget_keys}. Specify "
+        f"which one with mq-budget=<KEY>, e.g. mq-budget={budget_keys[0]}."
+    )
+
+
+def _load_mq_budget_block(out_dir: Path, key: str) -> dict:
+    """Read the full interchange block for a resolved ``BUDGET-*`` pseudo-tier
+    key (written by ``magicquant.v2.interchange.write_interchange_block``).
+
+    Unlike ``_load_mq_tier_config`` (which returns only the per-group
+    ``config`` projection), a budget block also carries the exact per-tensor
+    allocation (``tensor_config``) and the requested size (``budget_bytes``)
+    that ``_quantize_mq_budget`` needs.
+    """
+    results_path = out_dir / "magicquant" / "search_results.json"
+    if not results_path.exists():
+        raise FileNotFoundError(
+            f"MagicQuant search_results.json not found at {results_path}."
+        )
+    data = json.loads(results_path.read_text())
+    tiered = data.get("tiered") or {}
+    if key not in tiered:
+        raise KeyError(
+            f"Budget tier {key!r} not in search_results.json (have: "
+            f"{sorted(tiered)}). Use one of those or re-run the budget search."
+        )
+    return tiered[key]
+
+
 REFUSALS_FILENAME = "_refusals.json"
 
 
@@ -899,7 +1080,9 @@ def _rewrite_refusals(rocmfpx_out_dir: Path, tier: str, family: str,
 
 def _record_refusal(rocmfpx_out_dir: Path, *, tier: str, family: str, reason: str,
                      predicted_gib: float, baseline_gib: float,
-                     predicted_band: str, claimed_band: str) -> None:
+                     predicted_band: str, claimed_band: str,
+                     rule: str = "band",
+                     requested_budget_gib: float | None = None) -> None:
     """Append a build-time refusal to ``<out>/rocmfpx/_refusals.json``.
 
     The "Refusing mq-qN: ..." log line above used to be the ONLY trace of a
@@ -919,8 +1102,16 @@ def _record_refusal(rocmfpx_out_dir: Path, *, tier: str, family: str, reason: st
     Idempotent -- re-running a build replaces this tier's entry rather than
     duplicating it, keyed on (tier, family) since a future non-ROCmFPX family
     could in principle share this file.
+
+    ``rule``/``requested_budget_gib`` are ADDITIVE, for a BUDGET (size-target)
+    refusal: ``rule="budget"`` plus the requested GiB target lets the
+    consumer tell a size-guard refusal from a band-guard one. They are
+    omitted from the record entirely (not written as ``"rule": "band"`` /
+    ``"requested_budget_gib": null``) when left at their defaults, so every
+    existing band-guard caller's record keeps its exact original shape --
+    this is what makes the change additive rather than a schema break.
     """
-    _rewrite_refusals(rocmfpx_out_dir, tier, family, {
+    record = {
         "tier": tier,
         "family": family,
         "reason": reason,
@@ -928,7 +1119,12 @@ def _record_refusal(rocmfpx_out_dir: Path, *, tier: str, family: str, reason: st
         "baseline_gib": baseline_gib,
         "predicted_band": predicted_band,
         "claimed_band": claimed_band,
-    })
+    }
+    if rule != "band":
+        record["rule"] = rule
+    if requested_budget_gib is not None:
+        record["requested_budget_gib"] = requested_budget_gib
+    _rewrite_refusals(rocmfpx_out_dir, tier, family, record)
 
 
 def _clear_refusal(rocmfpx_out_dir: Path, *, tier: str, family: str) -> None:
@@ -1041,6 +1237,132 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
     print(f"  {out_path.name} ({out_path.stat().st_size / 1e9:.1f} GB)", flush=True)
     # This tier built, so a refusal an earlier run recorded for it is stale.
     _clear_refusal(rocmfpx_out_dir, tier=tier, family="rocmfpx")
+    return out_path
+
+
+def _quantize_mq_budget(spec, requested, out_dir, rocmfpx_out_dir, model_name,
+                        quantize_bin, bf16_gguf, imatrix, allow_requantize=False):
+    """Render a v2 per-tensor ``BUDGET-*`` size-target allocation into ROCmFPX
+    types.
+
+    Mirrors ``_quantize_mq_hybrid``'s shape, but the allocation is per-TENSOR
+    (not per-group), so it needs its own line-builder
+    (``build_tensor_type_lines_per_tensor``) and its own size guard: a budget
+    build claims a GiB target, not a Q-tier band, so the guard compares
+    predicted size against ``budget_gib`` within ``BUDGET_TOLERANCE`` (shared
+    with the publish stage's ``decide_budget_build``, so build-time and
+    publish-time can never disagree) instead of checking a band match.
+    """
+    import subprocess
+
+    from core.publish_criteria import BUDGET_TOLERANCE
+
+    try:
+        key = _resolve_budget_key(out_dir, requested)
+        block = _load_mq_budget_block(out_dir, key)
+
+        tensor_config = block.get("tensor_config") or {}
+        config = block.get("config") or {}
+        budget_bytes = block.get("budget_bytes")
+        if not budget_bytes:
+            raise ValueError(
+                f"{key!r} has no 'budget_bytes' in search_results.json"
+            )
+        budget_gib = budget_bytes / 1024 ** 3
+
+        try:
+            from magicquant.gguf.tensor_groups import TensorGroupClassifier
+        except ImportError as e:
+            print(
+                f"Error: mq-budget format {spec!r} needs the magicquant "
+                f"package (pip install -e ../MagicQuant): {e}",
+                flush=True,
+            )
+            return None
+
+        # Prefer the exact per-tensor allocation; fall back to the per-group
+        # projection (config) for a block that has none.
+        if tensor_config:
+            lines = build_tensor_type_lines_per_tensor(tensor_config)
+        elif config:
+            lines = build_tensor_type_lines(config, TensorGroupClassifier.GROUP_PATTERNS)
+        else:
+            raise ValueError(f"{key!r} has neither 'tensor_config' nor 'config'")
+
+        if not config:
+            raise ValueError(f"{key!r} has no 'config' -- cannot pick a base type")
+        base_type = pick_base_type(config)
+        # Fork-binary type validation must cover every scheme that can reach
+        # the fork, not just the per-group ones -- a scheme appearing ONLY in
+        # tensor_config (the common case: a per-tensor allocation routinely
+        # diverges from its own group's config) must not sneak past the probe.
+        required_types = (
+            {base_type}
+            | {translate_scheme(s) for s in config.values()}
+            | {translate_scheme(s) for s in tensor_config.values()}
+        )
+        validate_types_supported(required_types, quantize_bin)
+
+        # A tier name is a size band; a budget build's "name" is a GiB target.
+        # Refuse before spending the quantize if rendering into the sparse
+        # ROCmFPX family predicts a size outside that target's tolerance --
+        # the same check the publish stage repeats after the fact, sharing
+        # BUDGET_TOLERANCE so the two guards can never disagree.
+        try:
+            if tensor_config:
+                pred_gib, base_gib = predict_rendered_budget(tensor_config, bf16_gguf)
+            else:
+                pred_gib, base_gib, _ = predict_rendered_tier(config, bf16_gguf)
+            if pred_gib > budget_gib * (1 + BUDGET_TOLERANCE):
+                refusal_reason = (
+                    f"rendering the {key} allocation into ROCmFPX types "
+                    f"predicts {pred_gib:.2f} GiB against the requested "
+                    f"{budget_gib:.2f} GiB budget (tolerance "
+                    f"{BUDGET_TOLERANCE:.0%}) -- the ROCmFPX family has no "
+                    f"type between 4.5 and 6.5 bpw, so a scheme can round up "
+                    f"past what the allocation intended."
+                )
+                print(f"Refusing {spec}: {refusal_reason}", flush=True)
+                _record_refusal(
+                    rocmfpx_out_dir,
+                    tier=key,
+                    family="rocmfpx",
+                    reason=refusal_reason,
+                    predicted_gib=pred_gib,
+                    baseline_gib=base_gib,
+                    predicted_band="",
+                    claimed_band="",
+                    rule="budget",
+                    requested_budget_gib=budget_gib,
+                )
+                return None
+        except Exception as exc:  # noqa: BLE001 -- advisory, never blocks a valid build
+            print(f"  (budget-size prediction unavailable: {exc})", flush=True)
+    except (FileNotFoundError, KeyError, ValueError, RuntimeError) as e:
+        print(f"Error ({spec}): {e}", flush=True)
+        return None
+
+    rocmfpx_out_dir.mkdir(parents=True, exist_ok=True)
+    type_file = rocmfpx_out_dir / f"_ttf-mq-{key}.txt"
+    type_file.write_text("\n".join(lines) + "\n")
+    out_path = rocmfpx_out_dir / f"{model_name}-ROCMFPX-MQ-{key}.gguf"
+
+    print(f"Quantizing {spec}: budget {key} allocation in ROCmFPX types", flush=True)
+    print(f"  base={base_type}  budget={budget_gib:.2f} GiB  "
+          f"tensors={len(tensor_config) or len(config)}", flush=True)
+
+    cmd = _quantize_cmd_base(quantize_bin, allow_requantize)
+    cmd += ["--tensor-type-file", str(type_file)]
+    if imatrix:
+        cmd += ["--imatrix", imatrix]
+    cmd += [str(bf16_gguf), str(out_path), base_type]
+    rc = subprocess.run(cmd).returncode
+    if rc != 0 or not out_path.exists():
+        print(f"Warning: {spec} quantize failed (exit {rc})", flush=True)
+        return None
+    print(f"  {out_path.name} ({out_path.stat().st_size / 1e9:.1f} GB)", flush=True)
+    # This budget key built, so a refusal an earlier run recorded for it is stale.
+    _clear_refusal(rocmfpx_out_dir, tier=key, family="rocmfpx")
     return out_path
 
 
