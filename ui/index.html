@@ -688,12 +688,12 @@ const S = {
     heretic: { n_trials: 200, n_startup_trials: 60, quantization: 'bnb_4bit', kl_divergence_scale: 1.0, orthogonalize_direction: false, row_normalization: 'none' },
     reap: { compression_ratio: 0.25, prune_method: 'reap', samples_per_category: 512, model_max_length: 2048, dataset_name: 'theblackcat102/evol-codealpaca-v1', seed: 42 },
     qat: { config_source: '', tier: 'Q4', dataset: '', lora_r: 32, lora_alpha: 64.0, epochs: 1.0, max_steps: -1, lr: 0.0002, max_seq_len: 512 },
-    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, iq_schemes: false, seed: null, use_imatrix: false, imatrix_corpus: null, enable_kl: false, kl_weight: 0.1, enable_speed_bench: false, measurement_chunks: null, stream_aware: false, head_aggressive: false, speed_aware: null, speed_metric: 'bytes', speed_weight: null, use_bytes_tps: false, calibration_source: '', write_calibration: false, allow_dequant_source: false },
+    magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '', measured: false, measurement_rounds: 3, rocmfpx_schemes: false, iq_schemes: false, seed: null, use_imatrix: false, imatrix_corpus: null, enable_kl: false, kl_weight: 0.1, enable_speed_bench: false, measurement_chunks: null, stream_aware: false, head_aggressive: false, speed_aware: null, speed_metric: 'bytes', speed_weight: null, use_bytes_tps: false, calibration_source: '', write_calibration: false, allow_dequant_source: false, budget_gib: null },
     rocmfpx: { formats: ['rocmfp4-agent','rocmfp6-agent','rocmfp8-agent'], rocmfpx_hint: '', source_model: '', imatrix: '', allow_requantize: false },
     upload: { repo_id: '', repo_id_auto: true, private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
   mqTiers: ['Q2','Q3','Q4','Q5','Q6','Q8'],
-  rcFormats: ['rocmfp3','rocmfp3-agent','rocmfp4','rocmfp4-agent','rocmfp6','rocmfp6-agent','rocmfp8','rocmfp8-agent','mq-q4','mq-q5','mq-q6'],
+  rcFormats: ['rocmfp3','rocmfp3-agent','rocmfp4','rocmfp4-agent','rocmfp6','rocmfp6-agent','rocmfp8','rocmfp8-agent','mq-q4','mq-q5','mq-q6','mq-budget'],
   hfUsername: '',
 };
 
@@ -1446,6 +1446,7 @@ function renderMagicQuant() {
       <div class="tag-list">${S.mqTiers.map(t=>`<div class="tag ${sel.has(t)?'selected':''}" data-tier="${t}" onclick="toggleTier('${t}')">${t}</div>`).join('')}</div>
       <div class="form-hint">Q8 = near-lossless, Q6 = high quality, Q4 = balanced, Q3 = small, Q2 = smallest</div>
     </div>
+    <div class="form-group">${L('Size Target (GiB)','Run MagicQuant v2\'s budget search: best quality mix under this size instead of the Q4/Q5/Q6 tier ladder. Mutually exclusive with Measured search. Blank = tier ladder.')}<input class="form-input" type="number" step="0.1" data-key="magicquant.budget_gib" value="${c.budget_gib ?? ''}" placeholder="(tier ladder)"></div>
     <div class="form-group">${L('Measured Search','Run the Predict→Measure→Learn loop with real perplexity per candidate instead of the fast prediction-only search. More accurate, much slower (builds & measures candidate GGUFs).')}<label class="toggle"><input type="checkbox" data-key="magicquant.measured" ${c.measured?'checked':''} onchange="S.config.magicquant.measured=this.checked;saveFormState();renderStageContent()"><div class="toggle-track"></div><div class="toggle-thumb"></div></label></div>
     <div class="form-group">${L('Measurement Rounds','Build-measure-learn cycles for measured search. More rounds = better predictor calibration, more compute.')}<input class="form-input" type="number" data-key="magicquant.measurement_rounds" value="${c.measurement_rounds}"></div>
     <div class="form-group">${L('Search Seed','Optional RNG seed for a reproducible search (blank = nondeterministic).')}<input class="form-input" type="number" data-key="magicquant.seed" value="${c.seed ?? ''}"></div>
