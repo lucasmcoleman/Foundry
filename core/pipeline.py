@@ -193,6 +193,12 @@ class MagicQuantConfig:
     # (no safetensors/BF16 release); disclose on the model card. Propagated to
     # MagicQuant via the MAGICQUANT_ALLOW_DEQUANT_SOURCE env var.
     allow_dequant_source: bool = False
+    # Size-target mode: run MagicQuant v2's budget-constrained search instead
+    # of the v1 tier ladder. Units are GiB (v2 computes budget_gb * 1024**3).
+    # Mutually exclusive with `measured` -- v2 verifies with real perplexity
+    # itself, so "measured" would misrepresent what ran (refused in
+    # services.build_config, the single choke point for CLI and UI).
+    budget_gib: Optional[float] = None
 
 
 @dataclass
@@ -1195,6 +1201,7 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         "calibration_source": mc.calibration_source,
         "write_calibration": mc.write_calibration,
         "allow_dequant_source": mc.allow_dequant_source,
+        "budget_gib": mc.budget_gib,
     })
     existing = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.magicquant_dir / "_placeholder.gguf")
@@ -1236,6 +1243,7 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         calibration_source=mc.calibration_source,
         write_calibration=mc.write_calibration,
         allow_dequant_source=mc.allow_dequant_source,
+        budget_gib=mc.budget_gib,
     )
 
     rc = _run_stage_script(
@@ -1586,11 +1594,12 @@ def load_yaml_into_config(config_path: str, cfg: "PipelineConfig") -> "PipelineC
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
-def main(argv: Optional[list[str]] = None) -> int:
-    """Entry point for the `foundry` console script and `python core/pipeline.py`.
+def build_arg_parser() -> "argparse.ArgumentParser":
+    """Construct the pipeline CLI argument parser.
 
-    Parses CLI arguments, builds a PipelineConfig, and either runs a dry-run
-    upload validation or the full pipeline. Returns a process exit code.
+    Factored out of `main()` (mechanical, behavior-preserving extraction) so
+    callers -- tests, other entry points -- can build/parse the CLI surface
+    without running the full pipeline flow.
     """
     import argparse
 
@@ -1627,6 +1636,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                              "with real perplexity instead of prediction-only (slower)")
     parser.add_argument("--magicquant-rounds", type=int, default=3,
                         help="Measurement rounds for --magicquant-measured (default 3)")
+    parser.add_argument("--magicquant-budget-gib", type=float, default=None,
+                        help="Size-target mode: run MagicQuant v2's budget search "
+                             "for the best mix under this many GiB (instead of the "
+                             "Q4/Q5/Q6 tier ladder). Mutually exclusive with "
+                             "--magicquant-measured.")
     parser.add_argument("--magicquant-rocmfpx", action="store_true",
                         help="Let MagicQuant's search also explore AMD-native ROCmFPX fork "
                              "types (needs a ROCmFPX build; output loads only on the fork)")
@@ -1738,6 +1752,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="Per-stage subprocess timeout in seconds (kills a wedged stage)")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip the advisory GPU-memory preflight check")
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """Entry point for the `foundry` console script and `python core/pipeline.py`.
+
+    Parses CLI arguments, builds a PipelineConfig, and either runs a dry-run
+    upload validation or the full pipeline. Returns a process exit code.
+    """
+    parser = build_arg_parser()
     args = parser.parse_args(argv)
 
     cfg = PipelineConfig(output_dir=args.output_dir)
@@ -1778,6 +1802,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.magicquant_measured:
             cfg.magicquant.measured = True
             cfg.magicquant.measurement_rounds = args.magicquant_rounds
+        if args.magicquant_budget_gib is not None:
+            cfg.magicquant.budget_gib = args.magicquant_budget_gib
         if args.magicquant_rocmfpx:
             cfg.magicquant.rocmfpx_schemes = True
         if args.magicquant_iq:
