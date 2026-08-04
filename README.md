@@ -63,6 +63,13 @@ python core/pipeline.py --model "org/model" --qat \
     --qat-dataset data/qat_training.jsonl --qat-tier Q4 \
     --no-export --no-magicquant
 
+# Size target: highest-quality mix that fits under N GiB, instead of the
+# Q4/Q5/Q6 tier ladder. Runs MagicQuant v2's budget-constrained search (exact
+# per-tensor knapsack under a hard byte ceiling, verified against real
+# perplexity) and writes one <Model>-BUDGET-<N>GiB.gguf.
+python core/pipeline.py --model "org/model" --no-export \
+    --magicquant-budget-gib 12
+
 # MagicQuant + Upload
 python scripts/run_magicquant_upload.py
 

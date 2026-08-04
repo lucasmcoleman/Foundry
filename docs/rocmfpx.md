@@ -69,6 +69,33 @@ MagicQuant-optimized quant." Requires the `magicquant` package importable and
 the MagicQuant stage to have run first (it now persists `search_results.json`
 from both its search paths).
 
+### Size-target builds (`mq-budget`)
+
+`mq-budget` renders a **v2 budget build** (`--magicquant-budget-gib`) the same
+way, with two differences that follow from it being per-tensor rather than
+per-group:
+
+- It resolves the single `BUDGET-<N>GiB` pseudo-tier in `search_results.json`.
+  With none present it fails loudly listing what IS there; with more than one,
+  name it explicitly as `mq-budget=BUDGET-<N>GiB`.
+- It prefers the block's exact `tensor_config` and emits **per-tensor**
+  `--tensor-type-file` lines (`^…$`-anchored and regex-escaped: the fork
+  matches with unanchored `regex_search` and tokenizes on whitespace, so an
+  unanchored or unescaped pattern silently matches the wrong tensors). It
+  falls back to the per-group `config` when `tensor_config` is absent.
+
+Output: `<model>-ROCMFPX-MQ-BUDGET-<N>GiB.gguf`. A build predicted to exceed
+the requested budget by more than `BUDGET_TOLERANCE` (2%, imported from
+`core/publish_criteria.py` so build-time and publish-time cannot disagree) is
+refused before quantizing, and the refusal is recorded in
+`<out>/rocmfpx/_refusals.json` with `rule: "budget"` so the model card
+discloses it as a size overshoot rather than a band mismatch.
+
+Caveat worth knowing: the guard prices the **requested** types. The fork
+applies its own `tensor_type_fallback` *after* an explicit per-tensor
+override, so a rendered type can differ from the one asked for and the
+prediction can be optimistic in exactly the case the guard exists to catch.
+
 ## Native ROCmFPX types inside the MagicQuant search
 
 The tighter integration (see MagicQuant): `--magicquant-rocmfpx` lets the
@@ -88,10 +115,18 @@ python core/pipeline.py --model "org/model" \
 ```
 
 Flags: `--rocmfpx`/`--no-rocmfpx` (off by default), `--rocmfpx-formats`
-(accepts both presets and `mq-<tier>` specs),
+(accepts presets, `mq-<tier>` specs, and `mq-budget`),
 `--rocmfpx-source-model`, `--rocmfpx-hint` (point at an existing build instead
 of auto-installing). MagicQuant-side: `--magicquant-measured`
-(+`--magicquant-rounds`), `--magicquant-rocmfpx`.
+(+`--magicquant-rounds`), `--magicquant-rocmfpx`, `--magicquant-budget-gib`.
+
+```bash
+# Size target: best mix under 12 GiB, then the ROCm-native rendering of it.
+python core/pipeline.py --model "org/model" --no-export \
+    --magicquant-budget-gib 12 \
+    --rocmfpx --rocmfpx-source-model /path/to/merged \
+    --rocmfpx-formats mq-budget
+```
 
 ```bash
 # ROCm-optimized version of a MagicQuant-optimized quant:

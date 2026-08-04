@@ -124,6 +124,19 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
    explore AMD-native ROCmFPX fork types per group (needs a ROCmFPX build;
    output loads only on the fork). Persists `search_results.json` from both
    search paths (consumed by QAT and by ROCmFPX's mq-hybrid mode).
+   **Size-target mode** (`--magicquant-budget-gib <N>`, UI: "Size Target (GiB)")
+   runs MagicQuant v2's budget-constrained search instead of the tier ladder:
+   an exact per-tensor knapsack under a hard byte ceiling, verified against
+   real perplexity. It produces ONE file named for the size it was asked for
+   (`<Model>-BUDGET-<N>GiB.gguf`) rather than a band label, and is mutually
+   exclusive with `--magicquant-measured` (v2 verifies for itself; accepting
+   both would misrepresent what ran). The run merges a `BUDGET-<N>GiB`
+   pseudo-tier into `search_results.json` carrying BOTH a per-group projection
+   (so QAT and mq-hybrid consume it unchanged) and the exact per-tensor map.
+   Budget builds are exempt from BAND and DOMINANCE — they claim a size, not a
+   band, and have no siblings — but must land within `BUDGET_TOLERANCE` (2%)
+   of the request, one constant shared by the build-time and publish-time
+   guards so they can never disagree.
    GGUF-only releases (no safetensors/BF16 published) can serve as the source
    via `--magicquant-source-model <file.gguf> --magicquant-dequant-source`
    (UI: MagicQuant card "Quantized GGUF source" toggle) — the output is then
