@@ -17,8 +17,10 @@ import pytest
 
 from core.publish_records import (
     MEASUREMENTS_FILENAME,
+    REFUSALS_FILENAME,
     find_measurements,
     read_measurements,
+    read_refusals,
     write_measurements,
 )
 
@@ -118,3 +120,76 @@ def test_written_json_is_a_sorted_list(tmp_path):
     ])
     data = json.loads((tmp_path / MEASUREMENTS_FILENAME).read_text())
     assert [e["name"] for e in data] == ["a.gguf", "b.gguf"]
+
+
+# ── read_refusals: forwards records INTACT, unlike output/_publish_tiers.py's
+# find_refusals(), which projects a fixed {tier, family, reason} set and
+# silently drops rule/requested_budget_gib/predicted_gib -- the exact bug
+# that made a budget refusal's card closing unreachable on a real run. ──────
+
+REFUSAL_BAND = {
+    "tier": "Q5", "family": "rocmfpx", "rule": "band",
+    "reason": "predicts 14.10 GiB, which is the Q6 band, not Q5.",
+    "predicted_gib": 14.10, "baseline_gib": 11.50,
+    "predicted_band": "Q6", "claimed_band": "Q5",
+}
+# The shape a future budget size-guard would actually write (Task 6): tier is
+# a "BUDGET-<N>GiB" label, not None, and unclaimed band fields are "" not
+# None.
+REFUSAL_BUDGET = {
+    "tier": "BUDGET-100GiB", "family": "magicquant", "rule": "budget",
+    "reason": "predicted to exceed the requested 100 GiB budget by 18.4%.",
+    "requested_budget_gib": 100.0, "predicted_gib": 118.4,
+    "predicted_band": "", "claimed_band": "",
+}
+
+
+def test_read_refusals_forwards_every_field_intact(tmp_path):
+    (tmp_path / REFUSALS_FILENAME).write_text(json.dumps([REFUSAL_BUDGET]))
+    got = read_refusals(tmp_path, family="magicquant")
+    assert len(got) == 1
+    assert got[0] == REFUSAL_BUDGET
+    # The three fields the CRITICAL bug dropped, pinned individually so a
+    # partial-forwarding regression is caught even if the dict-equality
+    # check above were ever loosened.
+    assert got[0]["rule"] == "budget"
+    assert got[0]["requested_budget_gib"] == 100.0
+    assert got[0]["predicted_gib"] == 118.4
+
+
+def test_read_refusals_filters_by_family(tmp_path):
+    (tmp_path / REFUSALS_FILENAME).write_text(
+        json.dumps([REFUSAL_BAND, REFUSAL_BUDGET]))
+    assert [r["tier"] for r in read_refusals(tmp_path, family="rocmfpx")] == ["Q5"]
+    assert [r["tier"] for r in read_refusals(tmp_path, family="magicquant")] == [
+        "BUDGET-100GiB"
+    ]
+
+
+def test_read_refusals_dedupes_by_tier_keeping_first(tmp_path):
+    older = {**REFUSAL_BAND, "reason": "older reason"}
+    newer = {**REFUSAL_BAND, "reason": "newer reason"}
+    (tmp_path / REFUSALS_FILENAME).write_text(json.dumps([older, newer]))
+    got = read_refusals(tmp_path, family="rocmfpx")
+    assert len(got) == 1
+    assert got[0]["reason"] == "older reason"
+
+
+def test_read_refusals_missing_record_reads_as_empty(tmp_path):
+    assert read_refusals(tmp_path / "nope", family="rocmfpx") == []
+
+
+def test_read_refusals_corrupt_record_reads_as_empty(tmp_path):
+    (tmp_path / REFUSALS_FILENAME).write_text("{not json")
+    assert read_refusals(tmp_path, family="rocmfpx") == []
+
+
+def test_read_refusals_wrong_shape_reads_as_empty(tmp_path):
+    (tmp_path / REFUSALS_FILENAME).write_text('{"tier": "Q5"}')  # dict, not list
+    assert read_refusals(tmp_path, family="rocmfpx") == []
+
+
+def test_read_refusals_skips_entries_with_no_tier(tmp_path):
+    (tmp_path / REFUSALS_FILENAME).write_text(json.dumps(
+        [{"family": "rocmfpx", "rule": "band", "reason": "no tier key"}]))
+    assert read_refusals(tmp_path, family="rocmfpx") == []

@@ -24,6 +24,10 @@ from pathlib import Path
 from typing import Optional
 
 MEASUREMENTS_FILENAME = "_measurements.json"
+# Must match core/_rocmfpx_entry.py's REFUSALS_FILENAME -- duplicated as a
+# literal (not imported) because _rocmfpx_entry pulls in the quantize-stage
+# dependency chain, which this module deliberately stays free of.
+REFUSALS_FILENAME = "_refusals.json"
 
 
 def measurements_path(family_dir: Path | str) -> Path:
@@ -120,3 +124,47 @@ def find_measurements(
             if found:
                 return found
     return {}
+
+
+def refusals_path(family_dir: Path | str) -> Path:
+    """Where a family's build-time refusal record lives, e.g. ``<out>/rocmfpx/``."""
+    return Path(family_dir) / REFUSALS_FILENAME
+
+
+def read_refusals(family_dir: Path | str, family: str = "rocmfpx") -> list[dict]:
+    """Load build-time tier refusals for one family, every field INTACT.
+
+    ``output/_publish_tiers.py``'s own ``find_refusals()`` (gitignored,
+    untested -- the exact anti-pattern this module exists to end) reads the
+    same file but then projects a FIXED field set
+    (``{"tier", "family", "reason"}``), silently dropping anything else a
+    record carries. A budget-build refusal needs ``rule``,
+    ``requested_budget_gib``, and ``predicted_gib`` to render as a size
+    overshoot instead of a (false) band-mismatch claim -- those fields never
+    survived that projection, which made the card's ``rule == "budget"``
+    branch unreachable on a real run. This is the tested, drop-in
+    replacement: same dedupe-by-tier and family-filter behavior, but the
+    record a caller gets back is the record that was written.
+
+    Returns ``[]`` when the record is missing, unreadable, or the wrong
+    shape -- a refusal disclosure is advisory, it never blocks a card.
+    """
+    try:
+        data = json.loads(refusals_path(family_dir).read_text())
+    except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    seen: set = set()
+    for r in data:
+        if not isinstance(r, dict):
+            continue
+        if r.get("family", family) != family:
+            continue
+        tier = r.get("tier")
+        if not tier or tier in seen:
+            continue
+        seen.add(tier)
+        out.append(dict(r))
+    return out

@@ -267,6 +267,54 @@ def _find_measured_losses(
     return {}, None
 
 
+def _find_budget_measurement(
+    files_to_upload: list[tuple[Path, str]], budget_gib: float
+) -> Optional[dict]:
+    """Measured PPL/baseline for ONE size-target ("budget") build.
+
+    v2's budget search writes into v1's ``search_results.json`` via Task 1's
+    ``write_interchange_block``: ``tiered[<BUDGET-NGiB key>]`` carries ``ppl``
+    (this build's measured perplexity) and ``baseline_ppl`` (the run's BF16
+    baseline) -- the two fields a budget build's card row needs. This is the
+    ONLY place that PPL may come from: never ``v2_results.json`` or
+    ``frontier.json``, both of which the cleanup stage deletes, so trusting
+    them here would occasionally publish a stale or simply-missing number.
+
+    Reuses ``_find_measured_losses``'s directory-walking: a budget GGUF sits
+    next to ``magicquant/search_results.json`` (or under ``rocmfpx/``, a
+    sibling of the same ``magicquant/`` dir, for a ROCmFPX budget build).
+    Returns ``None`` when the file, or this budget's block within it, is
+    absent -- the caller omits the PPL line entirely rather than guessing.
+    """
+    try:
+        from magicquant.v2 import budget_tier_key
+    except ImportError:  # pragma: no cover - magicquant is an optional extra
+        try:
+            from magicquant.v2.interchange import budget_tier_key
+        except ImportError:
+            return None
+    key = budget_tier_key(budget_gib)
+    for local_path, _ in files_to_upload:
+        parent = local_path.parent
+        if parent.name not in ("magicquant", "rocmfpx"):
+            continue
+        results_path = parent.parent / "magicquant" / "search_results.json"
+        if not results_path.is_file():
+            continue
+        try:
+            import json as _json
+            data = _json.loads(results_path.read_text())
+        except (OSError, ValueError):
+            continue
+        rec = (data.get("tiered") or {}).get(key)
+        if not rec:
+            continue
+        ppl = rec.get("ppl")
+        if isinstance(ppl, (int, float)):
+            return {"ppl": float(ppl), "baseline_ppl": rec.get("baseline_ppl")}
+    return None
+
+
 def _find_rocmfpx_measurements(
     files_to_upload: list[tuple[Path, str]]
 ) -> dict[str, dict]:
@@ -282,6 +330,68 @@ def _find_rocmfpx_measurements(
     except ImportError:  # pragma: no cover - when imported as the `core` package
         from core.publish_records import find_measurements
     return find_measurements(files_to_upload, family="rocmfpx")
+
+
+def _find_refused_tiers(files_to_upload: list[tuple[Path, str]]) -> list[dict]:
+    """Auto-discover build-time tier refusals straight from each family's
+    on-disk ``_refusals.json``, via the shared publish-records module.
+
+    Mirrors ``_find_rocmfpx_measurements``: read the durable record directly
+    rather than trust only whatever a caller's ``HFUploadConfig`` happened to
+    carry. This is what makes the CRITICAL reachability fix real for an
+    actual publish: the one existing producer of ``cfg.refused_tiers``,
+    ``output/_publish_tiers.py``'s ``find_refusals()`` (gitignored,
+    untested), projects a fixed field set and silently drops
+    ``rule``/``requested_budget_gib``/``predicted_gib`` -- reading the record
+    again here, with every field intact via
+    ``core.publish_records.read_refusals``, does not depend on that script
+    ever being fixed.
+    """
+    try:
+        from publish_records import read_refusals
+    except ImportError:  # pragma: no cover - when imported as the `core` package
+        from core.publish_records import read_refusals
+    seen_dirs: set = set()
+    out: list[dict] = []
+    for local_path, _ in files_to_upload:
+        parent = Path(local_path).parent
+        if parent.name not in ("magicquant", "rocmfpx") or parent in seen_dirs:
+            continue
+        seen_dirs.add(parent)
+        out.extend(read_refusals(parent, family=parent.name))
+    return out
+
+
+def _resolve_refused_tiers(
+    cfg: "HFUploadConfig", files_to_upload: list[tuple[Path, str]]
+) -> list[dict]:
+    """The refusals to render, preferring the durable on-disk record.
+
+    ``cfg.refused_tiers`` may already be field-complete (a caller that reads
+    the record correctly, or a test that hand-builds it) or may be the
+    field-impoverished output of the currently-buggy
+    ``output/_publish_tiers.py`` -- which still supplies a NON-empty list
+    when a refusal exists, just missing ``rule``. So a plain "prefer cfg,
+    else auto-discover" would never actually trigger the fix on a real
+    publish: the on-disk read has to win per-entry when it finds a match.
+
+    An on-disk record for a given ``(tier, family)`` REPLACES the
+    corresponding cfg entry rather than being appended alongside a stale
+    duplicate. A cfg entry with no on-disk match (e.g. tests that pass
+    ``files_to_upload=[]`` and supply refusals directly, or a family with no
+    ``_refusals.json`` at all) is kept as-is, so this never drops a
+    disclosure the caller explicitly asked for.
+    """
+    cfg_provided = list(getattr(cfg, "refused_tiers", None) or [])
+    auto = _find_refused_tiers(files_to_upload)
+    if not auto:
+        return cfg_provided
+    auto_keys = {(r.get("tier"), r.get("family")) for r in auto}
+    merged = list(auto)
+    merged.extend(
+        r for r in cfg_provided if (r.get("tier"), r.get("family")) not in auto_keys
+    )
+    return merged
 
 
 def _find_legacy_tier_scheme_note(files_to_upload: list[tuple[Path, str]]) -> str:
@@ -460,6 +570,41 @@ def generate_model_card(
     gguf_sizes_gib: dict[str, float] = {}
     # ROCmFPX numbers come from the publish stage, not the search.
     fpx_measured = _find_rocmfpx_measurements(files_to_upload)
+    # Size-target ("budget") files claim a GiB SIZE via filename, not a
+    # Q-tier band -- detected with the same regex publish-time code uses
+    # (core.publish_criteria.BUDGET_FILE_RE, Task 4). Imported lazily, like
+    # recommend_tier below.
+    #
+    # publish_criteria imports magicquant.quant.tiers at MODULE SCOPE, so the
+    # whole module -- including this bare regex, which needs nothing from
+    # magicquant -- is unimportable in a magicquant-less environment. That
+    # used to fail SILENTLY (BUDGET_FILE_RE = None): a budget file then got no
+    # Size-Target section, no "Size-target build" quant hint, and no log
+    # line, and audit_card_against_repo doesn't catch it either -- the file's
+    # GGUF table row still accounts for it, so nothing looks broken. Falling
+    # back to a LOCAL copy of the same pattern keeps the feature working
+    # instead of quietly disabling it; the warning makes the fallback
+    # traceable rather than invisible.
+    _BUDGET_FILE_RE_FALLBACK = re.compile(r"-BUDGET-([\d.]+)GiB\.gguf$")
+    try:
+        from publish_criteria import BUDGET_FILE_RE
+    except ImportError:
+        try:
+            from core.publish_criteria import BUDGET_FILE_RE
+        except ImportError as e:
+            log(f"  WARNING: could not import core.publish_criteria "
+                f"({type(e).__name__}: {e}) -- using a local fallback copy "
+                f"of BUDGET_FILE_RE so size-target files are still "
+                f"disclosed. If magicquant is expected to be installed here, "
+                f"this warning itself is the bug to chase.", "warn")
+            BUDGET_FILE_RE = _BUDGET_FILE_RE_FALLBACK
+    # (local_path, repo_path, requested_gib, size_bytes) for every budget
+    # file in the upload set, collected as rows render so the dedicated
+    # section below doesn't need a second pass over files_to_upload.
+    # size_bytes is carried along (not re-resolved below) because it is
+    # already known-non-None here -- the "no size available" guard above
+    # already ran and `continue`d before an entry can reach this point.
+    budget_files: list[tuple[Path, str, float, int]] = []
     for local_path, repo_path in files_to_upload:
         if repo_path.endswith(".gguf"):
             has_gguf = True
@@ -481,11 +626,21 @@ def generate_model_card(
                 continue
             size_gb = size_bytes / 1e9
             name = repo_path
+            # A size-target ("budget") file claims a GiB SIZE, not a Q-tier
+            # band -- collected here (row already has a resolved size) for
+            # the dedicated "Size-Target Build" section built after this loop.
+            budget_match = BUDGET_FILE_RE.search(name) if BUDGET_FILE_RE else None
+            if budget_match:
+                budget_files.append(
+                    (local_path, repo_path, float(budget_match.group(1)), size_bytes)
+                )
             # Infer quant tier from filename
             quant_hint = ""
             name_lower = name.lower()
             mq_hybrid_tier = re.search(r"mq-q(\d+)", name_lower)
-            if mq_hybrid_tier:
+            if budget_match:
+                quant_hint = f"Size-target build (~{float(budget_match.group(1)):g} GiB requested)"
+            elif mq_hybrid_tier:
                 # MagicQuant-hybrid ROCmFPX file (_rocmfpx_entry._quantize_mq_hybrid's
                 # "<model>-ROCMFPX-MQ-<tier>.gguf" convention): MagicQuant's
                 # per-group layout re-expressed in ROCmFPX types. There's no
@@ -817,6 +972,42 @@ A tier name here is a **size band**, not a promise that every tensor uses that
 exact type. A "Q5" is whatever mix of schemes landed in the Q5 size band with
 the lowest measured perplexity loss -- which is the point of the search.""")
 
+    # Size-target ("budget") builds: v2's alternative to a named Q-tier band
+    # -- allocate bytes per-tensor to hit a REQUESTED SIZE directly, rather
+    # than search for the best quality within a fixed band. One subsection
+    # per budget file, so a repo carrying several budget points (or one
+    # alongside the Q4/Q5/Q6 ladder) discloses each on its own terms.
+    for local_path, repo_path, requested_gib, size_bytes in budget_files:
+        # size_bytes is guaranteed non-None here -- see the comment where
+        # budget_files is built above. No "unknown size" case to handle.
+        achieved = f"{size_bytes / 2 ** 30:.2f} GiB"
+        meas = _find_budget_measurement(files_to_upload, requested_gib)
+        ppl_line = ""
+        if meas is not None and isinstance(meas.get("ppl"), (int, float)):
+            ppl = meas["ppl"]
+            baseline = meas.get("baseline_ppl")
+            if isinstance(baseline, (int, float)) and baseline:
+                delta = (ppl / baseline - 1) * 100
+                ppl_line = (f"\n- **Measured perplexity:** {ppl:.4f} "
+                            f"({delta:+.2f}% vs BF16 baseline {baseline:.4f})")
+            else:
+                ppl_line = f"\n- **Measured perplexity:** {ppl:.4f}"
+        # No interchange block (prediction-only run, or search_results.json
+        # not found) -- the PPL line is simply absent. Never fabricate a
+        # number, and never fall back to v2_results.json/frontier.json,
+        # which the cleanup stage deletes.
+        body_sections.append(
+            f"""## Size-Target Build: `{repo_path}`
+
+`{repo_path}` targets a **requested size** directly instead of a named
+Q4/Q5/Q6 band -- MagicQuant's v2 search allocates quantization per-tensor to
+fit the budget, rather than searching for the best quality within a fixed
+band.
+
+- **Requested budget:** {requested_gib:g} GiB
+- **Achieved size:** {achieved}{ppl_line}"""
+        )
+
     # Explain any gap in the ladder, rather than leaving a hole for people to
     # wonder about.
     if getattr(cfg, "dropped_tiers", None):
@@ -898,19 +1089,83 @@ the lowest measured perplexity loss -- which is the point of the search.""")
     # Tiers the pipeline REFUSED to build at all (distinct from built-then-
     # rejected above). Without this, a repo carrying an older file for that
     # tier reads as though a fresh one is simply pending.
-    if getattr(cfg, "refused_tiers", None):
-        rows = [f"- **{r.get('tier', '?')}** -- {r.get('reason', '')}"
-                for r in cfg.refused_tiers]
+    #
+    # One entry shape is NOT a tier refusal: a budget build's build-time size
+    # guard (rule == "budget", carrying requested_budget_gib + predicted_gib,
+    # with the band fields empty -- the _refusals.json record a future
+    # size-prediction guard would write). That is a SIZE OVERSHOOT against a
+    # requested GiB figure, never a claim about landing in the wrong Q-tier
+    # band, so it must never be rendered with the "would land in band X"
+    # prose the tier-refusal branch below uses -- the phrasing decision lives
+    # HERE (core/hf_upload.py, tracked), not in output/_publish_tiers.py,
+    # which is exactly the untested-and-gitignored path that shipped the
+    # 2026-08 model-card bugs.
+    refused_tiers = _resolve_refused_tiers(cfg, files_to_upload)
+    if refused_tiers:
+        rows = []
+        for r in refused_tiers:
+            if r.get("rule") == "budget":
+                requested = r.get("requested_budget_gib")
+                predicted = r.get("predicted_gib")
+                label = r.get("tier") or (
+                    f"{requested:g} GiB budget" if requested is not None
+                    else "budget build")
+                if requested is not None and predicted is not None:
+                    overshoot = predicted / requested - 1.0
+                    detail = (
+                        f"predicted to render at {predicted:.2f} GiB, which "
+                        f"exceeds the requested {requested:g} GiB budget by "
+                        f"{overshoot:.1%} -- a size overshoot, so it was not "
+                        f"built.")
+                else:
+                    detail = (r.get("reason")
+                              or "predicted to exceed the requested size "
+                                 "budget, so it was not built.")
+                rows.append(f"- **{label}** -- {detail}")
+            else:
+                rows.append(f"- **{r.get('tier', '?')}** -- {r.get('reason', '')}")
+        refused_rules = {r.get("rule") for r in refused_tiers}
+        if refused_rules == {"budget"}:
+            closing = (
+                "\n\nThese were predicted, before building, to miss their "
+                "requested size -- a size overshoot against the GiB figure "
+                "requested, not a scheme-rounding gap in a Q-tier band -- so "
+                "nothing was built for them. A later run with different "
+                "search settings may fit within tolerance; ask and I'll retry."
+            )
+        elif "budget" not in refused_rules:
+            closing = (
+                "\n\nThese were not built at all. This is a property of how "
+                "the schemes round into the ROCmFPX type ladder for this "
+                "particular model, not a temporary gap, so a file for them "
+                "will not appear in a later build either."
+                + ("  Any file for them currently in this repo therefore "
+                   "comes from an earlier run -- see below."
+                   if getattr(cfg, "carried_over", None) else "")
+            )
+        else:
+            # A mix of budget (size-overshoot) and non-budget (permanent
+            # scheme-rounding gap) refusals in the same list. Either
+            # single-rule closing above asserts something false for the
+            # OTHER kind: the permanence claim is false for a budget entry
+            # (a differently-tuned search might still hit the target), and
+            # the "may fit within tolerance" claim is false for a genuine
+            # band refusal (rebuilding changes nothing about how the schemes
+            # round). Same reasoning as the mixed-rule fallback for
+            # dropped_tiers above -- state only what holds for every row and
+            # point to the per-row detail for the rest.
+            closing = (
+                "\n\nThese were not built for different reasons -- see the "
+                "note on each line above. Some are permanent for this model "
+                "(a scheme-rounding gap that recurs on any rebuild); others "
+                "are a size overshoot against a requested budget, which a "
+                "differently-tuned search might clear. Ask and I'll look at "
+                "rebuilding any of them."
+            )
         body_sections.append(
             "## Tiers this build does not produce\n\n"
             + "\n".join(rows)
-            + "\n\nThese were not built at all. This is a property of how the "
-            "schemes round into the ROCmFPX type ladder for this particular "
-            "model, not a temporary gap, so a file for them will not appear "
-            "in a later build either."
-            + ("  Any file for them currently in this repo therefore comes "
-               "from an earlier run -- see below."
-               if getattr(cfg, "carried_over", None) else "")
+            + closing
         )
 
     # Files that predate this run. The uploader adds and never reconciles, so
