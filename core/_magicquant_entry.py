@@ -399,6 +399,11 @@ def _run_budget(cfg: dict, source: str, llamacpp) -> str:
 
     final = Path(results["final_model"])
     target = final.parent / f"{cfg['model_name']}-{budget_tier_key(budget_gib)}.gguf"
+    # KNOWN DESYNC: run_budget_search() already wrote v2_results.json with
+    # "final_model" pointing at `final`'s pre-rename path; this rename makes
+    # that key stale (points at a now-nonexistent file). Nothing in Foundry
+    # reads v2_results.json's final_model back (checked), so left as-is --
+    # noted here rather than restructured.
     final.rename(target)
     print(f"  budget build: {target.name} "
           f"({target.stat().st_size / 1024**3:.2f} GiB)", flush=True)
@@ -505,8 +510,10 @@ def run(cfg_path: str | None = None) -> None:
             flush=True,
         )
 
-    if cfg.get("budget_gib"):
+    if cfg.get("budget_gib") is not None:
         # Size-target mode: v2 budget search instead of the v1 tier ladder.
+        # `is not None` (not truthiness) -- budget_gib=0.0 must route to v2's
+        # infeasibility error, not silently fall through to the v1 ladder.
         # `source`/`llamacpp` are the same resolved values the v1 branch
         # below uses -- resolve_source(), the safetensors->BF16 conversion,
         # and mmproj export above all apply identically to budget runs.
