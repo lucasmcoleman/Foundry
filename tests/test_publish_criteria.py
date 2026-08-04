@@ -19,6 +19,8 @@ favor is still noise below the floor, not a verdict.
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
 
 from publish_criteria import (
@@ -466,3 +468,50 @@ def test_recommendation_never_picks_a_larger_tier_over_a_tied_smaller_one():
         {"tier": "Q6", "gib": 20.0, "loss": 0.0019},
     ])
     assert r["tier"] == "Q4", "all three within the floor -> smallest wins"
+
+
+# --- budget builds -----------------------------------------------------------
+from core.publish_criteria import (BUDGET_FILE_RE, BUDGET_TOLERANCE,
+                                   decide_budget_build, decide_rocmfpx_budget)
+
+
+def test_budget_tolerance_value_pinned():
+    assert BUDGET_TOLERANCE == 0.02
+
+
+def test_budget_file_regex_extracts_the_number():
+    m = BUDGET_FILE_RE.search("Model-BUDGET-12.5GiB.gguf")
+    assert m and m.group(1) == "12.5"
+    assert not BUDGET_FILE_RE.search("Model-Q4_K_M.gguf")
+
+
+def test_budget_build_ships_under_budget():
+    d = decide_budget_build(name="M-BUDGET-100GiB.gguf",
+                            actual_gib=99.0, budget_gib=100.0)
+    assert d["ship"] is True and d["rule"] == "budget"
+
+
+def test_budget_build_ships_inside_tolerance():
+    d = decide_budget_build(name="M-BUDGET-100GiB.gguf",
+                            actual_gib=101.9, budget_gib=100.0)
+    assert d["ship"] is True
+
+
+def test_budget_build_refused_beyond_tolerance_names_uncounted_bytes():
+    d = decide_budget_build(name="M-BUDGET-100GiB.gguf",
+                            actual_gib=102.1, budget_gib=100.0)
+    assert d["ship"] is False
+    assert "uncounted" in d["reason"]
+    assert d["overshoot_frac"] == pytest.approx(0.021, abs=1e-4)
+
+
+def test_rocmfpx_budget_speed_rule_ships_only_when_faster():
+    assert decide_rocmfpx_budget(fx_tg=12.0, mq_tg=10.0)["ship"] is True
+    slow = decide_rocmfpx_budget(fx_tg=10.0, mq_tg=10.0)
+    assert slow["ship"] is False and slow["rule"] == "speed"
+    assert "tok/s" in slow["reason"] or "faster" in slow["reason"]
+
+
+def test_rocmfpx_budget_missing_measurement_refuses_and_says_which():
+    d = decide_rocmfpx_budget(fx_tg=None, mq_tg=10.0)
+    assert d["ship"] is False and "measure" in d["reason"].lower()
