@@ -266,6 +266,7 @@ class MagicQuantCfg(BaseModel):
     calibration_source: str = ""     # path to a noise_calibration.json to load (both search paths)
     write_calibration: bool = False  # measured-search only: emit <output>/noise_calibration.json from this run
     allow_dequant_source: bool = False  # dequant already-quantized GGUF source (double-quantization opt-in)
+    budget_gib: Optional[float] = None  # size-target mode: v2 budget search under this many GiB; None = tier ladder
 
 class QATCfg(BaseModel):
     """QAT-LoRA stage config.
@@ -1051,6 +1052,7 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         "calibration_source": mc.calibration_source,
         "write_calibration": mc.write_calibration,
         "allow_dequant_source": mc.allow_dequant_source,
+        "budget_gib": mc.budget_gib,
     })
     existing_ggufs = sorted(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
     mq_key = existing_ggufs[0] if existing_ggufs else (mq_dir / "_placeholder.gguf")
@@ -1102,6 +1104,7 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         calibration_source=mc.calibration_source,
         write_calibration=mc.write_calibration,
         allow_dequant_source=mc.allow_dequant_source,
+        budget_gib=mc.budget_gib,
     )
     rc = await run_script(script, out)
     ok = rc == 0
