@@ -331,6 +331,85 @@ def _maybe_generate_mmproj(llamacpp_dir: str, source: str, out_dir: Path,
         print(f"mmproj generation error: {exc}; text quants still valid", flush=True)
 
 
+# v1 config keys that have no meaning under the v2 budget search. Listed
+# explicitly so a user who set one sees it acknowledged, not swallowed.
+_BUDGET_IGNORED_KEYS = (
+    "generations", "population_size", "target_base_quant", "measured",
+    "measurement_rounds", "iq_schemes", "seed", "enable_kl", "kl_weight",
+    "enable_speed_bench", "stream_aware", "head_aggressive", "speed_aware",
+    "speed_metric", "speed_weight", "use_bytes_tps", "calibration_source",
+    "write_calibration", "tiers_json", "verify",
+)
+
+_BUDGET_KEY_DEFAULTS = {
+    "generations": 50, "population_size": 100, "measurement_rounds": 3,
+    "target_base_quant": "MXFP4_MOE", "kl_weight": 0.1,
+    "speed_metric": "bytes", "tiers_json": '["Q4","Q5","Q6"]',
+}
+
+
+def _run_budget(cfg: dict, source: str, llamacpp) -> str:
+    """Size-target mode: MagicQuant v2 budget search instead of the tier
+    ladder. `source` and `llamacpp` are the RESOLVED values from run()'s
+    shared preamble (source priority + safetensors->BF16 conversion + mmproj
+    export all apply to budget runs identically). Returns the renamed output
+    GGUF path (publish naming)."""
+    from magicquant.v2 import (BudgetInfeasibleError, V2Config,
+                               budget_tier_key, run_budget_search)
+
+    budget_gib = float(cfg["budget_gib"])
+    for key in _BUDGET_IGNORED_KEYS:
+        val = cfg.get(key)
+        default = _BUDGET_KEY_DEFAULTS.get(key)
+        if val not in (None, False, "", default):
+            print(f"  note: {key}={val!r} is ignored under "
+                  f"--magicquant-budget-gib (v2 search)", flush=True)
+
+    out_dir = Path(cfg["out_abs_str"]) / "magicquant"
+    v2cfg = V2Config(
+        source_model_path=source,
+        output_dir=str(out_dir),
+        budget_gb=budget_gib,
+        llamacpp_path=llamacpp or None,
+        use_imatrix=cfg.get("use_imatrix", True),
+        imatrix_corpus=cfg.get("imatrix_corpus"),
+        measurement_chunks=cfg.get("measurement_chunks"),
+        enable_rocmfpx=cfg.get("rocmfpx_schemes", False),
+        model_name=cfg["model_name"],
+    )
+    try:
+        results = run_budget_search(v2cfg)
+    except BudgetInfeasibleError as e:
+        print(
+            f"Error: budget {e.budget_bytes / 1024**3:.2f} GiB is below the "
+            f"floor; minimum achievable with the enabled schemes is "
+            f"{e.min_bytes / 1024**3:.2f} GiB. Raise --magicquant-budget-gib.",
+            flush=True,
+        )
+        sys.exit(1)
+
+    if not results.get("final_model"):
+        print(
+            "Error: v2 budget search produced no final model (the budget "
+            "anchor's build or measurement failed; a neighbor anchor may have "
+            f"succeeded). See {out_dir / 'v2_results.json'} -> 'failures'.",
+            flush=True,
+        )
+        sys.exit(1)
+
+    final = Path(results["final_model"])
+    target = final.parent / f"{cfg['model_name']}-{budget_tier_key(budget_gib)}.gguf"
+    # KNOWN DESYNC: run_budget_search() already wrote v2_results.json with
+    # "final_model" pointing at `final`'s pre-rename path; this rename makes
+    # that key stale (points at a now-nonexistent file). Nothing in Foundry
+    # reads v2_results.json's final_model back (checked), so left as-is --
+    # noted here rather than restructured.
+    final.rename(target)
+    print(f"  budget build: {target.name} "
+          f"({target.stat().st_size / 1024**3:.2f} GiB)", flush=True)
+    return str(target)
+
+
 def run(cfg_path: str | None = None) -> None:
     if cfg_path is None:
         cfg_path = sys.argv[1]
@@ -431,112 +510,121 @@ def run(cfg_path: str | None = None) -> None:
             flush=True,
         )
 
-    orch = MagicQuantOrchestrator(
-        source_model_path=source,
-        output_dir=str(out_dir / "magicquant"),
-        llamacpp_path=llamacpp,
-    )
-
-    generations = cfg["generations"]
-    population_size = cfg["population_size"]
-    target_base_quant = cfg["target_base_quant"]
-    measured = cfg.get("measured", False)
-    enable_rocmfpx = cfg.get("rocmfpx_schemes", False)
-    enable_iq = cfg.get("iq_schemes", False)
-    mode = "measured (Predict->Measure->Learn)" if measured else "prediction-only"
-    print(
-        f"Search [{mode}]: generations={generations}, "
-        f"population={population_size}, base={target_base_quant}, "
-        f"rocmfpx_schemes={enable_rocmfpx}, iq_schemes={enable_iq}",
-        flush=True,
-    )
-
-    use_imatrix = cfg.get("use_imatrix", False)
-    imatrix_corpus = cfg.get("imatrix_corpus") or None
-    measurement_chunks = cfg.get("measurement_chunks")
-    stream_aware = cfg.get("stream_aware", False)
-    head_aggressive = cfg.get("head_aggressive", False)
-    # speed_weight/use_bytes_tps/calibration_source: tunable SEARCH objective,
-    # accepted by both run_measured_search and run_full_search. speed_aware/
-    # speed_metric/write_calibration are measured-search-only (see their
-    # docstrings) -- forwarded only in the `measured` branch below, never to
-    # run_full_search (which has no such params).
-    speed_weight = cfg.get("speed_weight")
-    use_bytes_tps = cfg.get("use_bytes_tps", False)
-    calibration_source = cfg.get("calibration_source", "")
-
-    if measured:
-        # speed_aware: absent/null in cfg means "no explicit Foundry choice"
-        # (see MagicQuantService.build_config's speed_aware docstring) -- the
-        # kwarg is omitted entirely in that case so
-        # run_measured_search's OWN default (True, the 2026-07 fix) actually
-        # takes effect, instead of a stray explicit False (the old bug: cfg.
-        # get("speed_aware", False) always produced a concrete False, since
-        # the key was always present, permanently overriding the library
-        # default no matter what it was set to). An explicit True/False in
-        # cfg (a real user/CLI choice) is still forwarded and still wins.
-        measured_kwargs = dict(
-            target_base_quant=target_base_quant,
-            search_generations=generations,
-            population_size=population_size,
-            measurement_rounds=cfg.get("measurement_rounds", 3),
-            verbose=True,
-            enable_rocmfpx=enable_rocmfpx,
-            enable_iq=enable_iq,
-            seed=cfg.get("seed"),
-            use_imatrix=use_imatrix,
-            imatrix_corpus=imatrix_corpus,
-            enable_kl=cfg.get("enable_kl", False),
-            kl_weight=cfg.get("kl_weight", 0.1),
-            enable_speed_bench=cfg.get("enable_speed_bench", False),
-            measurement_chunks=measurement_chunks,
-            stream_aware=stream_aware,
-            head_aggressive=head_aggressive,
-            speed_metric=cfg.get("speed_metric", "bytes"),
-            speed_weight=speed_weight,
-            use_bytes_tps=use_bytes_tps,
-            write_calibration=cfg.get("write_calibration", False),
-            calibration_source=calibration_source,
-        )
-        cfg_speed_aware = cfg.get("speed_aware")
-        if cfg_speed_aware is not None:
-            measured_kwargs["speed_aware"] = cfg_speed_aware
-        best_configs, tiered = orch.run_measured_search(**measured_kwargs)
+    if cfg.get("budget_gib") is not None:
+        # Size-target mode: v2 budget search instead of the v1 tier ladder.
+        # `is not None` (not truthiness) -- budget_gib=0.0 must route to v2's
+        # infeasibility error, not silently fall through to the v1 ladder.
+        # `source`/`llamacpp` are the same resolved values the v1 branch
+        # below uses -- resolve_source(), the safetensors->BF16 conversion,
+        # and mmproj export above all apply identically to budget runs.
+        valid = [_run_budget(cfg, source, llamacpp)]
     else:
-        best_configs, tiered = orch.run_full_search(
-            target_base_quant=target_base_quant,
-            max_generations=generations,
-            population_size=population_size,
-            verbose=True,
-            enable_rocmfpx=enable_rocmfpx,
-            enable_iq=enable_iq,
-            seed=cfg.get("seed"),
-            use_imatrix=use_imatrix,
-            imatrix_corpus=imatrix_corpus,
-            measurement_chunks=measurement_chunks,
-            stream_aware=stream_aware,
-            head_aggressive=head_aggressive,
-            speed_weight=speed_weight,
-            use_bytes_tps=use_bytes_tps,
-            calibration_source=calibration_source,
+        orch = MagicQuantOrchestrator(
+            source_model_path=source,
+            output_dir=str(out_dir / "magicquant"),
+            llamacpp_path=llamacpp,
         )
-    if not tiered:
-        print("Error: no viable configurations found", flush=True)
-        sys.exit(1)
-    print(f"Tiers found: {list(tiered.keys())}", flush=True)
 
-    tiers = json.loads(cfg["tiers_json"])
-    paths = orch.generate_tiered_models(
-        tiered=tiered,
-        model_name_prefix=cfg["model_name"],
-        tiers=tiers,
-        verify=cfg["verify"],
-    )
-    valid = [p for p in paths if p]
-    for p in valid:
-        size = os.path.getsize(p) / 1e9
-        print(f"  {Path(p).name} ({size:.1f} GB)", flush=True)
-    print(f"Generated {len(valid)} hybrid GGUF files", flush=True)
+        generations = cfg["generations"]
+        population_size = cfg["population_size"]
+        target_base_quant = cfg["target_base_quant"]
+        measured = cfg.get("measured", False)
+        enable_rocmfpx = cfg.get("rocmfpx_schemes", False)
+        enable_iq = cfg.get("iq_schemes", False)
+        mode = "measured (Predict->Measure->Learn)" if measured else "prediction-only"
+        print(
+            f"Search [{mode}]: generations={generations}, "
+            f"population={population_size}, base={target_base_quant}, "
+            f"rocmfpx_schemes={enable_rocmfpx}, iq_schemes={enable_iq}",
+            flush=True,
+        )
+
+        use_imatrix = cfg.get("use_imatrix", False)
+        imatrix_corpus = cfg.get("imatrix_corpus") or None
+        measurement_chunks = cfg.get("measurement_chunks")
+        stream_aware = cfg.get("stream_aware", False)
+        head_aggressive = cfg.get("head_aggressive", False)
+        # speed_weight/use_bytes_tps/calibration_source: tunable SEARCH objective,
+        # accepted by both run_measured_search and run_full_search. speed_aware/
+        # speed_metric/write_calibration are measured-search-only (see their
+        # docstrings) -- forwarded only in the `measured` branch below, never to
+        # run_full_search (which has no such params).
+        speed_weight = cfg.get("speed_weight")
+        use_bytes_tps = cfg.get("use_bytes_tps", False)
+        calibration_source = cfg.get("calibration_source", "")
+
+        if measured:
+            # speed_aware: absent/null in cfg means "no explicit Foundry choice"
+            # (see MagicQuantService.build_config's speed_aware docstring) -- the
+            # kwarg is omitted entirely in that case so
+            # run_measured_search's OWN default (True, the 2026-07 fix) actually
+            # takes effect, instead of a stray explicit False (the old bug: cfg.
+            # get("speed_aware", False) always produced a concrete False, since
+            # the key was always present, permanently overriding the library
+            # default no matter what it was set to). An explicit True/False in
+            # cfg (a real user/CLI choice) is still forwarded and still wins.
+            measured_kwargs = dict(
+                target_base_quant=target_base_quant,
+                search_generations=generations,
+                population_size=population_size,
+                measurement_rounds=cfg.get("measurement_rounds", 3),
+                verbose=True,
+                enable_rocmfpx=enable_rocmfpx,
+                enable_iq=enable_iq,
+                seed=cfg.get("seed"),
+                use_imatrix=use_imatrix,
+                imatrix_corpus=imatrix_corpus,
+                enable_kl=cfg.get("enable_kl", False),
+                kl_weight=cfg.get("kl_weight", 0.1),
+                enable_speed_bench=cfg.get("enable_speed_bench", False),
+                measurement_chunks=measurement_chunks,
+                stream_aware=stream_aware,
+                head_aggressive=head_aggressive,
+                speed_metric=cfg.get("speed_metric", "bytes"),
+                speed_weight=speed_weight,
+                use_bytes_tps=use_bytes_tps,
+                write_calibration=cfg.get("write_calibration", False),
+                calibration_source=calibration_source,
+            )
+            cfg_speed_aware = cfg.get("speed_aware")
+            if cfg_speed_aware is not None:
+                measured_kwargs["speed_aware"] = cfg_speed_aware
+            best_configs, tiered = orch.run_measured_search(**measured_kwargs)
+        else:
+            best_configs, tiered = orch.run_full_search(
+                target_base_quant=target_base_quant,
+                max_generations=generations,
+                population_size=population_size,
+                verbose=True,
+                enable_rocmfpx=enable_rocmfpx,
+                enable_iq=enable_iq,
+                seed=cfg.get("seed"),
+                use_imatrix=use_imatrix,
+                imatrix_corpus=imatrix_corpus,
+                measurement_chunks=measurement_chunks,
+                stream_aware=stream_aware,
+                head_aggressive=head_aggressive,
+                speed_weight=speed_weight,
+                use_bytes_tps=use_bytes_tps,
+                calibration_source=calibration_source,
+            )
+        if not tiered:
+            print("Error: no viable configurations found", flush=True)
+            sys.exit(1)
+        print(f"Tiers found: {list(tiered.keys())}", flush=True)
+
+        tiers = json.loads(cfg["tiers_json"])
+        paths = orch.generate_tiered_models(
+            tiered=tiered,
+            model_name_prefix=cfg["model_name"],
+            tiers=tiers,
+            verify=cfg["verify"],
+        )
+        valid = [p for p in paths if p]
+        for p in valid:
+            size = os.path.getsize(p) / 1e9
+            print(f"  {Path(p).name} ({size:.1f} GB)", flush=True)
+        print(f"Generated {len(valid)} hybrid GGUF files", flush=True)
 
     # Post-generation PPL smoke gate: a cheap, automatic sanity check the
     # pipeline itself lacked before this change -- the qwen3_5 garbage-quant
