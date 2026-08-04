@@ -51,6 +51,14 @@ def _cfg(**overrides):
     return HFUploadConfig(**base)
 
 
+def _bullet_lines(section: str) -> list:
+    """The "- **tier** -- reason" bullet lines of a refusal/drop section,
+    excluding the closing paragraph -- which legitimately uses words like
+    "band" to explain what a budget refusal ISN'T, so checks that must never
+    see "band" belong on the bullet, not the whole section."""
+    return [l for l in section.strip().splitlines() if l.startswith("- **")]
+
+
 def _write_interchange_block(out_dir: Path, key: str, ppl: float, baseline_ppl: float):
     """Hand-built fixture matching Task 1's write_interchange_block shape
     (magicquant.v2.interchange) -- built locally rather than imported, since
@@ -85,9 +93,14 @@ def test_budget_file_gets_size_target_section(tmp_path):
     card = generate_model_card(_cfg(), [(p, "Model-BUDGET-100GiB.gguf")])
 
     assert "## Size-Target Build" in card
-    assert "Model-BUDGET-100GiB.gguf" in card
-    assert "100 GiB" in card                # requested figure, from the filename
-    assert "96.00 GiB" in card              # achieved size, from real file bytes
+    # "100 GiB"/"96.00 GiB" also appear in the GGUF table's quant-hint cell
+    # ("Size-target build (~100 GiB requested)"), so checking the whole card
+    # would pass even with the section's own bullets deleted. Isolate the
+    # section itself, the way the refusal tests below correctly do.
+    section = card.split("## Size-Target Build", 1)[1].split("\n## ", 1)[0]
+    assert "Model-BUDGET-100GiB.gguf" in section
+    assert "100 GiB" in section             # requested figure, from the filename
+    assert "96.00 GiB" in section           # achieved size, from real file bytes
 
 
 # ── PPL sourcing: interchange block ONLY, never fabricated ─────────────────
@@ -134,9 +147,10 @@ def test_budget_ppl_row_omitted_when_no_records(tmp_path):
     card = generate_model_card(_cfg(), [(p, "Model-BUDGET-100GiB.gguf")])
 
     assert "## Size-Target Build" in card    # section still renders...
-    assert "100 GiB" in card
-    assert "96.00 GiB" in card
-    assert "Measured perplexity" not in card  # ...just without a PPL line
+    section = card.split("## Size-Target Build", 1)[1].split("\n## ", 1)[0]
+    assert "100 GiB" in section
+    assert "96.00 GiB" in section
+    assert "Measured perplexity" not in section  # ...just without a PPL line
 
 
 # ── audit_card_against_repo: existing filename-mention rule ────────────────
@@ -214,3 +228,125 @@ def test_budget_refusal_without_gib_fields_falls_back_without_band_prose():
     section = section.split("\n## ", 1)[0]
     assert "would land in" not in section.lower()
     assert "budget" in section.lower()
+
+
+def test_budget_refusal_shipped_shape_renders_size_overshoot():
+    """Minor 2: the sparse fixtures above use tier=None and None bands. The
+    real producer's shape (Task 6's size-prediction guard) is different --
+    tier is a "BUDGET-<N>GiB" label, and unclaimed band fields are "" not
+    None. Cover that shape too, not just the placeholder."""
+    cfg = _cfg(refused_tiers=[
+        {"tier": "BUDGET-100GiB", "family": "magicquant", "rule": "budget",
+         "requested_budget_gib": 100.0, "predicted_gib": 118.4,
+         "predicted_band": "", "claimed_band": "",
+         "reason": "would land in the wrong band"},
+    ])
+    card = generate_model_card(cfg, [], rocmfpx=True)
+    section = card.split("## Tiers this build does not produce", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    budget_line = _bullet_lines(section)[0]
+    assert "100" in budget_line
+    assert "118.4" in budget_line
+    assert "overshoot" in budget_line.lower()
+    assert "band" not in budget_line.lower()
+    assert "would land in" not in budget_line.lower()
+
+
+# ── Important 2: pin the rule-aware closing itself -- the existing mixed-set
+# test above never exercises it (it only checks the per-row bullets), so
+# deleting the if/else entirely still passed all tests. ────────────────────
+
+def test_all_budget_refusal_closing_pins_budget_wording():
+    cfg = _cfg(refused_tiers=[
+        {"tier": "BUDGET-100GiB", "family": "magicquant", "rule": "budget",
+         "requested_budget_gib": 100.0, "predicted_gib": 118.4,
+         "predicted_band": "", "claimed_band": "",
+         "reason": "predicted to exceed the requested budget"},
+    ])
+    card = generate_model_card(cfg, [], rocmfpx=True)
+    section = card.split("## Tiers this build does not produce", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    assert "may fit within tolerance" in section
+    assert "will not appear in a later build" not in section
+
+
+def test_mixed_refusal_closing_is_neutral_not_a_permanence_claim():
+    """Important 1: a refused_tiers set mixing a permanent (band) refusal
+    with a budget size-overshoot refusal must use NEITHER single-rule
+    closing -- each asserts something false for the other kind in the same
+    list (the permanence closing says a fresh search can't help; the budget
+    closing implies a scheme-rounding gap might just need a retry)."""
+    cfg = _cfg(refused_tiers=[
+        {"tier": "Q5", "family": "rocmfpx", "rule": "band",
+         "reason": "predicts 14.10 GiB, which is the Q6 band, not Q5."},
+        {"tier": "BUDGET-100GiB", "family": "magicquant", "rule": "budget",
+         "requested_budget_gib": 100.0, "predicted_gib": 118.4,
+         "predicted_band": "", "claimed_band": "",
+         "reason": "would land in the wrong band"},
+    ])
+    card = generate_model_card(cfg, [], rocmfpx=True)
+    section = card.split("## Tiers this build does not produce", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    assert "will not appear in a later build" not in section
+    assert "may fit within tolerance" not in section
+    assert "not built for different reasons" in section
+
+
+# ── CRITICAL fix: the card must consume core.publish_records.read_refusals
+# directly, not depend solely on whatever output/_publish_tiers.py's own
+# (buggy, field-projecting) find_refusals() forwarded through cfg. ─────────
+
+def test_card_auto_discovers_refusals_from_disk_when_cfg_omits_them(tmp_path):
+    mq_dir = tmp_path / "magicquant"
+    mq_dir.mkdir()
+    p = _fake_gguf(mq_dir / "Model-BUDGET-100GiB.gguf")
+    (mq_dir / "_refusals.json").write_text(json.dumps([
+        {"tier": "BUDGET-100GiB", "family": "magicquant", "rule": "budget",
+         "requested_budget_gib": 100.0, "predicted_gib": 118.4,
+         "predicted_band": "", "claimed_band": "",
+         "reason": "would land in the wrong band"},
+    ]))
+    # cfg carries NO refused_tiers at all -- the on-disk record is the only
+    # source, exactly as a real publish run's card generation would see it
+    # if wired directly to the tracked reader instead of the buggy script.
+    card = generate_model_card(
+        _cfg(), [(p, "Model-BUDGET-100GiB.gguf")], rocmfpx=True)
+
+    assert "## Tiers this build does not produce" in card
+    section = card.split("## Tiers this build does not produce", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    budget_line = _bullet_lines(section)[0]
+    assert "118.4" in budget_line
+    assert "overshoot" in budget_line.lower()
+    assert "band" not in budget_line.lower()
+
+
+def test_card_prefers_disk_refusal_over_field_impoverished_cfg_entry(tmp_path):
+    """The exact shape of the CRITICAL bug: cfg carries a NON-empty
+    refused_tiers list for this tier (as output/_publish_tiers.py's buggy
+    find_refusals() would produce -- no "rule" key), while the on-disk
+    record for the SAME tier has the full fields. The disk record must win,
+    or the budget branch stays unreachable behind a cfg entry that merely
+    exists but is missing what the branch checks for."""
+    mq_dir = tmp_path / "magicquant"
+    mq_dir.mkdir()
+    p = _fake_gguf(mq_dir / "Model-BUDGET-100GiB.gguf")
+    (mq_dir / "_refusals.json").write_text(json.dumps([
+        {"tier": "BUDGET-100GiB", "family": "magicquant", "rule": "budget",
+         "requested_budget_gib": 100.0, "predicted_gib": 118.4,
+         "predicted_band": "", "claimed_band": "",
+         "reason": "would land in the wrong band"},
+    ]))
+    cfg = _cfg(refused_tiers=[
+        # output/_publish_tiers.py's projected shape: no "rule" key at all.
+        {"tier": "BUDGET-100GiB", "family": "magicquant",
+         "reason": "would land in the wrong band"},
+    ])
+    card = generate_model_card(
+        cfg, [(p, "Model-BUDGET-100GiB.gguf")], rocmfpx=True)
+
+    section = card.split("## Tiers this build does not produce", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    budget_line = _bullet_lines(section)[0]
+    assert "overshoot" in budget_line.lower()
+    assert "band" not in budget_line.lower()
