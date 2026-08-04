@@ -41,6 +41,8 @@ testable. ``output/_publish_tiers.py`` imports from here instead of keeping
 its own copy of the rules.
 """
 
+import re
+
 from magicquant.quant.tiers import classify_tier
 
 # Dominance needs a MEANINGFUL margin, not any margin. FableFusion's Q6
@@ -358,3 +360,54 @@ def recommend_tier(tiers, noise_margin=NOISE_MARGIN):
             reason = "It has the best measured quality of the tiers published here."
     return {"tier": pick["tier"], "reason": reason,
             "gib": pick["gib"], "loss": pick["loss"]}
+
+
+# --- Budget (size-target) builds --------------------------------------------
+# A budget build claims a SIZE, not a tier band. BAND and DOMINANCE do not
+# apply (no band claim, no siblings); the one rule is the tolerance below.
+# v2's budget bounds allocatable-tensor bytes, not file size -- metadata,
+# alignment padding, and passthrough tensors with unknown sizes are uncounted,
+# and ROCmFPX fork-type rounding can overshoot. 2% covers both; one constant
+# so build-time and publish-time guards can never disagree.
+BUDGET_TOLERANCE = 0.02
+
+BUDGET_FILE_RE = re.compile(r"-BUDGET-([\d.]+)GiB\.gguf$")
+
+
+def decide_budget_build(*, name: str, actual_gib: float, budget_gib: float) -> dict:
+    """SHIP/REFUSE for a MagicQuant budget build (publish-time size guard)."""
+    limit = budget_gib * (1 + BUDGET_TOLERANCE)
+    overshoot = actual_gib / budget_gib - 1.0
+    if actual_gib <= limit:
+        return {"ship": True, "rule": "budget", "overshoot_frac": overshoot,
+                "reason": (f"{name}: {actual_gib:.2f} GiB fits the requested "
+                           f"{budget_gib:g} GiB budget "
+                           f"(tolerance {BUDGET_TOLERANCE:.0%}).")}
+    return {"ship": False, "rule": "budget", "overshoot_frac": overshoot,
+            "reason": (f"{name}: {actual_gib:.2f} GiB exceeds the requested "
+                       f"{budget_gib:g} GiB budget by {overshoot:.1%} "
+                       f"(> {BUDGET_TOLERANCE:.0%} tolerance) -- likely "
+                       f"uncounted bytes (GGUF metadata, alignment padding, "
+                       f"passthrough tensors) or fork-type rounding.")}
+
+
+def decide_rocmfpx_budget(*, fx_tg, mq_tg) -> dict:
+    """SPEED rule for a ROCmFPX budget build vs its MagicQuant budget peer.
+
+    Same principle as decide_rocmfpx_tiers: ROCmFPX trades quality for
+    throughput, so it ships only when measurably faster. Unmeasured never
+    ships -- speed is the family's entire justification.
+    """
+    if fx_tg is None or mq_tg is None:
+        which = "ROCmFPX build" if fx_tg is None else "MagicQuant peer"
+        return {"ship": False, "rule": "speed",
+                "reason": f"no throughput measurement for the {which}; "
+                          f"a speed-justified family never ships unmeasured."}
+    if fx_tg >= mq_tg * SPEED_MARGIN:
+        return {"ship": True, "rule": "speed",
+                "reason": (f"{fx_tg:.2f} tok/s vs MagicQuant peer "
+                           f"{mq_tg:.2f} tok/s (>= {SPEED_MARGIN:g}x).")}
+    return {"ship": False, "rule": "speed",
+            "reason": (f"{fx_tg:.2f} tok/s is not >= {SPEED_MARGIN:g}x the "
+                       f"MagicQuant peer's {mq_tg:.2f} tok/s -- not faster, "
+                       f"so the quality trade buys nothing.")}
