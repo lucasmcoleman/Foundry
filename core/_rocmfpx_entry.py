@@ -717,8 +717,45 @@ def _quantize_cmd_base(quantize_bin, allow_requantize: bool = False) -> list[str
     return cmd
 
 
+# The LM head (`output.weight`) is kept at full precision in uniform presets.
+#
+# WHY (2026-08-04): our published Fable-Fusion Q8_0_ROCMFPX quantized the head
+# with everything else, while every reference build of the same base protects
+# it -- DavidAU's NEO-MAX Q8 keeps `output.weight` at BF16 and documents it
+# ("the output tensor (10-20% of output) was modified to full precision").
+# The head emits the logits, so its error lands straight on token
+# probabilities and thus on sampling behavior; the reported symptom was
+# shorter, blander generations. It is ~4.7% of parameters but was sitting at
+# the file's LOWEST precision.
+#
+# Uniform presets are the only path that needed this: mq-* hybrid builds
+# already get per-group precision for the head from MagicQuant's `H` group.
+DEFAULT_HEAD_TYPE = "bf16"
+
+# Bodies already at or above 16-bit need no protection -- and forcing bf16 on
+# an f32 body would DOWNGRADE the head.
+_FULL_PRECISION_TYPES = {"bf16", "f16", "f32"}
+
+
+def _preset_quantize_cmd(quantize_bin, allow_requantize, imatrix, bf16_gguf,
+                         out_path, ggml_type, head_type=DEFAULT_HEAD_TYPE):
+    """Build the uniform-preset llama-quantize argv.
+
+    Factored out of ``_quantize_preset`` so the head-precision policy is
+    testable without spawning the binary. Options must precede the
+    ``in out type`` positionals or llama-quantize misparses them.
+    """
+    cmd = _quantize_cmd_base(quantize_bin, allow_requantize)
+    if imatrix:
+        cmd += ["--imatrix", imatrix]
+    if head_type and ggml_type.lower() not in _FULL_PRECISION_TYPES:
+        cmd += ["--output-tensor-type", head_type]
+    cmd += [str(bf16_gguf), str(out_path), ggml_type]
+    return cmd
+
+
 def _quantize_preset(spec, out_dir, model_name, quantize_bin, bf16_gguf, imatrix,
-                     allow_requantize=False):
+                     allow_requantize=False, head_type=DEFAULT_HEAD_TYPE):
     """Run one uniform-preset quantize pass (rocmfp4-agent etc.)."""
     import subprocess
 
@@ -734,10 +771,11 @@ def _quantize_preset(spec, out_dir, model_name, quantize_bin, bf16_gguf, imatrix
         print(f"Error: skipping ROCmFPX format {spec!r}: {e}", flush=True)
         return None
     out_path = out_dir / f"{model_name}-{ggml_type}.gguf"
-    cmd = _quantize_cmd_base(quantize_bin, allow_requantize)
-    if imatrix:
-        cmd += ["--imatrix", imatrix]
-    cmd += [str(bf16_gguf), str(out_path), ggml_type]
+    cmd = _preset_quantize_cmd(quantize_bin, allow_requantize, imatrix,
+                               bf16_gguf, out_path, ggml_type, head_type)
+    if "--output-tensor-type" in cmd:
+        print(f"  keeping output.weight at {head_type} (head precision policy)",
+              flush=True)
     print(f"Quantizing {spec} ({ggml_type})...", flush=True)
     rc = subprocess.run(cmd).returncode
     if rc != 0 or not out_path.exists():
