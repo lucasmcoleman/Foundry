@@ -357,8 +357,15 @@ class MagicQuantService:
         calibration_source: str = "",
         write_calibration: bool = False,
         allow_dequant_source: bool = False,
+        budget_gib: Optional[float] = None,
     ) -> dict:
         """Build the JSON config consumed by core/_magicquant_entry.py."""
+        if budget_gib is not None and measured:
+            raise ValueError(
+                "--magicquant-budget-gib and --magicquant-measured are mutually "
+                "exclusive: the v2 budget search verifies with real perplexity "
+                "itself, so 'measured' would misrepresent what ran."
+            )
         return {
             "pipeline_root": str(self.pipeline_root),
             "llamacpp_hint": llamacpp_hint,
@@ -391,6 +398,7 @@ class MagicQuantService:
             "calibration_source": calibration_source,
             "write_calibration": write_calibration,
             "allow_dequant_source": allow_dequant_source,
+            "budget_gib": budget_gib,
         }
 
     def build_script(self, **kwargs) -> str:
