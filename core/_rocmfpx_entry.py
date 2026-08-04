@@ -1141,6 +1141,39 @@ def _clear_refusal(rocmfpx_out_dir: Path, *, tier: str, family: str) -> None:
     _rewrite_refusals(rocmfpx_out_dir, tier, family, None)
 
 
+def _run_ttf_quantize(*, spec, key, lines, base_type, rocmfpx_out_dir, model_name,
+                      quantize_bin, bf16_gguf, imatrix, allow_requantize):
+    """Write a ``--tensor-type-file`` and drive llama-quantize with it.
+
+    Shared tail of ``_quantize_mq_hybrid`` (per-group, ``key`` == tier) and
+    ``_quantize_mq_budget`` (per-tensor, ``key`` == budget key). The two
+    paths differ only in how ``lines``/``key`` are produced upstream; this is
+    the part that must never drift between them -- in particular the output
+    filename formula (``{model_name}-ROCMFPX-MQ-{key}.gguf``), which is what
+    the publish stage keys on to find the file it's grading.
+    """
+    import subprocess
+
+    rocmfpx_out_dir.mkdir(parents=True, exist_ok=True)
+    type_file = rocmfpx_out_dir / f"_ttf-mq-{key}.txt"
+    type_file.write_text("\n".join(lines) + "\n")
+    out_path = rocmfpx_out_dir / f"{model_name}-ROCMFPX-MQ-{key}.gguf"
+
+    cmd = _quantize_cmd_base(quantize_bin, allow_requantize)
+    cmd += ["--tensor-type-file", str(type_file)]
+    if imatrix:
+        cmd += ["--imatrix", imatrix]
+    cmd += [str(bf16_gguf), str(out_path), base_type]
+    rc = subprocess.run(cmd).returncode
+    if rc != 0 or not out_path.exists():
+        print(f"Warning: {spec} quantize failed (exit {rc})", flush=True)
+        return None
+    print(f"  {out_path.name} ({out_path.stat().st_size / 1e9:.1f} GB)", flush=True)
+    # This key built, so a refusal an earlier run recorded for it is stale.
+    _clear_refusal(rocmfpx_out_dir, tier=key, family="rocmfpx")
+    return out_path
+
+
 def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
                         quantize_bin, bf16_gguf, imatrix, allow_requantize=False):
     """Produce a ROCmFPX hybrid matching MagicQuant's per-group config for ``tier``.
@@ -1149,8 +1182,6 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
     drives llama-quantize with a per-tensor override file so the AMD-native
     formats land exactly where MagicQuant's search placed each precision.
     """
-    import subprocess
-
     try:
         from magicquant.gguf.tensor_groups import TensorGroupClassifier
     except ImportError as e:
@@ -1217,27 +1248,16 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
         print(f"Error ({spec}): {e}", flush=True)
         return None
 
-    type_file = rocmfpx_out_dir / f"_ttf-mq-{tier}.txt"
-    type_file.write_text("\n".join(lines) + "\n")
-    out_path = rocmfpx_out_dir / f"{model_name}-ROCMFPX-MQ-{tier}.gguf"
-
     schemes = " ".join(f"{g}:{s}" for g, s in sorted(config.items()))
     print(f"Quantizing {spec}: MagicQuant {tier} layout in ROCmFPX types", flush=True)
     print(f"  base={base_type}  groups={schemes}", flush=True)
 
-    cmd = _quantize_cmd_base(quantize_bin, allow_requantize)
-    cmd += ["--tensor-type-file", str(type_file)]
-    if imatrix:
-        cmd += ["--imatrix", imatrix]
-    cmd += [str(bf16_gguf), str(out_path), base_type]
-    rc = subprocess.run(cmd).returncode
-    if rc != 0 or not out_path.exists():
-        print(f"Warning: {spec} quantize failed (exit {rc})", flush=True)
-        return None
-    print(f"  {out_path.name} ({out_path.stat().st_size / 1e9:.1f} GB)", flush=True)
-    # This tier built, so a refusal an earlier run recorded for it is stale.
-    _clear_refusal(rocmfpx_out_dir, tier=tier, family="rocmfpx")
-    return out_path
+    return _run_ttf_quantize(
+        spec=spec, key=tier, lines=lines, base_type=base_type,
+        rocmfpx_out_dir=rocmfpx_out_dir, model_name=model_name,
+        quantize_bin=quantize_bin, bf16_gguf=bf16_gguf, imatrix=imatrix,
+        allow_requantize=allow_requantize,
+    )
 
 
 def _quantize_mq_budget(spec, requested, out_dir, rocmfpx_out_dir, model_name,
@@ -1253,8 +1273,6 @@ def _quantize_mq_budget(spec, requested, out_dir, rocmfpx_out_dir, model_name,
     with the publish stage's ``decide_budget_build``, so build-time and
     publish-time can never disagree) instead of checking a band match.
     """
-    import subprocess
-
     from core.publish_criteria import BUDGET_TOLERANCE
 
     try:
@@ -1301,69 +1319,72 @@ def _quantize_mq_budget(spec, requested, out_dir, rocmfpx_out_dir, model_name,
             | {translate_scheme(s) for s in config.values()}
             | {translate_scheme(s) for s in tensor_config.values()}
         )
-        validate_types_supported(required_types, quantize_bin)
 
         # A tier name is a size band; a budget build's "name" is a GiB target.
         # Refuse before spending the quantize if rendering into the sparse
         # ROCmFPX family predicts a size outside that target's tolerance --
         # the same check the publish stage repeats after the fact, sharing
-        # BUDGET_TOLERANCE so the two guards can never disagree.
+        # BUDGET_TOLERANCE so the two guards can never disagree. Runs BEFORE
+        # validate_types_supported (parity with _quantize_mq_hybrid's band
+        # guard, which also precedes its validate call) so a tier that is
+        # both over budget AND needs a type a stale fork build lacks still
+        # gets its refusal recorded instead of falling into the validate
+        # RuntimeError -> outer except -> silent `return None`.
+        #
+        # The prediction call is the only advisory part -- caught here so a
+        # broken predictor doesn't block a build it can't actually judge.
+        # The SHIP/REFUSE decision itself (comparison, record, return) sits
+        # OUTSIDE this try: nothing raised while deciding may be swallowed
+        # and let an over-budget build fall through to the quantize.
+        pred_gib = None
+        base_gib = None
         try:
             if tensor_config:
                 pred_gib, base_gib = predict_rendered_budget(tensor_config, bf16_gguf)
             else:
                 pred_gib, base_gib, _ = predict_rendered_tier(config, bf16_gguf)
-            if pred_gib > budget_gib * (1 + BUDGET_TOLERANCE):
-                refusal_reason = (
-                    f"rendering the {key} allocation into ROCmFPX types "
-                    f"predicts {pred_gib:.2f} GiB against the requested "
-                    f"{budget_gib:.2f} GiB budget (tolerance "
-                    f"{BUDGET_TOLERANCE:.0%}) -- the ROCmFPX family has no "
-                    f"type between 4.5 and 6.5 bpw, so a scheme can round up "
-                    f"past what the allocation intended."
-                )
-                print(f"Refusing {spec}: {refusal_reason}", flush=True)
-                _record_refusal(
-                    rocmfpx_out_dir,
-                    tier=key,
-                    family="rocmfpx",
-                    reason=refusal_reason,
-                    predicted_gib=pred_gib,
-                    baseline_gib=base_gib,
-                    predicted_band="",
-                    claimed_band="",
-                    rule="budget",
-                    requested_budget_gib=budget_gib,
-                )
-                return None
         except Exception as exc:  # noqa: BLE001 -- advisory, never blocks a valid build
             print(f"  (budget-size prediction unavailable: {exc})", flush=True)
+
+        if pred_gib is not None and pred_gib > budget_gib * (1 + BUDGET_TOLERANCE):
+            refusal_reason = (
+                f"rendering the {key} allocation into ROCmFPX types "
+                f"predicts {pred_gib:.2f} GiB against the requested "
+                f"{budget_gib:.2f} GiB budget (tolerance "
+                f"{BUDGET_TOLERANCE:.0%}) -- the ROCmFPX family has no "
+                f"type between 4.5 and 6.5 bpw, so a scheme can round up "
+                f"past what the allocation intended."
+            )
+            print(f"Refusing {spec}: {refusal_reason}", flush=True)
+            _record_refusal(
+                rocmfpx_out_dir,
+                tier=key,
+                family="rocmfpx",
+                reason=refusal_reason,
+                predicted_gib=pred_gib,
+                baseline_gib=base_gib,
+                predicted_band="",
+                claimed_band="",
+                rule="budget",
+                requested_budget_gib=budget_gib,
+            )
+            return None
+
+        validate_types_supported(required_types, quantize_bin)
     except (FileNotFoundError, KeyError, ValueError, RuntimeError) as e:
         print(f"Error ({spec}): {e}", flush=True)
         return None
-
-    rocmfpx_out_dir.mkdir(parents=True, exist_ok=True)
-    type_file = rocmfpx_out_dir / f"_ttf-mq-{key}.txt"
-    type_file.write_text("\n".join(lines) + "\n")
-    out_path = rocmfpx_out_dir / f"{model_name}-ROCMFPX-MQ-{key}.gguf"
 
     print(f"Quantizing {spec}: budget {key} allocation in ROCmFPX types", flush=True)
     print(f"  base={base_type}  budget={budget_gib:.2f} GiB  "
           f"tensors={len(tensor_config) or len(config)}", flush=True)
 
-    cmd = _quantize_cmd_base(quantize_bin, allow_requantize)
-    cmd += ["--tensor-type-file", str(type_file)]
-    if imatrix:
-        cmd += ["--imatrix", imatrix]
-    cmd += [str(bf16_gguf), str(out_path), base_type]
-    rc = subprocess.run(cmd).returncode
-    if rc != 0 or not out_path.exists():
-        print(f"Warning: {spec} quantize failed (exit {rc})", flush=True)
-        return None
-    print(f"  {out_path.name} ({out_path.stat().st_size / 1e9:.1f} GB)", flush=True)
-    # This budget key built, so a refusal an earlier run recorded for it is stale.
-    _clear_refusal(rocmfpx_out_dir, tier=key, family="rocmfpx")
-    return out_path
+    return _run_ttf_quantize(
+        spec=spec, key=key, lines=lines, base_type=base_type,
+        rocmfpx_out_dir=rocmfpx_out_dir, model_name=model_name,
+        quantize_bin=quantize_bin, bf16_gguf=bf16_gguf, imatrix=imatrix,
+        allow_requantize=allow_requantize,
+    )
 
 
 if __name__ == "__main__":

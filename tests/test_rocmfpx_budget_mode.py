@@ -96,15 +96,20 @@ def test_per_tensor_lines_are_anchored_and_escaped():
     pattern, _, ggml = lines[0].partition("=")
     assert pattern.startswith("^") and pattern.endswith("$")
     assert re.search(pattern, "blk.0.ffn_up.weight")
-    assert not re.search(pattern, "blk.10.ffn_up.weight")  # '.' escaped
+    # Same length as the real name (dots -> 'X'), so this only fails to match
+    # if '.' is escaped to a literal -- an unescaped '.' (regex "any char")
+    # would match here too, since it's a same-position, same-length swap.
+    # The old probe ("blk.10.ffn_up.weight") differed in LENGTH from the
+    # anchored pattern and so proved nothing about escaping specifically.
+    assert not re.search(pattern, "blkX0Xffn_upXweight")  # '.' escaped
     assert " " not in lines[0]
     assert ggml == translate_scheme("MXFP4_MOE")
 
 
 def test_per_tensor_lines_refuse_hostile_names():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="bad name"):
         build_tensor_type_lines_per_tensor({"bad name": "Q5_K"})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=re.escape("bad=name")):
         build_tensor_type_lines_per_tensor({"bad=name": "Q5_K"})
 
 
@@ -269,6 +274,74 @@ def test_quantize_mq_budget_within_tolerance_does_not_refuse(tmp_path, monkeypat
     just_inside = 10 * (1 + BUDGET_TOLERANCE) - 0.001
     monkeypatch.setattr(entry, "predict_rendered_budget",
                         lambda tensor_config, bf16_gguf: (just_inside, 50.0))
+    monkeypatch.setattr(entry, "validate_types_supported", lambda t, b: None)
+
+    built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
+
+    def _fake_run(cmd, *a, **kw):
+        built.write_bytes(b"gguf")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = _quantize_mq_budget(
+        spec="mq-budget", requested="BUDGET", out_dir=out_dir,
+        rocmfpx_out_dir=rocmfpx_out_dir, model_name="stub-model",
+        quantize_bin=Path("/nonexistent/llama-quantize"),
+        bf16_gguf="stub.gguf", imatrix="",
+    )
+    assert result == built
+    assert not (rocmfpx_out_dir / "_refusals.json").exists()
+
+
+def test_quantize_mq_budget_just_above_tolerance_refuses(tmp_path, monkeypatch, capsys):
+    """Mirror of the just-inside case above, from the other side of the
+    boundary: a prediction just ABOVE budget_gib * (1 + BUDGET_TOLERANCE)
+    must still refuse. Pins the tolerance itself -- a threshold silently
+    loosened (e.g. multiplied by 10) would let this ship green."""
+    out_dir = tmp_path / "output"
+    rocmfpx_out_dir = out_dir / "rocmfpx"
+    key = "BUDGET-10GiB"
+    _write_budget_block(
+        out_dir, key,
+        config={"U": "MXFP4_MOE"},
+        tensor_config={"blk.0.ffn_up.weight": "MXFP4_MOE"},
+        budget_gib=10,
+    )
+    just_above = 10 * (1 + BUDGET_TOLERANCE) + 0.001
+    monkeypatch.setattr(entry, "predict_rendered_budget",
+                        lambda tensor_config, bf16_gguf: (just_above, 50.0))
+
+    result = _quantize_mq_budget(
+        spec="mq-budget", requested="BUDGET", out_dir=out_dir,
+        rocmfpx_out_dir=rocmfpx_out_dir, model_name="stub-model",
+        quantize_bin=Path("/nonexistent/llama-quantize"),
+        bf16_gguf="stub.gguf", imatrix="",
+    )
+    assert result is None
+    out = capsys.readouterr().out
+    assert "Refusing mq-budget" in out
+    records = json.loads((rocmfpx_out_dir / "_refusals.json").read_text())
+    assert records[0]["predicted_gib"] == pytest.approx(just_above)
+
+
+def test_quantize_mq_budget_exact_boundary_ships_not_refuses(tmp_path, monkeypatch):
+    """Pins the comparison operator itself: at EXACT equality with
+    budget_gib * (1 + BUDGET_TOLERANCE) the build must ship, i.e. the guard
+    is strictly '>', not '>='. A silent '>' -> '>=' flip would refuse a
+    build that is, by the tolerance's own definition, still inside it."""
+    out_dir = tmp_path / "output"
+    rocmfpx_out_dir = out_dir / "rocmfpx"
+    key = "BUDGET-10GiB"
+    _write_budget_block(
+        out_dir, key,
+        config={"U": "MXFP4_MOE"},
+        tensor_config={"blk.0.ffn_up.weight": "MXFP4_MOE"},
+        budget_gib=10,
+    )
+    exact_boundary = 10 * (1 + BUDGET_TOLERANCE)
+    monkeypatch.setattr(entry, "predict_rendered_budget",
+                        lambda tensor_config, bf16_gguf: (exact_boundary, 50.0))
     monkeypatch.setattr(entry, "validate_types_supported", lambda t, b: None)
 
     built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
