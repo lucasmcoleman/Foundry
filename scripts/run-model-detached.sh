@@ -30,8 +30,15 @@
 set -uo pipefail
 
 UNIT_PREFIX="model-"
-DEFAULT_MEM="95G"          # 121 GiB box: leaves ~26 GiB for OS + agents
-RESERVE_GIB=12             # refuse to launch if less than this would remain
+# MemoryMax is a RUNAWAY BACKSTOP, not a working cap. GTT/GPU-pinned pages are
+# not charged to the cgroup: a probe that had 80.76 GiB resident reported
+# `547.7M memory peak` to systemd. So a snug cap does nothing useful, while a
+# too-snug one kills legitimate runs. Set it near total RAM so it only catches
+# a true runaway; real protection comes from (a) the separate unit, (b) the
+# preflight below, (c) OOMScoreAdjust making the model the kernel's first
+# victim, and (d) earlyoom.
+DEFAULT_MEM="110G"
+RESERVE_GIB=8              # empirical: the 2026-08-04 smoke test succeeded with 6.7 GiB slack
 
 die() { echo "run-model-detached: $*" >&2; exit 1; }
 unit_of() { echo "${UNIT_PREFIX}$1"; }
@@ -80,14 +87,33 @@ done
 UNIT=$(unit_of "$NAME")
 
 # --- Preflight: is there actually room? -------------------------------------
-# GTT-pinned pages leave MemAvailable, so this is the number that matters.
+# Check against what the MODEL needs, not against --mem (which is only a
+# runaway backstop -- see the DEFAULT_MEM comment). The requirement is derived
+# from the actual model file named by -m/--model: ds4 reports
+# "resident model <file size>" plus ~1 GiB of KV/buffers, and prefill working
+# buffers scale with the context, so add a margin.
 avail_gib=$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo)
-mem_gib=${MEM%[Gg]}
-if (( avail_gib < mem_gib + RESERVE_GIB )); then
-  die "PREFLIGHT FAILED: MemAvailable ${avail_gib} GiB < cap ${mem_gib} GiB + ${RESERVE_GIB} GiB reserve.
-       Free memory first (stop llama-swap, unload LM Studio, wait for a running
-       model to finish) or lower --mem. Refusing to start a run that would
-       drive the box into an OOM cascade."
+
+model_file=""
+prev=""
+for tok in "$@"; do
+  case "$prev" in -m|--model) model_file="$tok"; break ;; esac
+  case "$tok" in --model=*) model_file="${tok#--model=}"; break ;; esac
+  prev="$tok"
+done
+
+need_gib=0
+if [[ -n "$model_file" && -f "$model_file" ]]; then
+  model_gib=$(( $(stat -c%s "$model_file") / 1024 / 1024 / 1024 ))
+  need_gib=$(( model_gib + 2 ))       # ds4 measured: 80.76 GiB model -> 81.29 GiB total (KV 0.46 + buffers 0.06)
+  echo "run-model-detached: model $(basename "$model_file") = ${model_gib} GiB -> needs ~${need_gib} GiB"
+fi
+
+if (( avail_gib < need_gib + RESERVE_GIB )); then
+  die "PREFLIGHT FAILED: MemAvailable ${avail_gib} GiB < model need ${need_gib} GiB + ${RESERVE_GIB} GiB reserve.
+       Free memory first: stop llama-swap, unload LM Studio, finish any running
+       subagent fan-out (concurrent pytest suites plus an 81 GiB model is what
+       exhausted the box on 2026-08-04). Refusing to start."
 fi
 
 # Concurrency guard: never two big models at once.
@@ -106,14 +132,18 @@ mkdir -p "$(dirname "$LOGFILE")"
 echo "run-model-detached: unit=$UNIT mem=$MEM avail=${avail_gib}GiB log=$LOGFILE"
 echo "  cmd: $*"
 
-# --collect  : auto-reap so a failed unit does not linger in `systemctl --failed`
-# MemorySwapMax=0 : swap thrash was a major contributor to the 2026-08-04 cascade
-#                   (32 GiB swap fully consumed before the kill)
+# --collect        : auto-reap so a failed unit does not linger in `systemctl --failed`
+# OOMScoreAdjust   : if the BOX runs out, the kernel picks this model first --
+#                    never dbus, never the agent, never a bystander service.
+#                    (2026-07-27 the global OOM killer took dbus and livelocked
+#                    the box; 2026-08-04 it took the agent's whole scope.)
+# NOTE: MemorySwapMax=0 was tried and removed -- denying swap to a cgroup whose
+# mmap'd model is 80 GiB just converts reclaim into an OOM kill.
 sudo -n systemd-run \
   --unit="$UNIT" \
   --collect \
   --property=MemoryMax="$MEM" \
-  --property=MemorySwapMax=0 \
+  --property=OOMScoreAdjust=1000 \
   --property=OOMPolicy=stop \
   --property=WorkingDirectory="$PWD" \
   --property=Environment=LD_LIBRARY_PATH=/home/lucas/lib-override \
