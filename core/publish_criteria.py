@@ -11,7 +11,8 @@ rules deciding what reaches a public page were unreachable from pytest. Moving
 the DECISION functions (not the subprocess/HF-API orchestration around them)
 into a tracked, importable module is what lets them be tested.
 
-Three rules, applied in this order, decide whether a tier ships:
+Three rules, applied in this order, decide whether a NAMED-TIER (Q4/Q5/Q6)
+build ships:
 
   BAND      -- a tier must land in the size band its name claims, checked via
                ``magicquant.quant.tiers.classify_tier`` against the BF16
@@ -34,6 +35,13 @@ Three rules, applied in this order, decide whether a tier ships:
   SPEED     -- ROCmFPX trades quality for throughput at the same size, so its
                only justification over a same-band MagicQuant tier is speed.
                A ROCmFPX tier ships only if it clears ``SPEED_MARGIN`` faster.
+
+A fourth rule, BUDGET, applies instead to size-target builds that claim a
+GiB size rather than a Q-tier band: ``decide_budget_build`` ships a build
+that fits its requested size within ``BUDGET_TOLERANCE``, and
+``decide_rocmfpx_budget`` applies the same SPEED justification as above to a
+ROCmFPX budget build against its MagicQuant budget peer. Both live near the
+bottom of this module.
 
 Every function here is pure: sizes, losses, and tok/s in, a decision out. No
 filesystem, no subprocess, no HF API calls -- that split is what makes this
@@ -391,7 +399,7 @@ def decide_budget_build(*, name: str, actual_gib: float, budget_gib: float) -> d
                        f"passthrough tensors) or fork-type rounding.")}
 
 
-def decide_rocmfpx_budget(*, fx_tg, mq_tg) -> dict:
+def decide_rocmfpx_budget(*, fx_tg: float | None, mq_tg: float | None) -> dict:
     """SPEED rule for a ROCmFPX budget build vs its MagicQuant budget peer.
 
     Same principle as decide_rocmfpx_tiers: ROCmFPX trades quality for
@@ -399,7 +407,12 @@ def decide_rocmfpx_budget(*, fx_tg, mq_tg) -> dict:
     ships -- speed is the family's entire justification.
     """
     if fx_tg is None or mq_tg is None:
-        which = "ROCmFPX build" if fx_tg is None else "MagicQuant peer"
+        missing = []
+        if fx_tg is None:
+            missing.append("ROCmFPX build")
+        if mq_tg is None:
+            missing.append("MagicQuant peer")
+        which = " and ".join(missing)
         return {"ship": False, "rule": "speed",
                 "reason": f"no throughput measurement for the {which}; "
                           f"a speed-justified family never ships unmeasured."}

@@ -471,12 +471,16 @@ def test_recommendation_never_picks_a_larger_tier_over_a_tied_smaller_one():
 
 
 # --- budget builds -----------------------------------------------------------
-from core.publish_criteria import (BUDGET_FILE_RE, BUDGET_TOLERANCE,
-                                   decide_budget_build, decide_rocmfpx_budget)
+from publish_criteria import (BUDGET_FILE_RE, BUDGET_TOLERANCE, SPEED_MARGIN,
+                              decide_budget_build, decide_rocmfpx_budget)
 
 
 def test_budget_tolerance_value_pinned():
     assert BUDGET_TOLERANCE == 0.02
+
+
+def test_speed_margin_value_pinned():
+    assert SPEED_MARGIN == 1.15
 
 
 def test_budget_file_regex_extracts_the_number():
@@ -489,12 +493,24 @@ def test_budget_build_ships_under_budget():
     d = decide_budget_build(name="M-BUDGET-100GiB.gguf",
                             actual_gib=99.0, budget_gib=100.0)
     assert d["ship"] is True and d["rule"] == "budget"
+    assert "fits" in d["reason"] and "99.00" in d["reason"]
 
 
 def test_budget_build_ships_inside_tolerance():
     d = decide_budget_build(name="M-BUDGET-100GiB.gguf",
                             actual_gib=101.9, budget_gib=100.0)
-    assert d["ship"] is True
+    assert d["ship"] is True and d["rule"] == "budget"
+    assert "fits" in d["reason"] and "101.90" in d["reason"]
+
+
+def test_budget_build_ships_exactly_at_tolerance_boundary():
+    # actual_gib == budget_gib * (1 + BUDGET_TOLERANCE) exactly. The contract
+    # is "refuses iff actual > budget*(1+TOLERANCE)", so equality ships --
+    # this pins the "<=" at core/publish_criteria.py:389 against a silent
+    # flip to "<".
+    d = decide_budget_build(name="M-BUDGET-100GiB.gguf",
+                            actual_gib=102.0, budget_gib=100.0)
+    assert d["ship"] is True and d["rule"] == "budget"
 
 
 def test_budget_build_refused_beyond_tolerance_names_uncounted_bytes():
@@ -509,9 +525,28 @@ def test_rocmfpx_budget_speed_rule_ships_only_when_faster():
     assert decide_rocmfpx_budget(fx_tg=12.0, mq_tg=10.0)["ship"] is True
     slow = decide_rocmfpx_budget(fx_tg=10.0, mq_tg=10.0)
     assert slow["ship"] is False and slow["rule"] == "speed"
-    assert "tok/s" in slow["reason"] or "faster" in slow["reason"]
+    assert "tok/s" in slow["reason"] and "faster" in slow["reason"]
+
+
+def test_rocmfpx_budget_ships_exactly_at_speed_margin():
+    # fx_tg == mq_tg * SPEED_MARGIN exactly (10.0 * 1.15 = 11.5). The
+    # contract ships at equality, pinning the ">=" at
+    # core/publish_criteria.py:419 against a silent flip to ">".
+    d = decide_rocmfpx_budget(fx_tg=11.5, mq_tg=10.0)
+    assert d["ship"] is True and d["rule"] == "speed"
 
 
 def test_rocmfpx_budget_missing_measurement_refuses_and_says_which():
     d = decide_rocmfpx_budget(fx_tg=None, mq_tg=10.0)
-    assert d["ship"] is False and "measure" in d["reason"].lower()
+    assert d["ship"] is False and "ROCmFPX" in d["reason"]
+
+
+def test_rocmfpx_budget_missing_mq_measurement_refuses_and_says_which():
+    d = decide_rocmfpx_budget(fx_tg=10.0, mq_tg=None)
+    assert d["ship"] is False and "MagicQuant" in d["reason"]
+
+
+def test_rocmfpx_budget_both_measurements_missing_names_both():
+    d = decide_rocmfpx_budget(fx_tg=None, mq_tg=None)
+    assert d["ship"] is False
+    assert "ROCmFPX" in d["reason"] and "MagicQuant" in d["reason"]
