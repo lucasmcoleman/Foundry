@@ -132,6 +132,22 @@ mkdir -p "$(dirname "$LOGFILE")"
 echo "run-model-detached: unit=$UNIT mem=$MEM avail=${avail_gib}GiB log=$LOGFILE"
 echo "  cmd: $*"
 
+# Shield the agent session from the OOM killer for the duration of the run.
+#
+# WHY (2026-08-05, the SECOND way a model run killed the session): putting the
+# model in its own unit stops systemd tearing down the agent's scope, but it
+# does NOT stop the KERNEL choosing the agent as an additional victim when the
+# whole box runs out. On 2026-08-05 a global OOM killed the model unit AND the
+# agent session, even though the unit already carried OOMScoreAdjust=1000.
+# The asymmetry was only half-built: models were marked as preferred victims,
+# nothing marked the session as protected. A negative adj needs
+# CAP_SYS_RESOURCE, hence sudo; failure is non-fatal (best-effort shielding
+# must never block a run from starting).
+for _p in $(pgrep -f 'claude --resume' 2>/dev/null); do
+  sudo -n sh -c "echo -700 > /proc/$_p/oom_score_adj" 2>/dev/null
+done
+echo "  agent session shielded (oom_score_adj=-700); model unit is the preferred victim (+1000)"
+
 # --collect        : auto-reap so a failed unit does not linger in `systemctl --failed`
 # OOMScoreAdjust   : if the BOX runs out, the kernel picks this model first --
 #                    never dbus, never the agent, never a bystander service.
