@@ -771,13 +771,20 @@ def resolve_source(override: str, out_dir: Path, pipeline_root: str) -> str | No
     return None
 
 
-def _ensure_bf16_gguf(rocmfpx_dir: str, source: str, out_dir: Path) -> str:
+def _ensure_bf16_gguf(rocmfpx_dir: str, source: str, out_dir: Path,
+                       model_name: str | None = None) -> str:
     """Return a BF16 GGUF path for ``source``.
 
     Converts via ROCmFPX's bundled ``convert_hf_to_gguf.py`` when ``source``
     is a safetensors directory and no cached ``model-bf16.gguf`` already
     exists (reused across stages/runs, matching the existing
     ``Artifacts.bf16_gguf`` convention).
+
+    ``model_name``, when given, is passed through as ``--model-name`` so the
+    GGUF's ``general.name`` reflects the real model rather than the
+    converter's directory-name fallback (run dirs stage the checkpoint under
+    a literal ``source/`` directory, which otherwise leaks into the metadata
+    as ``general.name = "Source"``). ``None`` preserves old behavior.
     """
     import subprocess
 
@@ -805,10 +812,13 @@ def _ensure_bf16_gguf(rocmfpx_dir: str, source: str, out_dir: Path) -> str:
             "(needed to convert safetensors -> BF16 GGUF)"
         )
     print(f"Converting {source} -> {cached} (BF16)...", flush=True)
-    rc = subprocess.run([
+    argv = [
         sys.executable, str(convert_script), source,
         "--outfile", str(cached), "--outtype", "bf16",
-    ]).returncode
+    ]
+    if model_name:
+        argv += ["--model-name", model_name]
+    rc = subprocess.run(argv).returncode
     if rc != 0 or not cached.exists():
         raise RuntimeError(f"convert_hf_to_gguf.py failed (exit code {rc})")
     return str(cached)
@@ -840,7 +850,7 @@ def run(cfg_path: str | None = None) -> None:
         sys.exit(1)
     print(f"ROCmFPX source: {source}", flush=True)
 
-    bf16_gguf = _ensure_bf16_gguf(rocmfpx_dir, source, out_dir)
+    bf16_gguf = _ensure_bf16_gguf(rocmfpx_dir, source, out_dir, cfg.get("model_name"))
 
     quantize_bin = Path(rocmfpx_dir) / "build-strix-rocmfp4" / "bin" / "llama-quantize"
     rocmfpx_out_dir = out_dir / "rocmfpx"

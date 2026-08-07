@@ -219,7 +219,13 @@ def _find_convert_script(llamacpp_dir: str):
     return None
 
 
-def _ensure_bf16_gguf(llamacpp_dir: str, source: str, out_dir: Path) -> str:
+def _ensure_bf16_gguf(llamacpp_dir: str, source: str, out_dir: Path,
+                       model_name: str | None = None) -> str:
+    """``model_name``, when given, is passed through as ``--model-name`` so
+    the GGUF's ``general.name`` reflects the real model rather than the
+    converter's directory-name fallback (run dirs stage the checkpoint under
+    a literal ``source/`` directory, which otherwise leaks into the metadata
+    as ``general.name = "Source"``). ``None`` preserves old behavior."""
     import subprocess
     if source.endswith(".gguf"):
         return source
@@ -234,10 +240,13 @@ def _ensure_bf16_gguf(llamacpp_dir: str, source: str, out_dir: Path) -> str:
             "(needed to convert safetensors -> BF16 GGUF for baseline perplexity)"
         )
     print(f"Converting {source} -> {cached} (BF16)...", flush=True)
-    rc = subprocess.run([
+    argv = [
         sys.executable, str(convert_script), source,
         "--outfile", str(cached), "--outtype", "bf16",
-    ]).returncode
+    ]
+    if model_name:
+        argv += ["--model-name", model_name]
+    rc = subprocess.run(argv).returncode
     if rc != 0 or not cached.exists():
         raise RuntimeError(f"convert_hf_to_gguf.py failed (exit code {rc})")
     return str(cached)
@@ -317,10 +326,13 @@ def _maybe_generate_mmproj(llamacpp_dir: str, source: str, out_dir: Path,
         return
     print(f"Vision model detected -> generating mmproj: {out_file}", flush=True)
     try:
-        rc = subprocess.run([
+        argv = [
             sys.executable, str(convert_script), source,
             "--mmproj", "--outfile", str(out_file), "--outtype", "f16",
-        ]).returncode
+        ]
+        if model_name:
+            argv += ["--model-name", model_name]
+        rc = subprocess.run(argv).returncode
         if rc == 0 and out_file.exists():
             print(f"mmproj generated ({out_file.stat().st_size / 2**30:.2f} GiB) — "
                   "pair with any text quant for image input", flush=True)
@@ -491,7 +503,7 @@ def run(cfg_path: str | None = None) -> None:
             "(cached across runs).",
             flush=True,
         )
-        source = _ensure_bf16_gguf(llamacpp, source, out_dir)
+        source = _ensure_bf16_gguf(llamacpp, source, out_dir, cfg.get("model_name"))
         print(f"MagicQuant GGUF source: {source}", flush=True)
     elif is_dir_source:
         # llamacpp discovery/install failed -- fall back to the old behavior
