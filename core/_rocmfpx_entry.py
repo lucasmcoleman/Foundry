@@ -157,6 +157,37 @@ def _type_bpw(ggml_type: str) -> float:
     return 16.0
 
 
+# Literal-width GGUF float types. These are NOT MagicQuant "schemes" -- no
+# QuantizationScheme is registered for F32 or F16 in
+# magicquant.quant.schemes (only BF16 is) -- but a per-TENSOR map
+# (tensor_config/tensor_actual_types) legitimately contains them: 1-D
+# norms/biases always resolve to F32, and a requested BF16 tensor can resolve
+# to F16 on disk. Routing either through translate_scheme/_type_bpw raises
+# (translate_scheme("F32") happens to succeed since SCHEME_TO_ROCMFPX maps
+# "F32"->"F32", but _type_bpw then calls get_scheme_by_name("F32"), which is
+# unregistered and raises). Priced here as literal bit-widths instead,
+# case-insensitively, before anything is routed through the scheme
+# vocabulary at all.
+_LITERAL_WIDTH_BPW = {"F32": 32.0, "F16": 16.0, "BF16": 16.0}
+
+
+def _bpw_for_scheme(scheme: str) -> float:
+    """Bits-per-weight for one tensor's scheme/type-name value.
+
+    F32/F16/BF16 price as literal widths (``_LITERAL_WIDTH_BPW``) before
+    anything is routed through the MagicQuant-scheme/ROCmFPX-type vocabulary;
+    every other name goes through ``translate_scheme``/``_type_bpw`` as
+    before. Raises (propagated from ``translate_scheme`` or ``_type_bpw``)
+    for a name that is neither a literal width nor a recognized scheme --
+    callers that need a size guard to fail closed rather than silently skip
+    must not blanket-catch this.
+    """
+    literal = _LITERAL_WIDTH_BPW.get(str(scheme).upper())
+    if literal is not None:
+        return literal
+    return _type_bpw(translate_scheme(scheme))
+
+
 def predict_rendered_tier(config: dict, bf16_gguf: str) -> tuple:
     """Predict which tier band a MagicQuant config will land in once rendered
     into ROCmFPX types.
@@ -211,7 +242,9 @@ def predict_rendered_tier(config: dict, bf16_gguf: str) -> tuple:
     return predicted_gib, baseline_gib, classify_tier(predicted_gib, baseline_gib)
 
 
-def predict_rendered_budget(tensor_schemes: dict, bf16_gguf: str) -> tuple[float, float]:
+def predict_rendered_budget(
+    tensor_schemes: dict, bf16_gguf: str, fallback_schemes: dict | None = None,
+) -> tuple[float, float]:
     """Per-TENSOR analog of ``predict_rendered_tier``, for a v2 budget
     allocation (``{tensor_name: scheme}``, not ``{group: scheme}``).
 
@@ -220,8 +253,8 @@ def predict_rendered_budget(tensor_schemes: dict, bf16_gguf: str) -> tuple[float
     tensors in the same group two different schemes, something a per-group
     config has no way to represent.
 
-    Sums ``n_elems * bpw(translate_scheme(scheme))`` for each tensor present
-    in ``tensor_schemes``; a tensor NOT in it (untouched norms etc.) counts as
+    Sums ``n_elems * bpw(scheme)`` for each tensor present in
+    ``tensor_schemes``; a tensor NOT in it (untouched norms etc.) counts as
     32-bit, the same convention ``predict_rendered_tier`` uses for groups
     absent from its config.
 
@@ -230,9 +263,29 @@ def predict_rendered_budget(tensor_schemes: dict, bf16_gguf: str) -> tuple[float
     the better size proxy: ``tensor_actual_types`` (v2's own record of the
     type it actually resolved on disk, accounting for ggml-side block-size
     fallback) when present, else the plainly-REQUESTED ``tensor_config``.
-    Both maps share the same {tensor_name: scheme-or-ggml-type-name} shape
-    and vocabulary (every value is a name ``translate_scheme`` recognizes),
-    so this function doesn't need to know or care which one it was handed.
+    Both maps share the same ``{tensor_name: scheme-or-ggml-type-name}``
+    shape, but NOT one uniform vocabulary: most values are MagicQuant scheme
+    names or ROCmFPX-native type names, priced via
+    ``translate_scheme``/``_type_bpw``'s shared vocabulary, but 1-D
+    norms/biases legitimately resolve to bare ``F32``, and a requested
+    ``BF16`` tensor can resolve to ``F16`` on disk -- ``F32``/``F16`` are
+    literal-width GGUF float types, not MagicQuant schemes (no
+    ``QuantizationScheme`` is registered for them), so routing them through
+    the scheme vocabulary raises. ``_bpw_for_scheme`` prices those three
+    (F32/F16/BF16, case-insensitive) as literal widths first and only falls
+    through to ``translate_scheme``/``_type_bpw`` for everything else. Real
+    data: a 753-tensor budget block had 228 F32 tensors in both maps plus 40
+    F16 in ``tensor_actual_types`` -- this used to raise, silently disabling
+    the size guard entirely (see FAIL CLOSED below).
+
+    ``fallback_schemes``, when given, supplies a per-tensor backup value
+    (typically the REQUESTED ``tensor_config``, when ``tensor_schemes`` is
+    the resolved ``tensor_actual_types``) to retry a tensor whose primary
+    value still can't be priced by ``_bpw_for_scheme``. FAIL CLOSED: if BOTH
+    the primary and the fallback value for a tensor are unpriceable, this
+    raises ``ValueError`` naming that tensor, deliberately NOT swallowed
+    here -- a caller using this for a ship/refuse decision must not be able
+    to mistake "could not price" for "priced fine and it's small."
 
     Returns ``(predicted_gib, baseline_gib)`` -- no third ``tier`` element,
     since a budget build claims a GiB target, not a size band, so there is no
@@ -240,6 +293,7 @@ def predict_rendered_budget(tensor_schemes: dict, bf16_gguf: str) -> tuple[float
     """
     from magicquant.gguf.reader import GGUFReader
 
+    fallback_schemes = fallback_schemes or {}
     reader = GGUFReader(bf16_gguf)
     reader.open()
     rendered_bits = 0.0
@@ -255,7 +309,27 @@ def predict_rendered_budget(tensor_schemes: dict, bf16_gguf: str) -> tuple[float
             if scheme is None:                 # untouched (norms etc.)
                 rendered_bits += count * 32.0
                 continue
-            rendered_bits += count * _type_bpw(translate_scheme(scheme))
+            try:
+                bpw = _bpw_for_scheme(scheme)
+            except Exception as primary_exc:
+                fb_scheme = fallback_schemes.get(name)
+                if fb_scheme is None:
+                    raise ValueError(
+                        f"Cannot price tensor {name!r}: {scheme!r} is not a "
+                        f"literal width (F32/F16/BF16) or a known "
+                        f"MagicQuant/ROCmFPX scheme ({primary_exc}), and no "
+                        f"fallback value for this tensor is available."
+                    ) from primary_exc
+                try:
+                    bpw = _bpw_for_scheme(fb_scheme)
+                except Exception as fallback_exc:
+                    raise ValueError(
+                        f"Cannot price tensor {name!r}: neither its primary "
+                        f"value {scheme!r} ({primary_exc}) nor its fallback "
+                        f"value {fb_scheme!r} ({fallback_exc}) is a literal "
+                        f"width or a known MagicQuant/ROCmFPX scheme."
+                    ) from fallback_exc
+            rendered_bits += count * bpw
     finally:
         reader.close()
 
@@ -1389,22 +1463,54 @@ def _quantize_mq_budget(spec, requested, out_dir, rocmfpx_out_dir, model_name,
         # gets its refusal recorded instead of falling into the validate
         # RuntimeError -> outer except -> silent `return None`.
         #
-        # The prediction call is the only advisory part -- caught here so a
-        # broken predictor doesn't block a build it can't actually judge.
-        # The SHIP/REFUSE decision itself (comparison, record, return) sits
-        # OUTSIDE this try: nothing raised while deciding may be swallowed
-        # and let an over-budget build fall through to the quantize.
+        # FAIL CLOSED: a prediction failure here must never be advisory. It
+        # used to be caught, printed, and ignored -- leaving pred_gib at
+        # None, which silently skipped the comparison below and let an
+        # unpriceable (and therefore completely unguarded) build ship. This
+        # was live on real data: 228 of 753 tensors in a real budget block
+        # are F32 (1-D norms/biases always resolve to F32), which raised
+        # inside predict_rendered_budget and was swallowed here every time.
+        # Now a raise from predict_rendered_budget/predict_rendered_tier is
+        # caught ONCE, right here, and converted directly into a refusal
+        # record naming what couldn't be priced -- never into a bare
+        # `pred_gib = None` that lets the ship/refuse comparison below fall
+        # through unchecked. When pricing ``tensor_actual_types``, a
+        # per-tensor value that still can't be priced (an actual fallback
+        # scheme this module has no width for) gets one more chance via the
+        # REQUESTED ``tensor_config`` for that same tensor
+        # (predict_rendered_budget's own fallback_schemes arg); only if that
+        # also fails does pricing raise and this refuse.
         pred_gib = None
         base_gib = None
         try:
             if tensor_actual_types:
-                pred_gib, base_gib = predict_rendered_budget(tensor_actual_types, bf16_gguf)
+                pred_gib, base_gib = predict_rendered_budget(
+                    tensor_actual_types, bf16_gguf, fallback_schemes=tensor_config,
+                )
             elif tensor_config:
                 pred_gib, base_gib = predict_rendered_budget(tensor_config, bf16_gguf)
             else:
                 pred_gib, base_gib, _ = predict_rendered_tier(config, bf16_gguf)
-        except Exception as exc:  # noqa: BLE001 -- advisory, never blocks a valid build
-            print(f"  (budget-size prediction unavailable: {exc})", flush=True)
+        except Exception as exc:
+            refusal_reason = (
+                f"the {key} allocation's rendered size could not be "
+                f"predicted ({exc}) -- refusing rather than shipping a "
+                f"build with no working size guard."
+            )
+            print(f"Refusing {spec}: {refusal_reason}", flush=True)
+            _record_refusal(
+                rocmfpx_out_dir,
+                tier=key,
+                family=ROCMFPX_FAMILY,
+                reason=refusal_reason,
+                predicted_gib=None,
+                baseline_gib=None,
+                predicted_band="",
+                claimed_band="",
+                rule="budget",
+                requested_budget_gib=budget_gib,
+            )
+            return None
 
         if pred_gib is not None and pred_gib > budget_gib * (1 + BUDGET_TOLERANCE):
             refusal_reason = (

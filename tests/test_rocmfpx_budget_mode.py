@@ -179,6 +179,172 @@ def test_type_bpw_matches_fork_type_facts():
     assert _type_bpw("Q4_0_ROCMFP4") == pytest.approx(fact["size"] * 8.0 / fact["block"])
 
 
+# ── predict_rendered_budget: F32/F16/BF16 literal-width fix + fail-closed ──
+#
+# Real data (output/Qwen3.6-35B-A3B-budget/magicquant/search_results.json,
+# BUDGET-13.5GiB block) has 228/753 tensors at "F32" in BOTH tensor_config
+# and tensor_actual_types (1-D norms/biases always resolve to F32), plus 40
+# more at "F16" in tensor_actual_types alone. Before the fix, pricing either
+# raised (translate_scheme("F32") succeeds -- SCHEME_TO_ROCMFPX maps it to
+# itself -- but _type_bpw then calls get_scheme_by_name("F32"), which is
+# NOT a registered MagicQuant scheme, and raises), and the caller's advisory
+# `except Exception` swallowed it, silently skipping the ship/refuse guard.
+
+def test_predict_rendered_budget_prices_f32_tensors_at_4_bytes_per_elem(patched_reader):
+    """F32 appearing as an EXPLICIT value (not merely absent/'untouched') in
+    both the primary map and its fallback must price at 32 bpw = 4
+    bytes/elem, not raise -- this is the literal shape of the real defect."""
+    tensor_actual_types = {"blk.0.ffn_up.weight": "MXFP4_MOE",
+                           "blk.0.attn_norm.weight": "F32"}
+    tensor_config = {"blk.0.ffn_up.weight": "MXFP4_MOE",
+                     "blk.0.attn_norm.weight": "F32"}
+    pred_gib, base_gib = predict_rendered_budget(
+        tensor_actual_types, "stub.gguf", fallback_schemes=tensor_config)
+
+    bpw = _type_bpw(translate_scheme("MXFP4_MOE"))
+    f32_bytes = 100 * 4  # 100 elements at 4 bytes/elem
+    expected_bits = 1000 * bpw + f32_bytes * 8.0
+    expected_gib = expected_bits / 8.0 / 2 ** 30
+    assert pred_gib == pytest.approx(expected_gib, rel=1e-9)
+
+
+def test_quantize_mq_budget_f32_tensors_drive_a_correct_verdict(tmp_path, monkeypatch):
+    """End-to-end (mirrors the real 228/753-F32 block): with F32 tensors
+    priced correctly, a budget too tight to fit them must REFUSE with the
+    real (non-None) predicted size recorded -- not silently ship because the
+    guard's prediction call blew up and was swallowed."""
+    import magicquant.gguf.reader as reader_mod
+
+    class _Reader:
+        _SHAPES = {"blk.0.ffn_up.weight": [1000], "output_norm.weight": [500]}
+        def __init__(self, path): pass
+        def open(self): pass
+        def close(self): pass
+        def get_tensor_names(self): return list(self._SHAPES)
+        def get_tensor_info(self, name): return {"shape": self._SHAPES[name]}
+
+    monkeypatch.setattr(reader_mod, "GGUFReader", _Reader)
+    monkeypatch.setattr(entry, "validate_types_supported", lambda t, b: None)
+
+    tensor_config = {"blk.0.ffn_up.weight": "MXFP4_MOE", "output_norm.weight": "F32"}
+    tensor_actual_types = dict(tensor_config)
+
+    q4_bpw = _type_bpw(translate_scheme("MXFP4_MOE"))
+    true_gib = (1000 * q4_bpw + 500 * 32.0) / 8.0 / 2 ** 30
+    budget_gib = true_gib / (1 + BUDGET_TOLERANCE) - 0.001  # just under -> must refuse
+
+    out_dir = tmp_path / "output"
+    rocmfpx_out_dir = out_dir / "rocmfpx"
+    magicquant_dir = out_dir / "magicquant"
+    magicquant_dir.mkdir(parents=True)
+    key = "BUDGET-TEST"
+    (magicquant_dir / "search_results.json").write_text(json.dumps({
+        "tier_scheme_version": 2,
+        "tiered": {key: {
+            "config": {"U": "MXFP4_MOE"},
+            "tensor_config": tensor_config,
+            "tensor_actual_types": tensor_actual_types,
+            "budget_bytes": budget_gib * 1024 ** 3,
+        }},
+    }))
+
+    result = _quantize_mq_budget(
+        spec="mq-budget", requested="BUDGET", out_dir=out_dir,
+        rocmfpx_out_dir=rocmfpx_out_dir, model_name="stub-model",
+        quantize_bin=Path("/nonexistent/llama-quantize"),
+        bf16_gguf="stub.gguf", imatrix="",
+    )
+    assert result is None
+    records = json.loads((rocmfpx_out_dir / "_refusals.json").read_text())
+    assert records[0]["predicted_gib"] == pytest.approx(true_gib, rel=1e-6)
+
+
+def test_predict_rendered_budget_unpriceable_value_names_the_tensor(patched_reader):
+    """A scheme that is neither a literal width (F32/F16/BF16) nor a known
+    MagicQuant/ROCmFPX name must raise, naming the offending tensor -- fail
+    closed, with no fallback available for it."""
+    with pytest.raises(ValueError, match="blk.0.ffn_up.weight"):
+        predict_rendered_budget(
+            {"blk.0.ffn_up.weight": "TOTALLY_MADE_UP_TYPE"}, "stub.gguf")
+
+
+def test_predict_rendered_budget_unpriceable_primary_and_fallback_still_names_the_tensor(
+    patched_reader,
+):
+    """Even with a fallback_schemes map supplied, if BOTH the primary and
+    fallback value for a tensor are unpriceable, this must still raise,
+    naming the tensor -- never silently drop it or price it as 0."""
+    with pytest.raises(ValueError, match="blk.0.ffn_up.weight"):
+        predict_rendered_budget(
+            {"blk.0.ffn_up.weight": "TOTALLY_MADE_UP_TYPE"}, "stub.gguf",
+            fallback_schemes={"blk.0.ffn_up.weight": "ALSO_MADE_UP"})
+
+
+def test_predict_rendered_budget_recovers_via_fallback_when_primary_unpriceable(
+    patched_reader,
+):
+    """Primary value unpriceable, but the SAME tensor has a priceable
+    fallback (e.g. tensor_config's requested scheme, when
+    tensor_actual_types carries something this module can't price) --
+    recovers via the fallback instead of raising."""
+    pred_gib, base_gib = predict_rendered_budget(
+        {"blk.0.ffn_up.weight": "TOTALLY_MADE_UP_TYPE"}, "stub.gguf",
+        fallback_schemes={"blk.0.ffn_up.weight": "MXFP4_MOE"})
+    bpw = _type_bpw(translate_scheme("MXFP4_MOE"))
+    expected_bits = 1000 * bpw + 100 * 32.0
+    expected_gib = expected_bits / 8.0 / 2 ** 30
+    assert pred_gib == pytest.approx(expected_gib, rel=1e-9)
+
+
+# ── THE REAL-BLOCK TEST: the actual defect, on the actual data ─────────────
+
+_REAL_SEARCH_RESULTS = (
+    Path(__file__).resolve().parents[1]
+    / "output" / "Qwen3.6-35B-A3B-budget" / "magicquant" / "search_results.json"
+)
+_REAL_BF16_GGUF = (
+    Path(__file__).resolve().parents[1]
+    / "output" / "Qwen3.6-35B-A3B-budget" / "model-bf16.gguf"
+)
+
+
+@pytest.mark.skipif(
+    not (_REAL_SEARCH_RESULTS.exists() and _REAL_BF16_GGUF.exists()),
+    reason="real run output not present (output/ is gitignored) -- "
+           "this box's output/Qwen3.6-35B-A3B-budget/ has it",
+)
+def test_predict_rendered_budget_real_block_is_finite_and_close_to_requested():
+    """THE test that would have caught the original defect: the real
+    BUDGET-13.5GiB block (753 tensors, 228 legitimately F32 in both maps, 40
+    more F16-in-tensor_actual_types) must price to a finite number in the
+    neighborhood of the requested 13.5 GiB -- not raise, and not silently
+    vanish into a swallowed exception three frames up."""
+    data = json.loads(_REAL_SEARCH_RESULTS.read_text())
+    tiered = data["tiered"]
+    key = "BUDGET-13.5GiB"
+    assert key in tiered, f"expected {key!r} in {sorted(tiered)}"
+    block = tiered[key]
+    tensor_config = block["tensor_config"]
+    tensor_actual_types = block["tensor_actual_types"]
+    assert sum(1 for v in tensor_config.values() if v == "F32") > 0  # sanity: real defect shape
+    assert sum(1 for v in tensor_actual_types.values() if v == "F16") > 0
+
+    pred_gib, base_gib = predict_rendered_budget(
+        tensor_actual_types, str(_REAL_BF16_GGUF), fallback_schemes=tensor_config)
+
+    import math
+    assert math.isfinite(pred_gib) and pred_gib > 0
+    # ROCmFPX's sparse family (no type between 4.5 and 6.5 bpw) rounds
+    # several schemes UP, so this legitimately renders somewhat larger than
+    # the 13.5 GiB v2 knapsack target (measured on this box: ~15.25 GiB,
+    # ~13% over -- itself correctly a REFUSE at BUDGET_TOLERANCE=2%). The
+    # bound below is deliberately generous: its job is to catch "didn't
+    # raise, isn't None, isn't the ~66 GiB untouched-everywhere pathology,
+    # isn't zero/negative" -- not to pin the exact predictor output.
+    assert 10.0 <= pred_gib <= 20.0
+    assert base_gib > pred_gib  # BF16 baseline still dwarfs the quantized render
+
+
 # ── _record_refusal: additive rule/requested_budget_gib kwargs ─────────────
 
 def test_record_refusal_omits_additive_fields_by_default(tmp_path):
@@ -508,9 +674,14 @@ def test_quantize_mq_budget_validates_union_of_config_and_tensor_config_types(tm
     assert translate_scheme("MXFP4_MOE") in captured["required_types"]
 
 
-def test_quantize_mq_budget_prediction_failure_is_advisory_not_fatal(tmp_path, monkeypatch):
-    """Mirrors _quantize_mq_hybrid: if the size prediction itself blows up,
-    that's advisory (printed), not a build-blocking error."""
+def test_quantize_mq_budget_prediction_failure_fails_closed_and_refuses(
+    tmp_path, monkeypatch, capsys,
+):
+    """FAIL CLOSED: if the size prediction itself blows up, that must refuse
+    the build (with a recorded reason) rather than silently shipping it
+    unguarded -- the inverse of the old (buggy) advisory behavior this test
+    used to pin. A prediction failure means the guard cannot tell whether the
+    build is over budget, so it must not ship on the strength of a guess."""
     out_dir = tmp_path / "output"
     rocmfpx_out_dir = out_dir / "rocmfpx"
     key = "BUDGET-10GiB"
@@ -537,7 +708,19 @@ def test_quantize_mq_budget_prediction_failure_is_advisory_not_fatal(tmp_path, m
         quantize_bin=Path("/nonexistent/llama-quantize"),
         bf16_gguf="stub.gguf", imatrix="",
     )
-    assert result == built
+    assert result is None
+    assert not built.exists()
+    out = capsys.readouterr().out
+    assert "Refusing mq-budget" in out
+    assert "boom" in out
+
+    records = json.loads((rocmfpx_out_dir / "_refusals.json").read_text())
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["tier"] == key
+    assert rec["rule"] == "budget"
+    assert rec["predicted_gib"] is None
+    assert "boom" in rec["reason"]
 
 
 def test_quantize_mq_budget_prices_from_tensor_actual_types_when_present(
