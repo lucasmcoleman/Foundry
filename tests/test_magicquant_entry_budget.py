@@ -71,6 +71,12 @@ def _cfg(tmp_path, **over):
         "seed": 7,           # inapplicable to v2 -> must be loudly ignored
         "tiers_json": '["Q4","Q5","Q6"]',
         "verify": False,
+        # A real cfg dict (services.MagicQuantService.build_config) always
+        # carries these -- enable_kl defaults True since 2026-08-07. Stock
+        # values here so the "no false positive" test below reflects what a
+        # real stock budget cfg actually looks like, not an absent key.
+        "enable_kl": True,
+        "kl_weight": 0.1,
     }
     cfg.update(over)
     return cfg
@@ -104,6 +110,20 @@ def test_inapplicable_v1_knobs_are_loudly_ignored(monkeypatch, tmp_path, capsys)
     # Pins the no-false-positive-noise half: deleting that filter would
     # announce every listed key, including ones left at their default.
     assert "generations" not in text
+
+
+def test_stock_enable_kl_default_emits_no_ignored_note(monkeypatch, tmp_path, capsys):
+    """enable_kl now defaults True (services.build_config); a stock budget
+    cfg (enable_kl=True, kl_weight=0.1, both left at default) must not be
+    misreported as a user-set 'ignored key' -- _BUDGET_KEY_DEFAULTS must
+    know enable_kl's real default is True, not the False/None/"" generic
+    unset sentinel every other listed key happens to share."""
+    _install_fake_v2(monkeypatch, tmp_path)
+    from core import _magicquant_entry as entry
+    entry._run_budget(_cfg(tmp_path), str(tmp_path / "s.gguf"), None)
+    text = capsys.readouterr().out
+    assert "enable_kl" not in text
+    assert "kl_weight" not in text
 
 
 def test_infeasible_budget_exits_with_floor_in_message(monkeypatch, tmp_path, capsys):

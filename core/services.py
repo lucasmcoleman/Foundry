@@ -332,7 +332,7 @@ class MagicQuantService:
         seed: Optional[int] = None,
         use_imatrix: bool = True,
         imatrix_corpus: Optional[str] = None,
-        enable_kl: bool = False,
+        enable_kl: bool = True,
         kl_weight: float = 0.1,
         enable_speed_bench: bool = False,
         measurement_chunks: Optional[int] = None,

@@ -356,6 +356,11 @@ _BUDGET_IGNORED_KEYS = (
 _BUDGET_KEY_DEFAULTS = {
     "generations": 50, "population_size": 100, "measurement_rounds": 3,
     "target_base_quant": "MXFP4_MOE", "kl_weight": 0.1,
+    # enable_kl default mirrors core.services.build_config's enable_kl=True
+    # (the one source of truth for CLI + UI stage config); listed here so a
+    # stock budget cfg (enable_kl left at its default) isn't misreported as
+    # a user-set value ignored under v2 budget search.
+    "enable_kl": True,
     "speed_metric": "bytes", "tiers_json": '["Q4","Q5","Q6"]',
 }
 
@@ -372,8 +377,17 @@ def _run_budget(cfg: dict, source: str, llamacpp) -> str:
     budget_gib = float(cfg["budget_gib"])
     for key in _BUDGET_IGNORED_KEYS:
         val = cfg.get(key)
-        default = _BUDGET_KEY_DEFAULTS.get(key)
-        if val not in (None, False, "", default):
+        if key in _BUDGET_KEY_DEFAULTS:
+            # Known default: report ANY deviation from it, including falsy
+            # ones -- with enable_kl defaulting True, an explicit
+            # --magicquant-no-kl (False) is a real user-set value that the
+            # v2 budget search will ignore, and the generic falsy sentinel
+            # below would silently swallow it.
+            notable = val is not None and val != _BUDGET_KEY_DEFAULTS[key]
+        else:
+            # No recorded default: fall back to the unset heuristic.
+            notable = val not in (None, False, "")
+        if notable:
             print(f"  note: {key}={val!r} is ignored under "
                   f"--magicquant-budget-gib (v2 search)", flush=True)
 

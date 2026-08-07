@@ -253,7 +253,7 @@ class MagicQuantCfg(BaseModel):
     seed: Optional[int] = None       # optional RNG seed for a reproducible search
     use_imatrix: bool = True         # capture/reuse an importance matrix (both search paths)
     imatrix_corpus: Optional[str] = None  # calibration corpus; None = bundled default
-    enable_kl: bool = False          # measured-search only: real KL-divergence-to-base
+    enable_kl: bool = True           # measured-search only: real KL-divergence-to-base
     kl_weight: float = 0.1           # weight of |mean_kl| in measured-search selection
     enable_speed_bench: bool = False  # measured-search only: real tokens/sec per candidate
     measurement_chunks: Optional[int] = None  # cap perplexity/KL passes (both search paths)

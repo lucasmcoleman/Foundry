@@ -43,7 +43,9 @@ def test_magicquant_config_new_knob_defaults():
     mc = pl.MagicQuantConfig()
     assert mc.use_imatrix is False
     assert mc.imatrix_corpus is None
-    assert mc.enable_kl is False
+    # True since 2026-08-07: probes are KL-scored, resolving dense models
+    # whose sub-percent probe deltas sit below raw-PPL measurement error.
+    assert mc.enable_kl is True
     assert mc.kl_weight == 0.1
     assert mc.enable_speed_bench is False
     assert mc.measurement_chunks is None
@@ -83,7 +85,7 @@ def test_magicquant_cli_flags_wire_into_config(monkeypatch):
     mc = captured["cfg"].magicquant
     assert mc.use_imatrix is False
     assert mc.imatrix_corpus is None
-    assert mc.enable_kl is False
+    assert mc.enable_kl is True  # default since 2026-08-07
     assert mc.kl_weight == 0.1
     assert mc.enable_speed_bench is False
     assert mc.stream_aware is False
@@ -173,10 +175,12 @@ def test_magicquant_stream_aware_and_head_aggressive_cli_flags_unconditional(mon
     assert mc.head_aggressive is True
 
 
-def test_magicquant_kl_weight_only_applied_when_kl_flag_set(monkeypatch):
-    """--magicquant-kl-weight alone (without --magicquant-kl) must not silently
-    enable KL scoring -- mirrors --magicquant-rounds only applying under
-    --magicquant-measured."""
+def test_magicquant_kl_weight_applied_without_kl_flag(monkeypatch):
+    """--magicquant-kl-weight alone (without --magicquant-kl) must still land
+    in the config -- enable_kl already defaults True since 2026-08-07, so
+    gating an explicitly-passed weight behind the now-redundant --magicquant-kl
+    flag would silently discard it. The argparse default is a None sentinel
+    (not 0.1) so "explicitly passed" and "left alone" are distinguishable."""
     pl = _pipeline()
     captured = {}
 
@@ -190,8 +194,74 @@ def test_magicquant_kl_weight_only_applied_when_kl_flag_set(monkeypatch):
         "--magicquant-kl-weight", "0.9",
     ])
     mc = captured["cfg"].magicquant
+    assert mc.enable_kl is True
+    assert mc.kl_weight == 0.9  # honored even though --magicquant-kl wasn't passed
+
+
+def test_magicquant_kl_weight_untouched_when_not_passed(monkeypatch):
+    """No --magicquant-kl-weight at all -> dataclass default (0.1) survives,
+    proving the None sentinel doesn't clobber it."""
+    pl = _pipeline()
+    captured = {}
+
+    def _fake_run_pipeline(cfg, **kwargs):
+        captured["cfg"] = cfg
+        return {"magicquant": True}
+
+    monkeypatch.setattr(pl, "run_pipeline", _fake_run_pipeline)
+    pl.main(["--model", "org/m", "--no-export", "--no-heretic", "--no-reap"])
+    mc = captured["cfg"].magicquant
+    assert mc.enable_kl is True
+    assert mc.kl_weight == 0.1
+
+
+def test_magicquant_no_kl_flag_disables_default_on_kl(monkeypatch):
+    """enable_kl now defaults True; --magicquant-no-kl is the only CLI way
+    to turn the default-on blend back off."""
+    pl = _pipeline()
+    captured = {}
+
+    def _fake_run_pipeline(cfg, **kwargs):
+        captured["cfg"] = cfg
+        return {"magicquant": True}
+
+    monkeypatch.setattr(pl, "run_pipeline", _fake_run_pipeline)
+    pl.main([
+        "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
+        "--magicquant-no-kl",
+    ])
+    mc = captured["cfg"].magicquant
     assert mc.enable_kl is False
-    assert mc.kl_weight == 0.1  # untouched dataclass default
+
+
+def test_magicquant_kl_and_no_kl_are_mutually_exclusive(monkeypatch):
+    pl = _pipeline()
+    monkeypatch.setattr(pl, "run_pipeline", lambda cfg, **kw: {"magicquant": True})
+    with pytest.raises(SystemExit):
+        pl.main([
+            "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
+            "--magicquant-kl", "--magicquant-no-kl",
+        ])
+
+
+def test_magicquant_kl_help_text_reflects_default_on(monkeypatch, capsys):
+    """--magicquant-kl help text must say blending is on by default and the
+    flag remains for explicitness/back-compat, not read as the on-switch."""
+    pl = _pipeline()
+    parser = pl.build_arg_parser()
+    help_text = parser.format_help()
+    options_text = help_text.split("\noptions:", 1)[-1]
+    assert "--magicquant-kl " in options_text
+    # Find the --magicquant-kl (not --magicquant-kl-weight/--magicquant-no-kl)
+    # help block in the options list and check it mentions the default-on
+    # behavior.
+    import re
+    m = re.search(
+        r"^  --magicquant-kl(?:\s|$).*?(?=^  --|\Z)",
+        options_text, re.S | re.M,
+    )
+    assert m is not None
+    assert "default" in m.group(0).lower()
 
 
 def test_magicquant_speed_cli_flags_wire_into_config(monkeypatch):
@@ -367,12 +437,31 @@ def test_magicquant_build_config_new_knobs_default():
     # once the calibration is sound. imatrix_corpus stays None = bundled.
     assert cfg["use_imatrix"] is True
     assert cfg["imatrix_corpus"] is None
-    assert cfg["enable_kl"] is False
+    # True since 2026-08-07: measured searches default to KL-scored probing
+    # (see CLAUDE.md's MagicQuant stage-6 note); kl_weight stays 0.1.
+    assert cfg["enable_kl"] is True
     assert cfg["kl_weight"] == 0.1
     assert cfg["enable_speed_bench"] is False
     assert cfg["measurement_chunks"] is None
     assert cfg["stream_aware"] is False
     assert cfg["head_aggressive"] is False
+
+
+def test_magicquant_build_config_measured_search_default_kl():
+    """A measured-search config built with no explicit enable_kl/kl_weight
+    override must carry enable_kl=True, kl_weight=0.1 (2026-08-07 default)
+    so it reaches _magicquant_entry.py's run_measured_search kwargs and,
+    downstream, MagicQuantOrchestrator's KL-scored probing."""
+    svc = MagicQuantService(ROOT, "python")
+    cfg = svc.build_config(
+        llamacpp_hint="", pipeline_root_str="/repo", mq_source_override="/src",
+        out_abs_str="/o", generations=5, population_size=10,
+        target_base_quant="IQ4_NL", tiers_json="{}", model_name="m",
+        measured=True,
+    )
+    assert cfg["measured"] is True
+    assert cfg["enable_kl"] is True
+    assert cfg["kl_weight"] == 0.1
 
 
 def test_magicquant_build_config_carries_speed_knobs():
@@ -815,7 +904,7 @@ def test_magicquantcfg_new_knob_defaults():
     # See the note in test_magicquant_build_config_new_knobs_default.
     assert c.use_imatrix is True
     assert c.imatrix_corpus is None
-    assert c.enable_kl is False
+    assert c.enable_kl is True  # default since 2026-08-07
     assert c.kl_weight == 0.1
     assert c.enable_speed_bench is False
     assert c.measurement_chunks is None
