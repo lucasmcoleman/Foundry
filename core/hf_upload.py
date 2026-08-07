@@ -523,6 +523,51 @@ def card_rows_from_repo(
     return rows, sizes
 
 
+# A local copy of core.publish_criteria.BUDGET_FILE_RE, used only if that
+# module is unimportable (see `_load_budget_file_re`). Pinned equal to the
+# real regex by test_hf_upload_budget_regex_fallback.py's pattern-parity
+# test, so the two can never silently drift apart.
+_BUDGET_FILE_RE_FALLBACK = re.compile(r"-BUDGET-([\d.]+)GiB\.gguf$")
+
+
+def _load_budget_file_re(log: LogFn = _default_log) -> "re.Pattern":
+    """Load ``core.publish_criteria.BUDGET_FILE_RE`` (Task 4), with a
+    value-identical local fallback if that import fails.
+
+    ``publish_criteria`` imports ``magicquant.quant.tiers`` at MODULE SCOPE,
+    so the whole module -- including this bare regex, which needs nothing
+    from magicquant -- is unimportable in a magicquant-less environment.
+    That used to fail SILENTLY (``BUDGET_FILE_RE = None``): a budget file
+    then got no Size-Target section, no "Size-target build" quant hint, and
+    no log line, and ``audit_card_against_repo`` doesn't catch it either --
+    the file's GGUF table row still accounts for it, so nothing looks
+    broken. Falling back to ``_BUDGET_FILE_RE_FALLBACK`` keeps the feature
+    working instead of quietly disabling it; the warning makes the fallback
+    traceable rather than invisible.
+
+    Pulled out of ``generate_model_card`` into its own function specifically
+    so the ImportError branch can be exercised directly in tests (via
+    ``sys.modules[name] = None`` poisoning) instead of needing a fragile
+    reload of the whole ``hf_upload`` module. Always returns a working
+    compiled pattern -- never ``None`` -- so callers no longer need an
+    ``if BUDGET_FILE_RE else None`` guard.
+    """
+    try:
+        from publish_criteria import BUDGET_FILE_RE
+        return BUDGET_FILE_RE
+    except ImportError:
+        try:
+            from core.publish_criteria import BUDGET_FILE_RE
+            return BUDGET_FILE_RE
+        except ImportError as e:
+            log(f"  WARNING: could not import core.publish_criteria "
+                f"({type(e).__name__}: {e}) -- using a local fallback copy "
+                f"of BUDGET_FILE_RE so size-target files are still "
+                f"disclosed. If magicquant is expected to be installed here, "
+                f"this warning itself is the bug to chase.", "warn")
+            return _BUDGET_FILE_RE_FALLBACK
+
+
 def generate_model_card(
     cfg: HFUploadConfig,
     files_to_upload: list[tuple[Path, str]],
@@ -572,32 +617,10 @@ def generate_model_card(
     fpx_measured = _find_rocmfpx_measurements(files_to_upload)
     # Size-target ("budget") files claim a GiB SIZE via filename, not a
     # Q-tier band -- detected with the same regex publish-time code uses
-    # (core.publish_criteria.BUDGET_FILE_RE, Task 4). Imported lazily, like
-    # recommend_tier below.
-    #
-    # publish_criteria imports magicquant.quant.tiers at MODULE SCOPE, so the
-    # whole module -- including this bare regex, which needs nothing from
-    # magicquant -- is unimportable in a magicquant-less environment. That
-    # used to fail SILENTLY (BUDGET_FILE_RE = None): a budget file then got no
-    # Size-Target section, no "Size-target build" quant hint, and no log
-    # line, and audit_card_against_repo doesn't catch it either -- the file's
-    # GGUF table row still accounts for it, so nothing looks broken. Falling
-    # back to a LOCAL copy of the same pattern keeps the feature working
-    # instead of quietly disabling it; the warning makes the fallback
-    # traceable rather than invisible.
-    _BUDGET_FILE_RE_FALLBACK = re.compile(r"-BUDGET-([\d.]+)GiB\.gguf$")
-    try:
-        from publish_criteria import BUDGET_FILE_RE
-    except ImportError:
-        try:
-            from core.publish_criteria import BUDGET_FILE_RE
-        except ImportError as e:
-            log(f"  WARNING: could not import core.publish_criteria "
-                f"({type(e).__name__}: {e}) -- using a local fallback copy "
-                f"of BUDGET_FILE_RE so size-target files are still "
-                f"disclosed. If magicquant is expected to be installed here, "
-                f"this warning itself is the bug to chase.", "warn")
-            BUDGET_FILE_RE = _BUDGET_FILE_RE_FALLBACK
+    # (core.publish_criteria.BUDGET_FILE_RE, Task 4). See
+    # `_load_budget_file_re`'s docstring for why this needs a fallback at
+    # all. Tested directly: tests/test_hf_upload_budget_regex_fallback.py.
+    BUDGET_FILE_RE = _load_budget_file_re(log)
     # (local_path, repo_path, requested_gib, size_bytes) for every budget
     # file in the upload set, collected as rows render so the dedicated
     # section below doesn't need a second pass over files_to_upload.
