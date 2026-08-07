@@ -503,7 +503,8 @@ def fake_orchestrator(monkeypatch, tmp_path):
     # Measured runs auto-convert a safetensors source to BF16 GGUF via
     # convert_hf_to_gguf.py, which the fake llamacpp dir doesn't have.
     monkeypatch.setattr(
-        entry, "_ensure_bf16_gguf", lambda llamacpp_dir, source, out_dir: source
+        entry, "_ensure_bf16_gguf",
+        lambda llamacpp_dir, source, out_dir, model_name=None: source
     )
 
     return entry
@@ -1244,7 +1245,7 @@ def test_entry_converts_directory_source_even_when_not_measured(
 
     calls = []
 
-    def _fake_ensure(llamacpp_dir, source, out_dir):
+    def _fake_ensure(llamacpp_dir, source, out_dir, model_name=None):
         calls.append((llamacpp_dir, source, out_dir))
         return str(tmp_path / "model-bf16.gguf")
 
@@ -1269,7 +1270,7 @@ def test_entry_converts_directory_source_when_measured_too(
 
     calls = []
 
-    def _fake_ensure(llamacpp_dir, source, out_dir):
+    def _fake_ensure(llamacpp_dir, source, out_dir, model_name=None):
         calls.append((llamacpp_dir, source, out_dir))
         return str(tmp_path / "model-bf16.gguf")
 

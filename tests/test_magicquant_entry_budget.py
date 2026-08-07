@@ -184,7 +184,7 @@ def test_run_dispatches_budget_with_converted_source_and_honors_smoke_gate(
     converted_source = "/converted/model-bf16.gguf"
     monkeypatch.setattr(
         entry, "_ensure_bf16_gguf",
-        lambda llamacpp_dir, source, out_dir: converted_source,
+        lambda llamacpp_dir, source, out_dir, model_name=None: converted_source,
     )
 
     cfg_path = tmp_path / "run_cfg.json"

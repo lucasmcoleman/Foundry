@@ -691,3 +691,57 @@ def test_find_perplexity_bin_resolves_real_rocmfpx_build_layout(tmp_path):
     (bin_dir / "llama-perplexity").write_text("")
 
     assert ppl_smoke.find_perplexity_bin(str(tmp_path)) == bin_dir / "llama-perplexity"
+
+
+# ── _ensure_bf16_gguf: --model-name threading ────────────────────────────
+#
+# Run dirs stage the checkpoint under a literal source/ directory, and
+# convert_hf_to_gguf.py derives general.name from that directory name when
+# not told otherwise -- every published GGUF through this path shipped with
+# general.name = "Source". _ensure_bf16_gguf must pass the real name
+# through as --model-name when the caller supplies one, and must not add
+# the flag at all when it doesn't (old behavior, for untouched callers).
+
+def _stub_rocmfpx_dir(tmp_path):
+    d = tmp_path / "rocmfpx"
+    d.mkdir()
+    (d / "convert_hf_to_gguf.py").write_text("")
+    return d
+
+
+def _stub_subprocess_run(monkeypatch, called):
+    def fake_run(argv, *a, **k):
+        called["argv"] = argv
+        outfile = Path(argv[argv.index("--outfile") + 1])
+        outfile.write_bytes(b"GGUF")
+
+        class R:
+            returncode = 0
+        return R()
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+
+def test_ensure_bf16_gguf_includes_model_name_flag_when_given(tmp_path, monkeypatch):
+    rocmfpx_dir = _stub_rocmfpx_dir(tmp_path)
+    src = tmp_path / "src"; src.mkdir()
+    out = tmp_path / "out"; out.mkdir()
+    called = {}
+    _stub_subprocess_run(monkeypatch, called)
+
+    entry._ensure_bf16_gguf(str(rocmfpx_dir), str(src), out, "MyModel")
+
+    assert "--model-name" in called["argv"]
+    assert called["argv"][called["argv"].index("--model-name") + 1] == "MyModel"
+
+
+def test_ensure_bf16_gguf_omits_model_name_flag_when_not_given(tmp_path, monkeypatch):
+    rocmfpx_dir = _stub_rocmfpx_dir(tmp_path)
+    src = tmp_path / "src"; src.mkdir()
+    out = tmp_path / "out"; out.mkdir()
+    called = {}
+    _stub_subprocess_run(monkeypatch, called)
+
+    # old-behavior default: no model_name argument at all.
+    entry._ensure_bf16_gguf(str(rocmfpx_dir), str(src), out)
+
+    assert "--model-name" not in called["argv"]
