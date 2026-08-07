@@ -116,8 +116,9 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
    ~55% of live's recovery in a controlled 4-arm rerun (+13.0% vs +21.8%), and
    a frozen run's *raw* out-of-domain PPL delta can be negative even when its
    controlled recovery is positive — that signature explains the Qwen3.6-35B-A3B
-   frozen-QAT −6.1% and is why that build shipped pre-QAT. Judge frozen runs
-   only with a control arm or an in-domain eval. See MagicQuant's `docs/qat.md`
+   frozen-QAT −6.1% and is why that build shipped pre-QAT (in-domain, the same
+   QAT build measures −2.20% BETTER than pre-QAT on held-out chat-blend text).
+   Judge frozen runs only with a control arm or an in-domain eval. See MagicQuant's `docs/qat.md`
    + `docs/experiments/qat-frozen-mode-2026-08.md`.
 6. **MagicQuant**: Evolutionary search → 3-tier hybrid GGUFs (Q4/Q5/Q6).
    **A tier name is a SIZE BAND, not a recipe** — see "Tier semantics" below.
