@@ -71,14 +71,26 @@ case "${1:-}" in
   --stop)   shift; cmd_stop   "$@"; exit $? ;;
 esac
 
-NAME=""; MEM="$DEFAULT_MEM"; LOGFILE=""
+NAME=""; MEM="$DEFAULT_MEM"; LOGFILE=""; PROTECT=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --name) NAME="$2"; shift 2 ;;
-    --mem)  MEM="$2";  shift 2 ;;
-    --log)  LOGFILE="$2"; shift 2 ;;
-    --)     shift; break ;;
-    *)      die "unknown option: $1 (did you forget -- before the command?)" ;;
+    --name)    NAME="$2"; shift 2 ;;
+    --mem)     MEM="$2";  shift 2 ;;
+    --log)     LOGFILE="$2"; shift 2 ;;
+    # --protect: this run is LONG and NOT resumable, so it must survive a
+    # global OOM rather than absorb it.
+    #
+    # WHY THIS EXISTS (2026-08-05): the default OOMScoreAdjust=1000 below is
+    # correct for a disposable inference run -- kill the model, spare the box.
+    # Applied to a 7-hour QAT job with no checkpointing it is exactly
+    # backwards: it guarantees the most expensive, least recoverable job is the
+    # kernel's FIRST victim. An ffmpeg transcode drove the box OOM and the
+    # kernel duly killed a 7h training run while 1 GB containers survived,
+    # because I had volunteered it. --protect inverts that: negative adj plus a
+    # MemoryMin reservation so reclaim pressure goes elsewhere first.
+    --protect) PROTECT=1; shift ;;
+    --)        shift; break ;;
+    *)         die "unknown option: $1 (did you forget -- before the command?)" ;;
   esac
 done
 [[ -n "$NAME" ]] || die "--name is required"
@@ -155,11 +167,25 @@ echo "  agent session shielded (oom_score_adj=-700); model unit is the preferred
 #                    the box; 2026-08-04 it took the agent's whole scope.)
 # NOTE: MemorySwapMax=0 was tried and removed -- denying swap to a cgroup whose
 # mmap'd model is 80 GiB just converts reclaim into an OOM kill.
+if (( PROTECT )); then
+  # Long, non-resumable job: make it a LAST-resort victim and reserve its
+  # working set so the kernel reclaims from the box's other tenants first.
+  # need_gib was derived from the actual model file above.
+  OOM_ADJ=-800
+  MEM_MIN=$(( need_gib > 0 ? need_gib : 40 ))
+  EXTRA=( --property=MemoryMin="${MEM_MIN}G" )
+  echo "  PROTECTED run: oom_score_adj=$OOM_ADJ, MemoryMin=${MEM_MIN}G"
+else
+  OOM_ADJ=1000
+  EXTRA=()
+fi
+
 sudo -n systemd-run \
   --unit="$UNIT" \
   --collect \
   --property=MemoryMax="$MEM" \
-  --property=OOMScoreAdjust=1000 \
+  --property=OOMScoreAdjust="$OOM_ADJ" \
+  "${EXTRA[@]}" \
   --property=OOMPolicy=stop \
   --property=WorkingDirectory="$PWD" \
   --property=Environment=LD_LIBRARY_PATH=/home/lucas/lib-override \
