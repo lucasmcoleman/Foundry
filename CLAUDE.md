@@ -106,11 +106,19 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
    adapters that compensate. Delegates to `magicquant.qat.run_qat` (needs the
    MagicQuant `[qat]` extra). Enable with `--qat --qat-dataset <chat.jsonl>` or
    the UI QAT card. Writes adapters to `<output>/qat_adapters/`. Validated
-   (confound-controlled, Qwen2.5-0.5B base, aggressive Q4_K-attn/MXFP4-FFN hybrid):
-   QAT recovered **47.5% of the quantization loss beyond plain LoRA domain
-   adaptation** (bf16-vs-quant PPL gap +3.19 → +1.67 vs a bf16+identical-LoRA
-   control). Recovery scales with quant aggressiveness; the final GGUF pack is
-   exact-ggml. See MagicQuant's `docs/qat.md`.
+   (confound-controlled, Qwen2.5-0.5B base, aggressive hybrid — effectively
+   MXFP4-attn/MXFP4-FFN: 896-wide rows can't take Q4_K, the writer's block-32
+   fallback applies): **live-mode** QAT recovered **47.5% of the quantization
+   loss beyond plain LoRA domain adaptation** (bf16-vs-quant PPL gap
+   +3.19 → +1.67 vs a bf16+identical-LoRA control). Recovery scales with quant
+   aggressiveness; the final GGUF pack is exact-ggml. **Mode matters**: frozen
+   mode (the only feasible mode for fused 3-D MoE experts at scale) measured
+   ~55% of live's recovery in a controlled 4-arm rerun (+13.0% vs +21.8%), and
+   a frozen run's *raw* out-of-domain PPL delta can be negative even when its
+   controlled recovery is positive — that signature explains the Qwen3.6-35B-A3B
+   frozen-QAT −6.1% and is why that build shipped pre-QAT. Judge frozen runs
+   only with a control arm or an in-domain eval. See MagicQuant's `docs/qat.md`
+   + `docs/experiments/qat-frozen-mode-2026-08.md`.
 6. **MagicQuant**: Evolutionary search → 3-tier hybrid GGUFs (Q4/Q5/Q6).
    **A tier name is a SIZE BAND, not a recipe** — see "Tier semantics" below.
    Prediction-only by default; `--magicquant-measured` runs the real-perplexity
