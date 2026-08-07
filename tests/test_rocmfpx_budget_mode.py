@@ -540,6 +540,135 @@ def test_quantize_mq_budget_prediction_failure_is_advisory_not_fatal(tmp_path, m
     assert result == built
 
 
+def test_quantize_mq_budget_prices_from_tensor_actual_types_when_present(
+    tmp_path, monkeypatch, capsys,
+):
+    """v2's own record of the type it ACTUALLY resolved on disk
+    (``tensor_actual_types``, written by ``magicquant.v2.interchange``) must
+    be priced in preference to the merely-REQUESTED ``tensor_config`` -- a
+    K-quant that ggml's writer fell back to a higher-precision block-32 type
+    (e.g. Q5_K -> Q8_0 on a non-256-divisible row) is bigger than what was
+    asked for, so pricing the request instead of the resolved type silently
+    under-prices a build that is actually over budget.
+
+    Rigged so the two pricings disagree on the SHIP/REFUSE verdict itself:
+    the (wrong) requested-scheme price lands exactly at budget, the actual
+    on-disk type's price is over tolerance.
+    """
+    import magicquant.gguf.reader as reader_mod
+
+    n = 100_000
+
+    class _OneTensorReader:
+        def __init__(self, path):
+            pass
+
+        def open(self):
+            pass
+
+        def close(self):
+            pass
+
+        def get_tensor_names(self):
+            return ["blk.0.attn_q.weight"]
+
+        def get_tensor_info(self, name):
+            return {"shape": [n]}
+
+    monkeypatch.setattr(reader_mod, "GGUFReader", _OneTensorReader)
+    monkeypatch.setattr(entry, "validate_types_supported", lambda t, b: None)
+
+    q5k_bpw = _type_bpw(translate_scheme("Q5_K"))
+    q8_0_bpw = _type_bpw(translate_scheme("Q8_0"))
+    assert q8_0_bpw > q5k_bpw  # sanity: the fallback is more expensive, not less
+
+    requested_gib = n * q5k_bpw / 8.0 / 2 ** 30
+    actual_gib = n * q8_0_bpw / 8.0 / 2 ** 30
+    budget_gib = requested_gib  # requested-scheme price lands exactly at budget
+    assert actual_gib > budget_gib * (1 + BUDGET_TOLERANCE)  # actual price is over
+
+    out_dir = tmp_path / "output"
+    rocmfpx_out_dir = out_dir / "rocmfpx"
+    magicquant_dir = out_dir / "magicquant"
+    magicquant_dir.mkdir(parents=True)
+    key = "BUDGET-10GiB"
+    (magicquant_dir / "search_results.json").write_text(json.dumps({
+        "tier_scheme_version": 2,
+        "tiered": {key: {
+            "config": {"Q": "Q5_K"},
+            "tensor_config": {"blk.0.attn_q.weight": "Q5_K"},
+            "tensor_actual_types": {"blk.0.attn_q.weight": "Q8_0"},
+            "budget_bytes": budget_gib * 1024 ** 3,
+        }},
+    }))
+
+    built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
+
+    def _fake_run(cmd, *a, **kw):
+        built.write_bytes(b"gguf")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = _quantize_mq_budget(
+        spec="mq-budget", requested="BUDGET", out_dir=out_dir,
+        rocmfpx_out_dir=rocmfpx_out_dir, model_name="stub-model",
+        quantize_bin=Path("/nonexistent/llama-quantize"),
+        bf16_gguf="stub.gguf", imatrix="",
+    )
+
+    assert result is None  # refused -- priced from the ACTUAL type, over budget
+    out = capsys.readouterr().out
+    assert "Refusing mq-budget" in out
+    records = json.loads((rocmfpx_out_dir / "_refusals.json").read_text())
+    assert records[0]["predicted_gib"] == pytest.approx(actual_gib, rel=1e-6)
+
+
+def test_quantize_mq_budget_falls_back_to_tensor_config_without_actual_types(
+    tmp_path, monkeypatch,
+):
+    """Absent ``tensor_actual_types`` (a block from before it was written, or
+    a block whose tensor_config-only path never populated it), pricing falls
+    back to ``tensor_config`` exactly as before -- this is the existing
+    behavior every other test in this file already exercises; pinned
+    explicitly here as the other half of the "when present / when absent"
+    contract.
+    """
+    out_dir = tmp_path / "output"
+    rocmfpx_out_dir = out_dir / "rocmfpx"
+    key = "BUDGET-10GiB"
+    _write_budget_block(
+        out_dir, key,
+        config={"U": "MXFP4_MOE"},
+        tensor_config={"blk.0.ffn_up.weight": "MXFP4_MOE"},
+        budget_gib=10,
+    )
+    captured = {}
+
+    def _spy(alloc_map, bf16_gguf):
+        captured["alloc_map"] = dict(alloc_map)
+        return 9.0, 50.0
+
+    monkeypatch.setattr(entry, "predict_rendered_budget", _spy)
+    monkeypatch.setattr(entry, "validate_types_supported", lambda t, b: None)
+    built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
+
+    def _fake_run(cmd, *a, **kw):
+        built.write_bytes(b"gguf")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = _quantize_mq_budget(
+        spec="mq-budget", requested="BUDGET", out_dir=out_dir,
+        rocmfpx_out_dir=rocmfpx_out_dir, model_name="stub-model",
+        quantize_bin=Path("/nonexistent/llama-quantize"),
+        bf16_gguf="stub.gguf", imatrix="",
+    )
+    assert result == built
+    assert captured["alloc_map"] == {"blk.0.ffn_up.weight": "MXFP4_MOE"}
+
+
 # ── run() dispatch: BUDGET/BUDGET-* specs route to the budget path ─────────
 
 def test_run_dispatch_routes_budget_specs_to_quantize_mq_budget(tmp_path, monkeypatch):

@@ -211,7 +211,7 @@ def predict_rendered_tier(config: dict, bf16_gguf: str) -> tuple:
     return predicted_gib, baseline_gib, classify_tier(predicted_gib, baseline_gib)
 
 
-def predict_rendered_budget(tensor_config: dict, bf16_gguf: str) -> tuple[float, float]:
+def predict_rendered_budget(tensor_schemes: dict, bf16_gguf: str) -> tuple[float, float]:
     """Per-TENSOR analog of ``predict_rendered_tier``, for a v2 budget
     allocation (``{tensor_name: scheme}``, not ``{group: scheme}``).
 
@@ -221,9 +221,18 @@ def predict_rendered_budget(tensor_config: dict, bf16_gguf: str) -> tuple[float,
     config has no way to represent.
 
     Sums ``n_elems * bpw(translate_scheme(scheme))`` for each tensor present
-    in ``tensor_config``; a tensor NOT in it (untouched norms etc.) counts as
+    in ``tensor_schemes``; a tensor NOT in it (untouched norms etc.) counts as
     32-bit, the same convention ``predict_rendered_tier`` uses for groups
     absent from its config.
+
+    ``tensor_schemes`` is deliberately generic -- the caller
+    (``_quantize_mq_budget``) passes whichever of v2's two per-tensor maps is
+    the better size proxy: ``tensor_actual_types`` (v2's own record of the
+    type it actually resolved on disk, accounting for ggml-side block-size
+    fallback) when present, else the plainly-REQUESTED ``tensor_config``.
+    Both maps share the same {tensor_name: scheme-or-ggml-type-name} shape
+    and vocabulary (every value is a name ``translate_scheme`` recognizes),
+    so this function doesn't need to know or care which one it was handed.
 
     Returns ``(predicted_gib, baseline_gib)`` -- no third ``tier`` element,
     since a budget build claims a GiB target, not a size band, so there is no
@@ -242,7 +251,7 @@ def predict_rendered_budget(tensor_config: dict, bf16_gguf: str) -> tuple[float,
             for dim in info["shape"]:
                 count *= dim
             total += count
-            scheme = tensor_config.get(name)
+            scheme = tensor_schemes.get(name)
             if scheme is None:                 # untouched (norms etc.)
                 rendered_bits += count * 32.0
                 continue
@@ -1024,6 +1033,11 @@ def _load_mq_budget_block(out_dir: Path, key: str) -> dict:
 
 REFUSALS_FILENAME = "_refusals.json"
 
+# The one family this module ever produces refusals for. Every real caller
+# writes into ``<out>/rocmfpx/`` -- a directory whose name IS this literal
+# string -- see ``_record_refusal``'s per-family-dir contract note.
+ROCMFPX_FAMILY = "rocmfpx"
+
 
 def _rewrite_refusals(rocmfpx_out_dir: Path, tier: str, family: str,
                        entry: dict | None) -> None:
@@ -1103,6 +1117,21 @@ def _record_refusal(rocmfpx_out_dir: Path, *, tier: str, family: str, reason: st
     duplicating it, keyed on (tier, family) since a future non-ROCmFPX family
     could in principle share this file.
 
+    BINDING per-family-dir contract: a record is only ever found again by
+    ``hf_upload._find_refused_tiers``, which calls
+    ``core.publish_records.read_refusals(parent, family=parent.name)`` --
+    i.e. it filters strictly on ``family == <the directory's own name>``. A
+    record whose ``family`` disagrees with the directory it was written into
+    is therefore invisible to every real reader, not merely mislabeled --
+    this is the "exact CRITICAL we already fixed once" shape (a disclosure
+    that exists on disk but that nothing reading the repo will ever surface).
+    This module's own ``rocmfpx_out_dir`` IS the ROCmFPX family's directory
+    (name == ``ROCMFPX_FAMILY``), so passing any other ``family`` for it is a
+    caller bug: raises rather than writing an unreachable record. (A
+    hypothetical future SHARED refusals file keyed on (tier, family) alone,
+    instead of one file per family directory, would silently break this --
+    don't build that without updating the reader to match.)
+
     ``rule``/``requested_budget_gib`` are ADDITIVE, for a BUDGET (size-target)
     refusal: ``rule="budget"`` plus the requested GiB target lets the
     consumer tell a size-guard refusal from a band-guard one. They are
@@ -1111,6 +1140,15 @@ def _record_refusal(rocmfpx_out_dir: Path, *, tier: str, family: str, reason: st
     existing band-guard caller's record keeps its exact original shape --
     this is what makes the change additive rather than a schema break.
     """
+    if rocmfpx_out_dir.name == ROCMFPX_FAMILY and family != ROCMFPX_FAMILY:
+        raise ValueError(
+            f"_record_refusal({rocmfpx_out_dir!s}, family={family!r}, ...): "
+            f"this directory IS the {ROCMFPX_FAMILY!r} family directory (by "
+            f"name), so family must be {ROCMFPX_FAMILY!r} too -- a mismatched "
+            f"family would write a record that read_refusals(parent, "
+            f"family=parent.name) can never find again. Refusing to write "
+            f"rather than silently producing an unreachable disclosure."
+        )
     record = {
         "tier": tier,
         "family": family,
@@ -1170,7 +1208,7 @@ def _run_ttf_quantize(*, spec, key, lines, base_type, rocmfpx_out_dir, model_nam
         return None
     print(f"  {out_path.name} ({out_path.stat().st_size / 1e9:.1f} GB)", flush=True)
     # This key built, so a refusal an earlier run recorded for it is stale.
-    _clear_refusal(rocmfpx_out_dir, tier=key, family="rocmfpx")
+    _clear_refusal(rocmfpx_out_dir, tier=key, family=ROCMFPX_FAMILY)
     return out_path
 
 
@@ -1228,7 +1266,7 @@ def _quantize_mq_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name,
                 _record_refusal(
                     rocmfpx_out_dir,
                     tier=tier,
-                    family="rocmfpx",
+                    family=ROCMFPX_FAMILY,
                     reason=refusal_reason,
                     predicted_gib=pred_gib,
                     baseline_gib=base_gib,
@@ -1272,6 +1310,22 @@ def _quantize_mq_budget(spec, requested, out_dir, rocmfpx_out_dir, model_name,
     predicted size against ``budget_gib`` within ``BUDGET_TOLERANCE`` (shared
     with the publish stage's ``decide_budget_build``, so build-time and
     publish-time can never disagree) instead of checking a band match.
+
+    The size guard prices REQUESTED types, but reality can differ two ways:
+
+    (a) v2's own ggml-side fallback -- a K-quant landing on a row that isn't
+        256-divisible falls back to a block-32 type (the GGUF writer's Pass-1
+        rule, mirrored by ``magicquant.v2.resolve.resolve_tensor_type``). v2
+        already carries the answer for this one: ``tensor_actual_types``
+        (written by ``magicquant.v2.interchange``) is the on-disk type v2
+        actually resolved per tensor, not merely what was requested. Priced
+        here in preference to ``tensor_config`` whenever present -- falls
+        back to ``tensor_config`` (the old behavior) when it's absent, e.g.
+        a block written before ``tensor_actual_types`` existed.
+    (b) the ROCmFPX fork's OWN ``tensor_type_fallback``, applied AFTER our
+        per-tensor override file is handed to its ``llama-quantize``. This
+        module has no visibility into that fallback at all -- it is a
+        SEPARATE, still-unpriced gap, only narrowed by (a), not eliminated.
     """
     from core.publish_criteria import BUDGET_TOLERANCE
 
@@ -1280,6 +1334,10 @@ def _quantize_mq_budget(spec, requested, out_dir, rocmfpx_out_dir, model_name,
         block = _load_mq_budget_block(out_dir, key)
 
         tensor_config = block.get("tensor_config") or {}
+        # v2's own record of the type it ACTUALLY resolved per tensor
+        # (ggml-side block-size fallback already applied) -- the better size
+        # proxy when present; see the docstring's (a)/(b) note above.
+        tensor_actual_types = block.get("tensor_actual_types") or {}
         config = block.get("config") or {}
         budget_bytes = block.get("budget_bytes")
         if not budget_bytes:
@@ -1339,7 +1397,9 @@ def _quantize_mq_budget(spec, requested, out_dir, rocmfpx_out_dir, model_name,
         pred_gib = None
         base_gib = None
         try:
-            if tensor_config:
+            if tensor_actual_types:
+                pred_gib, base_gib = predict_rendered_budget(tensor_actual_types, bf16_gguf)
+            elif tensor_config:
                 pred_gib, base_gib = predict_rendered_budget(tensor_config, bf16_gguf)
             else:
                 pred_gib, base_gib, _ = predict_rendered_tier(config, bf16_gguf)
@@ -1359,7 +1419,7 @@ def _quantize_mq_budget(spec, requested, out_dir, rocmfpx_out_dir, model_name,
             _record_refusal(
                 rocmfpx_out_dir,
                 tier=key,
-                family="rocmfpx",
+                family=ROCMFPX_FAMILY,
                 reason=refusal_reason,
                 predicted_gib=pred_gib,
                 baseline_gib=base_gib,
