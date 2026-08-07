@@ -23,6 +23,8 @@
 #
 # Usage:
 #   run-model-detached.sh --name ds4-probe [--mem 95G] [--log FILE] -- <cmd> [args...]
+#   run-model-detached.sh --name small-job --allow-concurrent --mem 24G -- <cmd>
+#       ^ small job that must not queue behind a running big-model unit
 #   run-model-detached.sh --status ds4-probe
 #   run-model-detached.sh --wait   ds4-probe        # block until it finishes
 #   run-model-detached.sh --logs   ds4-probe
@@ -71,7 +73,7 @@ case "${1:-}" in
   --stop)   shift; cmd_stop   "$@"; exit $? ;;
 esac
 
-NAME=""; MEM="$DEFAULT_MEM"; LOGFILE=""; PROTECT=0
+NAME=""; MEM="$DEFAULT_MEM"; LOGFILE=""; PROTECT=0; ALLOW_CONCURRENT=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name)    NAME="$2"; shift 2 ;;
@@ -89,6 +91,20 @@ while [[ $# -gt 0 ]]; do
     # because I had volunteered it. --protect inverts that: negative adj plus a
     # MemoryMin reservation so reclaim pressure goes elsewhere first.
     --protect) PROTECT=1; shift ;;
+    # --allow-concurrent: opt this run OUT of the big-model serialization guard.
+    #
+    # The guard below exists so two multi-GB models never share 121 GB of
+    # unified memory. A SMALL companion job -- a 0.5B control experiment, a
+    # tokenizer pass -- is not what it protects against, and blocking it behind
+    # a multi-day search just pushes it back into the agent's own scope, which
+    # is the exact failure this whole script exists to prevent.
+    #
+    # The waiver is deliberately narrow: it drops the "is another model-* unit
+    # running" check and NOTHING else. The unit still gets its own cgroup, the
+    # MemAvailable preflight still runs, and an explicit --mem is REQUIRED --
+    # a run that skips the queue must state its own ceiling rather than inherit
+    # the runaway backstop meant for a box-sized model.
+    --allow-concurrent) ALLOW_CONCURRENT=1; shift ;;
     --)        shift; break ;;
     *)         die "unknown option: $1 (did you forget -- before the command?)" ;;
   esac
@@ -132,10 +148,24 @@ fi
 if systemctl is-active "$UNIT" >/dev/null 2>&1; then
   die "$UNIT is already active. Use --status/--wait, or --stop it first."
 fi
-running=$(systemctl list-units --type=service --state=running --no-legend "${UNIT_PREFIX}*" 2>/dev/null | wc -l)
-if (( running > 0 )); then
+if (( ALLOW_CONCURRENT )); then
+  # Waived on purpose (see --allow-concurrent above). The trade is explicit:
+  # skip the queue, state your own ceiling.
+  [[ "$MEM" != "$DEFAULT_MEM" ]] || die \
+    "--allow-concurrent requires an explicit --mem. The serialization guard is
+       waived for this run; the memory ceiling must not be. Pass a cap sized to
+       what this job actually needs (e.g. --mem 24G)."
+  echo "run-model-detached: --allow-concurrent -- skipping the big-model" \
+       "serialization guard, capped at $MEM"
   systemctl list-units --type=service --state=running --no-legend "${UNIT_PREFIX}*" 2>/dev/null >&2
-  die "another ${UNIT_PREFIX}* unit is already running (see above). Serialize big-model runs."
+else
+  running=$(systemctl list-units --type=service --state=running --no-legend "${UNIT_PREFIX}*" 2>/dev/null | wc -l)
+  if (( running > 0 )); then
+    systemctl list-units --type=service --state=running --no-legend "${UNIT_PREFIX}*" 2>/dev/null >&2
+    die "another ${UNIT_PREFIX}* unit is already running (see above). Serialize big-model runs.
+       If this run is SMALL and genuinely safe alongside it, pass
+       --allow-concurrent --mem <cap>."
+  fi
 fi
 
 [[ -n "$LOGFILE" ]] || LOGFILE="/server/programming/Foundry/output/_model_runs/${NAME}.log"
