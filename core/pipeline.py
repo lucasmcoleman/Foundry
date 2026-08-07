@@ -127,7 +127,7 @@ class MagicQuantConfig:
     # KL-divergence-to-base per candidate and blends |mean_kl| * kl_weight into
     # final-survivor selection; enable_speed_bench also measures real
     # tokens/sec per candidate via llama-bench (informational).
-    enable_kl: bool = False
+    enable_kl: bool = True
     kl_weight: float = 0.1
     enable_speed_bench: bool = False
     # measurement_chunks: cap every perplexity/KL pass (both search paths) to
@@ -1656,12 +1656,18 @@ def build_arg_parser() -> "argparse.ArgumentParser":
     parser.add_argument("--magicquant-imatrix-corpus", type=str, default=None,
                         help="Calibration corpus for --magicquant-use-imatrix "
                              "(default: bundled corpus)")
-    parser.add_argument("--magicquant-kl", action="store_true",
-                        help="Also measure real KL-divergence-to-base per candidate "
-                             "during --magicquant-measured search")
-    parser.add_argument("--magicquant-kl-weight", type=float, default=0.1,
+    _kl_group = parser.add_mutually_exclusive_group()
+    _kl_group.add_argument("--magicquant-kl", action="store_true",
+                        help="Measure real KL-divergence-to-base per candidate during "
+                             "--magicquant-measured search and blend it into selection "
+                             "(on by default; kept for explicitness/back-compat)")
+    _kl_group.add_argument("--magicquant-no-kl", action="store_true",
+                        help="Disable the (now default-on) KL-divergence blend during "
+                             "--magicquant-measured search")
+    parser.add_argument("--magicquant-kl-weight", type=float, default=None,
                         help="Weight applied to |mean_kl| when blending into the "
-                             "measured-search selection score (default 0.1)")
+                             "measured-search selection score (default 0.1). Applied "
+                             "whenever explicitly passed, independent of --magicquant-kl.")
     parser.add_argument("--magicquant-speed-bench", action="store_true",
                         help="Also measure real tokens/sec per candidate (llama-bench) "
                              "during --magicquant-measured search")
@@ -1816,6 +1822,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             cfg.magicquant.imatrix_corpus = args.magicquant_imatrix_corpus
         if args.magicquant_kl:
             cfg.magicquant.enable_kl = True
+        if args.magicquant_no_kl:
+            cfg.magicquant.enable_kl = False
+        if args.magicquant_kl_weight is not None:
             cfg.magicquant.kl_weight = args.magicquant_kl_weight
         if args.magicquant_speed_bench:
             cfg.magicquant.enable_speed_bench = True

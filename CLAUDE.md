@@ -129,7 +129,18 @@ This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RA
    capture bounded to 200 chunks (~35-40 min once per model, then cached).
    `enable_imatrix` refuses outright if the calibration and eval corpora
    resolve to the same file — calibrating on the text a run is scored against
-   makes every measured loss optimistic with nothing in the output showing it. `--magicquant-rocmfpx` lets the search also
+   makes every measured loss optimistic with nothing in the output showing it.
+   **Two separate KL knobs, don't conflate them**: (1) probe scoring is
+   KL-based unconditionally — MagicQuant's `run_measured_search` defaults
+   `probe_kl=True`, not a Foundry knob, and it stays on even with
+   `--magicquant-no-kl`. This is what resolves dense models whose sub-percent
+   probe deltas sit below raw-PPL measurement error (a dense 27B regen died at
+   the probing gate for exactly this on 2026-08-07). (2) `enable_kl` (Foundry
+   default now True for measured searches) controls ONLY the candidate
+   objective blend, KL-to-base at `kl_weight=0.1`; disable with
+   `--magicquant-no-kl`. The blend alone is what makes measured scores not
+   directly comparable to pre-2026-08-07 `search_results.json` runs — and a
+   checkpoint written under one objective refuses to resume under the other. `--magicquant-rocmfpx` lets the search also
    explore AMD-native ROCmFPX fork types per group (needs a ROCmFPX build;
    output loads only on the fork). Persists `search_results.json` from both
    search paths (consumed by QAT and by ROCmFPX's mq-hybrid mode).
