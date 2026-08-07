@@ -389,6 +389,31 @@ def test_a_successful_build_clears_that_tier_stale_refusal(tmp_path, monkeypatch
         "sits next to it -- original bug #2 shape")
 
 
+# ── the per-family-dir contract is enforced, not just implied ──────────────
+
+def test_family_disagreeing_with_a_literal_rocmfpx_dir_raises(tmp_path):
+    """``hf_upload._find_refused_tiers`` reads ``<dir>/_refusals.json`` via
+    ``read_refusals(parent, family=parent.name)`` -- so a record whose
+    ``family`` disagrees with the directory it's written into is invisible
+    to every real reader, not merely mislabeled. ``rocmfpx_out_dir`` here IS
+    the literal ROCmFPX family directory (named "rocmfpx"), so a caller
+    passing any other family for it is a bug and must raise, not write --
+    this is what stands between the current per-family-dir contract and the
+    unreachable-record CRITICAL a future shared-file layout would silently
+    reintroduce (see _record_refusal's docstring).
+    """
+    rocmfpx_out_dir = tmp_path / "rocmfpx"
+    with pytest.raises(ValueError, match="family"):
+        entry._record_refusal(
+            rocmfpx_out_dir,
+            tier="Q5", family="magicquant", reason=REAL_REASON_Q5,
+            predicted_gib=20.68, baseline_gib=50.89,
+            predicted_band="Q6", claimed_band="Q5",
+        )
+    assert not (rocmfpx_out_dir / "_refusals.json").exists()
+    assert not rocmfpx_out_dir.exists()  # nothing written at all, not even the dir
+
+
 def test_recorded_reason_renders_on_a_card_the_way_the_consumer_expects(tmp_path):
     """The only consumer contract that exists: hf_upload renders refused
     tiers as "- **<tier>** -- <reason>". Pin the record against that, so a
