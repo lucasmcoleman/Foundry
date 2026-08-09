@@ -87,6 +87,17 @@
   `_build_hf_upload_config(config, log, enabled)`, called from both; each now
   only branches on `upload()` vs `dry_run()`.
 
+### Performance
+- **`/api/runs` no longer re-globs the log directory per log file (cleanup):**
+  the `live` flag computation reran `model_dir.glob("_stage_*.log")` + an
+  mtime sort *inside* the loop already iterating that same file list --
+  O(N²) directory-listing + stat syscalls for a model dir with N stage logs,
+  on an endpoint that walks every run directory under `output/`. Only
+  triggered for the currently-active run dir (short-circuited otherwise), but
+  real accumulating I/O for a long-running pipeline that grows one log per
+  stage attempt. The newest-log lookup is now computed once per model dir,
+  above the loop.
+
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
 ### Changed (behavior)

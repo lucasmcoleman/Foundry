@@ -1833,12 +1833,17 @@ async def list_runs():
         if not model_dir.is_dir():
             continue
         logs = []
+        is_active_dir = state.running and model_dir.name == active_dir
+        newest_log = (
+            sorted(model_dir.glob("_stage_*.log"), key=lambda p: p.stat().st_mtime)[-1]
+            if is_active_dir else None
+        )
         for log_file in sorted(model_dir.glob("_stage_*.log"), reverse=True):
             logs.append({
                 "name": log_file.name,
                 "size": log_file.stat().st_size,
                 "modified": log_file.stat().st_mtime,
-                "live": state.running and model_dir.name == active_dir and log_file == sorted(model_dir.glob("_stage_*.log"), key=lambda p: p.stat().st_mtime)[-1],
+                "live": is_active_dir and log_file == newest_log,
             })
         # Also check for magicquant subdir logs
         mq_dir = model_dir / "magicquant"
