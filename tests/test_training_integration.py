@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Lightweight integration test for the custom fast training pipeline.
 
@@ -15,19 +14,30 @@ Validates:
 6. fast_export.py can produce a merged safetensors directory
 
 Usage:
-    python tests/test_training_integration.py
+    make test-integration
+    python -m pytest tests/test_training_integration.py -v
 
 NOTE: This test requires GPU access and downloads a 9B model (~5 GB).
       Do not run while the GPU is busy (e.g. during GGUF generation).
       Expected runtime: ~10-30 minutes depending on dataset size.
+
+Structure: model/tokenizer, the LoRA-attached model, the trained model, and
+the saved adapter dir are module-scoped fixtures, each performing its stage's
+real work and core assertions -- a failure surfaces immediately as a setup
+error on whichever test first requests the broken fixture, and the fixture's
+result is cached (computed once) for every other test in the module that
+depends on it. Downstream tests then add their stage-specific assertions.
+This used to be a manually-threaded script (model/tokenizer/lora_dir passed
+by hand between plain functions via run_all_tests()) with pytest markers
+bolted on after the fact; pytest collected 4 of its 5 tests but none of them
+could run (`fixture 'model' not found` at setup), so `make test-integration`
+only ever exercised step 1. Converting to real fixtures is what makes pytest
+actually run the full chain.
 """
 
-import gc
 import json
 import os
 import sys
-import tempfile
-import traceback
 
 # Set ROCm environment before any torch import.
 os.environ["HSA_ENABLE_SDMA"] = "0"
@@ -39,50 +49,43 @@ os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 PIPELINE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(PIPELINE_ROOT, "core"))
 
-import torch
+import pytest
 
 # These tests need a GPU + a multi-GB model download. Mark the whole module so
 # the offline/CI suite deselects it with `-m 'not slow'` / `-m 'not gpu'`.
-# (make test additionally passes --ignore for this module.)
-try:
-    import pytest as _pytest
-    pytestmark = [_pytest.mark.slow, _pytest.mark.gpu]
-except ImportError:  # running as a plain script
-    pass
+pytestmark = [pytest.mark.slow, pytest.mark.gpu]
 
 # Test configuration — use the 9B model for manageable test times.
 TEST_MODEL_ID = "huihui-ai/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated"
 DATASET_PATH = os.path.join(PIPELINE_ROOT, "data", "zeroclaw_training_data.jsonl")
 
-# Use a temp directory for test output so we don't pollute the workspace.
-TEST_OUTPUT_DIR = tempfile.mkdtemp(prefix="pipeline_test_")
+
+@pytest.fixture(scope="module")
+def test_output_dir(tmp_path_factory):
+    return str(tmp_path_factory.mktemp("pipeline_test"))
 
 
-def test_model_loading():
-    """Test that fast_load_quantized_model loads the 9B model successfully."""
-    print("\n=== Test 1: Model Loading ===")
+@pytest.fixture(scope="module")
+def model_and_tokenizer():
+    """Load the test model once for the whole module (audit B4)."""
     from fast_train_zeroclaw import fast_load_quantized_model
 
     model, tokenizer = fast_load_quantized_model(TEST_MODEL_ID)
 
-    # Verify model is on GPU.
     first_param = next(model.parameters())
     assert first_param.device.type == "cuda", f"Model not on GPU: {first_param.device}"
-
-    # Verify tokenizer works.
     tokens = tokenizer.encode("Hello, world!")
     assert len(tokens) > 0, "Tokenizer produced empty output"
 
-    print(f"  Model loaded on {first_param.device}")
-    print(f"  Tokenizer vocab size: {len(tokenizer)}")
     return model, tokenizer
 
 
-def test_lora_attachment(model):
-    """Test that LoRA adapters attach correctly."""
-    print("\n=== Test 2: LoRA Attachment ===")
+@pytest.fixture(scope="module")
+def lora_model(model_and_tokenizer):
+    """Attach LoRA adapters to the loaded model."""
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
+    model, _tokenizer = model_and_tokenizer
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     lora_config = LoraConfig(
         r=16,  # Smaller rank for faster test
@@ -99,22 +102,22 @@ def test_lora_attachment(model):
     total_params = sum(p.numel() for p in model.parameters())
     assert trainable > 0, "No trainable parameters after LoRA attachment"
     assert trainable < total_params, "All parameters are trainable (LoRA not applied)"
-
     pct = 100 * trainable / total_params
-    print(f"  Trainable: {trainable:,} / {total_params:,} ({pct:.2f}%)")
     assert pct < 5, f"Trainable percentage too high ({pct:.2f}%), LoRA may not be working"
+
     return model
 
 
-def test_training_one_epoch(model, tokenizer):
-    """Test that 1 epoch of training completes and saves a checkpoint."""
-    print("\n=== Test 4: Training (1 epoch) ===")
+@pytest.fixture(scope="module")
+def trained_model(lora_model, model_and_tokenizer, test_output_dir):
+    """Run 1 epoch of training and return (model, tokenizer)."""
     from datasets import load_dataset
     from trl import SFTTrainer, SFTConfig
 
-    # Load dataset.
+    _base_model, tokenizer = model_and_tokenizer
+    model = lora_model
+
     dataset = load_dataset("json", data_files=DATASET_PATH, split="train")
-    print(f"  Dataset: {len(dataset)} examples")
 
     def fmt(ex):
         ex["text"] = tokenizer.apply_chat_template(
@@ -124,7 +127,7 @@ def test_training_one_epoch(model, tokenizer):
     dataset = dataset.map(fmt)
 
     training_args = SFTConfig(
-        output_dir=TEST_OUTPUT_DIR,
+        output_dir=test_output_dir,
         num_train_epochs=1,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,  # Small for fast test
@@ -156,165 +159,84 @@ def test_training_one_epoch(model, tokenizer):
 
     stats = trainer.train()
     loss = stats.training_loss
-    print(f"  Training loss: {loss:.4f}")
     assert loss > 0, "Training loss is zero — something is wrong"
     assert loss < 100, f"Training loss unreasonably high: {loss}"
 
-    # Verify checkpoint was saved.
     from pathlib import Path
-    checkpoints = list(Path(TEST_OUTPUT_DIR).glob("checkpoint-*"))
+    checkpoints = list(Path(test_output_dir).glob("checkpoint-*"))
     assert len(checkpoints) > 0, "No checkpoints saved after training"
-    print(f"  Checkpoints: {[c.name for c in checkpoints]}")
 
     return model, tokenizer
 
 
-def test_lora_save(model, tokenizer):
-    """Test that LoRA adapters save correctly."""
-    print("\n=== Test 5: LoRA Save ===")
-    lora_dir = os.path.join(TEST_OUTPUT_DIR, "lora_adapters")
+@pytest.fixture(scope="module")
+def saved_lora_dir(trained_model, test_output_dir):
+    """Save the trained LoRA adapters and return the directory path."""
+    model, tokenizer = trained_model
+    lora_dir = os.path.join(test_output_dir, "lora_adapters")
     model.save_pretrained(lora_dir)
     tokenizer.save_pretrained(lora_dir)
 
-    # Verify required files exist.
     required = ["adapter_config.json", "adapter_model.safetensors"]
     for fname in required:
         fpath = os.path.join(lora_dir, fname)
         assert os.path.exists(fpath), f"Missing required file: {fname}"
-        size = os.path.getsize(fpath)
-        print(f"  {fname}: {size / 1e6:.1f} MB")
-        assert size > 0, f"File is empty: {fname}"
+        assert os.path.getsize(fpath) > 0, f"File is empty: {fname}"
 
-    # Verify adapter_config.json is valid JSON with expected fields.
     with open(os.path.join(lora_dir, "adapter_config.json")) as f:
         cfg = json.load(f)
     assert "r" in cfg, "adapter_config.json missing 'r'"
     assert "lora_alpha" in cfg, "adapter_config.json missing 'lora_alpha'"
     assert "target_modules" in cfg, "adapter_config.json missing 'target_modules'"
-    print(f"  Config: r={cfg['r']}, alpha={cfg['lora_alpha']}")
 
     return lora_dir
 
 
-def test_export(lora_dir):
+def test_model_loading(model_and_tokenizer):
+    model, tokenizer = model_and_tokenizer
+    first_param = next(model.parameters())
+    assert first_param.device.type == "cuda"
+    assert len(tokenizer) > 0
+
+
+def test_lora_attachment(lora_model):
+    trainable = sum(p.numel() for p in lora_model.parameters() if p.requires_grad)
+    assert trainable > 0
+
+
+def test_training_one_epoch(trained_model, test_output_dir):
+    from pathlib import Path
+    checkpoints = list(Path(test_output_dir).glob("checkpoint-*"))
+    assert len(checkpoints) > 0
+
+
+def test_lora_save(saved_lora_dir):
+    assert os.path.exists(os.path.join(saved_lora_dir, "adapter_model.safetensors"))
+
+
+def test_export(saved_lora_dir, test_output_dir):
     """Test that fast_export.py can merge LoRA adapters with the base model."""
-    print("\n=== Test 6: LoRA Merge (fast_export) ===")
     from fast_export import streaming_merge
 
-    merged_dir = os.path.join(TEST_OUTPUT_DIR, "merged_model")
+    merged_dir = os.path.join(test_output_dir, "merged_model")
 
     streaming_merge(
         model_id=TEST_MODEL_ID,
-        lora_dir=lora_dir,
+        lora_dir=saved_lora_dir,
         merged_dir=merged_dir,
     )
 
-    # Verify output exists and has safetensors files.
     from pathlib import Path
     merged_path = Path(merged_dir)
     assert merged_path.exists(), "Merged directory not created"
 
     st_files = list(merged_path.glob("*.safetensors"))
     assert len(st_files) > 0, "No safetensors files in merged output"
-    print(f"  Safetensors files: {len(st_files)}")
 
-    # Verify index file.
     idx_path = merged_path / "model.safetensors.index.json"
     assert idx_path.exists(), "Missing model.safetensors.index.json"
     with open(idx_path) as f:
         idx = json.load(f)
     assert "weight_map" in idx, "Index missing weight_map"
-    print(f"  Weight map entries: {len(idx['weight_map'])}")
 
-    # Verify config was copied.
     assert (merged_path / "config.json").exists(), "Missing config.json in merged output"
-    print("  config.json present")
-
-    total_size = sum(f.stat().st_size for f in st_files) / 1e9
-    print(f"  Total merged size: {total_size:.1f} GB")
-
-
-def run_all_tests():
-    """Run all integration tests in sequence."""
-    print("=" * 60)
-    print("Training Pipeline Integration Test")
-    print(f"Model: {TEST_MODEL_ID}")
-    print(f"Dataset: {DATASET_PATH}")
-    print(f"Output: {TEST_OUTPUT_DIR}")
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print("=" * 60)
-
-    passed = 0
-    failed = 0
-    errors = []
-
-    try:
-        model, tokenizer = test_model_loading()
-        passed += 1
-    except Exception as e:
-        failed += 1
-        errors.append(("Model Loading", traceback.format_exc()))
-        print(f"  FAILED: {e}")
-        return passed, failed, errors  # Cannot continue without model
-
-    try:
-        model = test_lora_attachment(model)
-        passed += 1
-    except Exception as e:
-        failed += 1
-        errors.append(("LoRA Attachment", traceback.format_exc()))
-        print(f"  FAILED: {e}")
-        return passed, failed, errors
-
-    try:
-        model, tokenizer = test_training_one_epoch(model, tokenizer)
-        passed += 1
-    except Exception as e:
-        failed += 1
-        errors.append(("Training", traceback.format_exc()))
-        print(f"  FAILED: {e}")
-        return passed, failed, errors
-
-    try:
-        lora_dir = test_lora_save(model, tokenizer)
-        passed += 1
-    except Exception as e:
-        failed += 1
-        errors.append(("LoRA Save", traceback.format_exc()))
-        print(f"  FAILED: {e}")
-        return passed, failed, errors
-
-    # Free model memory before export test.
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    try:
-        test_export(lora_dir)
-        passed += 1
-    except Exception as e:
-        failed += 1
-        errors.append(("Export", traceback.format_exc()))
-        print(f"  FAILED: {e}")
-
-    return passed, failed, errors
-
-
-if __name__ == "__main__":
-    passed, failed, errors = run_all_tests()
-
-    print("\n" + "=" * 60)
-    print(f"Results: {passed} passed, {failed} failed")
-    if errors:
-        print("\nFailures:")
-        for name, tb in errors:
-            print(f"\n--- {name} ---")
-            print(tb)
-    print("=" * 60)
-
-    # Clean up temp directory.
-    import shutil
-    print(f"\nTest output at: {TEST_OUTPUT_DIR}")
-    print("Run 'rm -rf {TEST_OUTPUT_DIR}' to clean up.")
-
-    sys.exit(1 if failed > 0 else 0)

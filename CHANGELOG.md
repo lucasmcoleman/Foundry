@@ -160,6 +160,29 @@
   `pydantic-settings` and `python-dotenv` from `pyproject.toml` -- both were
   pulled in solely for this module (`env_file=".env"` support) and had no
   other consumer anywhere in the repo.
+- **`test_training_integration.py` now actually runs its full chain
+  (user-confirmed, B4):** the file was written as a manual script
+  (`run_all_tests()` hand-threading `model`/`tokenizer`/`lora_dir` between
+  plain functions) with `pytest.mark.slow/gpu` and a `make test-integration`
+  target bolted on afterward. pytest collected `test_lora_attachment`/
+  `test_training_one_epoch`/`test_lora_save`/`test_export` as independent
+  tests needing `model`/`tokenizer`/`lora_dir` fixtures that didn't exist --
+  `fixture '...' not found` at setup -- so only `test_model_loading` (no
+  params) ever ran; `make test-integration` silently checked model-loading
+  only. Converted `model_and_tokenizer`/`lora_model`/`trained_model`/
+  `saved_lora_dir` into real module-scoped fixtures (each performs its
+  stage's actual work + core assertions, chained in dependency order); the
+  manual `run_all_tests()`/`__main__` script mode is removed since
+  `make test-integration` already invokes this via `pytest -v`, not as a
+  standalone script. **Verification note:** this test needs a live GPU + a
+  9B model download (~10-30 min), impractical to run as part of this cleanup
+  pass. Verified instead via `pytest --collect-only` (all 5 tests collect
+  cleanly) and `pytest --setup-plan -m gpu` (the full fixture dependency
+  graph resolves in the correct order -- `model_and_tokenizer` →
+  `lora_model` → `trained_model` → `saved_lora_dir` -- with no
+  `fixture not found` errors, the exact failure mode this fixes). A full
+  live GPU run is still the way to fully validate the training/export path
+  itself.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
