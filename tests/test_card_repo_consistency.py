@@ -23,25 +23,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
 
 from hf_upload import (
-    HFUploadConfig,
     audit_card_against_repo,
     card_rows_from_repo,
     generate_model_card,
 )
 
+from conftest import hf_upload_cfg as _cfg
+
 
 # ── FIX 1: known_sizes ───────────────────────────────────────────────────────
-
-def _cfg(**overrides):
-    base = dict(
-        repo_id="user/model-MagicQuant-GGUF",
-        base_model="org/base",
-        dataset_name="mydata",
-        did_training=True,
-        did_magicquant=True,
-    )
-    base.update(overrides)
-    return HFUploadConfig(**base)
 
 
 def test_local_stat_path_unchanged_when_file_present(tmp_path):

@@ -32,31 +32,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
 import hf_upload
 import publish_criteria
 from hf_upload import (
-    HFUploadConfig,
     _BUDGET_FILE_RE_FALLBACK,
     _load_budget_file_re,
     generate_model_card,
 )
 
-_96_GIB = 96 * 1024 ** 3
-
-
-def _fake_gguf(path: Path, size_bytes: int = _96_GIB) -> Path:
-    with open(path, "wb") as f:
-        f.truncate(size_bytes)
-    return path
-
-
-def _cfg(**overrides):
-    base = dict(
-        repo_id="user/model-MagicQuant-GGUF",
-        base_model="org/base",
-        dataset_name="mydata",
-        did_training=True,
-        did_magicquant=True,
-    )
-    base.update(overrides)
-    return HFUploadConfig(**base)
+from conftest import GIB_96 as _96_GIB, fake_gguf as _fake_gguf, hf_upload_cfg as _cfg
 
 
 class _PoisonImport:
