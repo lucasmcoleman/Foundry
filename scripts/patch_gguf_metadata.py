@@ -7,7 +7,6 @@ Rewrites the file with additional KV metadata without touching tensor data.
 import struct
 import sys
 import os
-import shutil
 from pathlib import Path
 
 
@@ -172,15 +171,46 @@ def patch_gguf(input_path, chat_template, eos_token_id, pad_token_id):
     print(f"  Patched successfully!")
 
 
-def main():
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(
-        'DavidAU/Qwen3.5-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking',
-        trust_remote_code=True,
-    )
+def find_gguf_files(dirs) -> list:
+    """Collect *.gguf files across one or more directories, sorted per directory.
 
-    gguf_dir = "/server/ai/models/lmcoleman/qwen3.5-40b-claude-4.6-os-deckard-heretic-uncensored-thinking-gguf"
-    gguf_files = list(Path(gguf_dir).glob("*.gguf"))
+    Non-existent directories are skipped with a message, not an error --
+    callers routinely pass a set of candidate locations where not all of
+    them exist for a given run.
+    """
+    files = []
+    for d in dirs:
+        gguf_dir = Path(d)
+        if not gguf_dir.exists():
+            print(f"Skipping {gguf_dir} (does not exist)")
+            continue
+        files.extend(sorted(gguf_dir.glob("*.gguf")))
+    return files
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Patch GGUF files with a missing chat template + EOS/pad token IDs, "
+                     "sourced from a HuggingFace tokenizer.",
+    )
+    parser.add_argument(
+        "--model-id", required=True,
+        help="HF repo id (or local path) to load the tokenizer from, e.g. "
+             "'org/model-name'.",
+    )
+    parser.add_argument(
+        "--gguf-dir", required=True, nargs="+", dest="gguf_dirs",
+        help="One or more directories to scan for *.gguf files (non-existent "
+             "directories are skipped with a warning, not an error).",
+    )
+    args = parser.parse_args()
+
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+
+    gguf_files = find_gguf_files(args.gguf_dirs)
 
     if not gguf_files:
         print("No GGUF files found!")
@@ -188,7 +218,7 @@ def main():
 
     print(f"Found {len(gguf_files)} GGUF files to patch\n")
 
-    for gguf_path in sorted(gguf_files):
+    for gguf_path in gguf_files:
         patch_gguf(
             str(gguf_path),
             chat_template=tok.chat_template,
@@ -196,20 +226,6 @@ def main():
             pad_token_id=tok.pad_token_id,
         )
         print()
-
-    # Also patch the copies in the output dir
-    mq_dir = Path("/server/programming/pipeline/output-zeroclaw-qwen40b/magicquant")
-    mq_files = list(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
-    if mq_files:
-        print(f"Also patching {len(mq_files)} files in {mq_dir}\n")
-        for gguf_path in sorted(mq_files):
-            patch_gguf(
-                str(gguf_path),
-                chat_template=tok.chat_template,
-                eos_token_id=tok.eos_token_id,
-                pad_token_id=tok.pad_token_id,
-            )
-            print()
 
     print("All done!")
 
