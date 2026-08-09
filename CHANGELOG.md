@@ -63,6 +63,17 @@
   that's intentional or a copy-paste gap is a still-open question from the
   cleanup audit; this change only removes the duplication that was actually
   identical.
+- **UI `validate_dataset` reimplemented instead of reused (cleanup):**
+  `ui/app.py` carried its own independent JSONL pre-flight check that had
+  already drifted from `core/pipeline.py`'s (missing the `system`/`assistant`
+  role-coverage warnings and the file-size report). Replaced with a thin async
+  wrapper delegating to `core.pipeline.validate_dataset`, using the same
+  buffer-and-replay pattern `_mem_preflight` already uses to bridge the
+  synchronous log callback into the WebSocket log stream. Confirmed no
+  relative-path regression: both the old code's explicit `FOUNDRY_ROOT`
+  resolution and core's CWD-relative resolution agree, since
+  `foundry-ui.service`'s `WorkingDirectory=/server/programming/Foundry`
+  guarantees the two are the same directory.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
