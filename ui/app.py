@@ -33,6 +33,7 @@ from pydantic import BaseModel, ValidationError
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 import markers
 from config import settings as foundry_settings
+from pipeline import validate_dataset as _core_validate_dataset
 from preflight import check_system_memory
 from reap_common import REAP_SUPPORTED_ARCHS, detect_model_arch as _detect_model_arch
 from services import (
@@ -482,94 +483,22 @@ FOUNDRY_ROOT = Path(__file__).resolve().parent.parent
 
 
 async def validate_dataset(sources: list[str]) -> bool:
-    """Pre-flight dataset check for one or more dataset sources."""
-    await state.log("Validating dataset(s)...", "stage")
+    """Pre-flight dataset check for one or more dataset sources.
 
-    if not sources or all(not s.strip() for s in sources):
-        await state.log("No datasets configured", "error")
-        return False
-
-    all_ok = True
-    for src in sources:
-        src = src.strip()
-        if not src:
-            continue
-
-        # Strip config/split suffixes for path detection
-        clean = src
-        if "[" in clean and clean.endswith("]"):
-            clean = clean.split("[")[0]
-        if ":" in clean and not clean.startswith("/") and not Path(clean).suffix:
-            clean = clean.rsplit(":", 1)[0]
-
-        local = Path(clean)
-        if local.suffix in (".jsonl", ".json", ".csv", ".parquet"):
-            # Local file -- full validation
-            p = local
-            if not p.is_absolute():
-                p = FOUNDRY_ROOT / p
-            if not p.exists():
-                await state.log(f"Dataset not found: {src}", "error")
-                all_ok = False
-                continue
-            if p.stat().st_size == 0:
-                await state.log(f"Dataset file is empty: {src}", "error")
-                all_ok = False
-                continue
-
-            errors = []
-            n = 0
-            tool_calls = 0
-            roles = set()
-
-            with open(p) as f:
-                for i, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        ex = json.loads(line)
-                    except json.JSONDecodeError as e:
-                        errors.append(f"Line {i}: invalid JSON -- {e}")
-                        if len(errors) >= 5:
-                            break
-                        continue
-                    n += 1
-                    if "messages" not in ex:
-                        errors.append(f"Line {i}: missing 'messages' field")
-                        continue
-                    msgs = ex["messages"]
-                    if not isinstance(msgs, list) or len(msgs) < 2:
-                        errors.append(f"Line {i}: 'messages' needs >= 2 entries")
-                        continue
-                    for msg in msgs:
-                        if "role" not in msg or "content" not in msg:
-                            errors.append(f"Line {i}: message missing 'role' or 'content'")
-                            break
-                        roles.add(msg["role"])
-                        if msg["role"] == "assistant" and "<tool_call>" in msg.get("content", ""):
-                            tool_calls += 1
-
-            if errors:
-                for e in errors[:5]:
-                    await state.log(f"  {e}", "error")
-                await state.log(f"Validation failed for {src} ({len(errors)} errors)", "error")
-                all_ok = False
-                continue
-
-            if n < 10:
-                await state.log(f"  Warning: only {n} examples in {src}", "warn")
-            await state.log(f"  {src}: {n} examples, {tool_calls} tool-call turns, roles: {sorted(roles)}")
-        else:
-            # Possibly a HuggingFace dataset -- check if it exists locally first
-            if local.exists():
-                await state.log(f"  Local path: {src}")
-            else:
-                await state.log(f"  HF dataset: {src} (will be downloaded if not cached)")
-
-    if all_ok:
-        await state.log("Dataset validation passed", "success")
-    return all_ok
+    Thin async wrapper over core.pipeline.validate_dataset (the CLI's own
+    check), using the same buffer-and-replay pattern as _mem_preflight to
+    bridge its synchronous log callback into the WebSocket log stream. The UI
+    used to carry its own independent implementation here, which had already
+    drifted from core's (missing the system/assistant role warnings and the
+    file-size report) -- one implementation now serves both.
+    """
+    buffered: list[tuple[str, str]] = []
+    ok = _core_validate_dataset(
+        sources, log=lambda msg, level="info": buffered.append((msg, level))
+    )
+    for msg, level in buffered:
+        await state.log(msg, level)
+    return ok
 
 
 # ── Stage runners ────────────────────────────────────────────────────────────
