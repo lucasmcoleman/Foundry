@@ -28,6 +28,11 @@
   `_magicquant_entry.py` directly (matching how the ROCmFPX equivalent test
   already worked); the now-inapplicable single-sourcing test was removed since
   there is no longer a second copy to keep in sync.
+- **Pre-entry-shim leftovers in `core/services.py` (cleanup):** `ENTRY_MODULES`,
+  `_env_preamble()`, and `_hf_cache_check()` predate the H2 entry-shim
+  migration and had zero callers -- every service now unconditionally uses
+  `_entry_shim()`, and the env-setup/cache-probe logic they generated as
+  strings now lives as real Python in the entry modules.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
