@@ -25,30 +25,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
 
-from hf_upload import HFUploadConfig, audit_card_against_repo, generate_model_card
+from hf_upload import audit_card_against_repo, generate_model_card
 
-_96_GIB = 96 * 1024 ** 3
-
-
-def _fake_gguf(path: Path, size_bytes: int = _96_GIB) -> Path:
-    """A sparse file of the given size -- stat() reports it accurately
-    without actually allocating/writing gigabytes of real bytes (which
-    hung the test run the first time this was tried with b"x" * N)."""
-    with open(path, "wb") as f:
-        f.truncate(size_bytes)
-    return path
-
-
-def _cfg(**overrides):
-    base = dict(
-        repo_id="user/model-MagicQuant-GGUF",
-        base_model="org/base",
-        dataset_name="mydata",
-        did_training=True,
-        did_magicquant=True,
-    )
-    base.update(overrides)
-    return HFUploadConfig(**base)
+from conftest import GIB_96 as _96_GIB, fake_gguf as _fake_gguf, hf_upload_cfg as _cfg
 
 
 def _bullet_lines(section: str) -> list:

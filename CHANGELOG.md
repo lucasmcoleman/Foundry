@@ -98,6 +98,16 @@
   stage attempt. The newest-log lookup is now computed once per model dir,
   above the loop.
 
+### Changed
+- **HF-upload test fixtures deduplicated (cleanup):** `_cfg(**overrides)` was
+  byte-for-byte identical across `test_hf_upload_budget_card.py`,
+  `test_hf_upload_budget_regex_fallback.py`, and `test_card_repo_consistency.py`;
+  `_fake_gguf`/`_96_GIB` (a sparse-file helper for a fake 96 GiB GGUF) likewise
+  identical between the first two. Moved into `tests/conftest.py` as
+  `hf_upload_cfg`/`fake_gguf`/`GIB_96`; all three files now import them
+  (aliased to their old local names to keep call sites unchanged). Test-only,
+  no production-code risk.
+
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
 ### Changed (behavior)
