@@ -17,13 +17,6 @@ import json
 import sys
 from pathlib import Path
 
-_ROCM_ENV = {
-    "HSA_ENABLE_SDMA": "0",
-    "PYTORCH_HIP_ALLOC_CONF": "backend:native,expandable_segments:True",
-    "UNSLOTH_SKIP_TORCHVISION_CHECK": "1",
-    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
-}
-
 
 def parse_config(cfg_path: str) -> dict:
     return json.loads(Path(cfg_path).read_text())
@@ -32,7 +25,11 @@ def parse_config(cfg_path: str) -> dict:
 def run(cfg_path: str | None = None) -> None:
     import os
 
-    for k, v in _ROCM_ENV.items():
+    try:
+        from entry_common import ROCM_ENV
+    except ImportError:
+        from core.entry_common import ROCM_ENV
+    for k, v in ROCM_ENV.items():
         os.environ.setdefault(k, v)
 
     if cfg_path is None:

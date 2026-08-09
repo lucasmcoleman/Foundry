@@ -17,6 +17,11 @@ import json
 import sys
 from pathlib import Path
 
+# Deliberately NOT core.entry_common.ROCM_ENV (which the other entry modules
+# share): this is missing UNSLOTH_SKIP_TORCHVISION_CHECK relative to that
+# shared dict. Left as its own copy, unchanged, pending confirmation of
+# whether REAP genuinely has no torchvision import surface or this is a
+# copy-paste gap (open question, not yet resolved) -- see CHANGELOG.
 _ROCM_ENV = {
     "HSA_ENABLE_SDMA": "0",
     "PYTORCH_HIP_ALLOC_CONF": "backend:native,expandable_segments:True",
