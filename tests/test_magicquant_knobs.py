@@ -960,7 +960,7 @@ def test_magicquantcfg_accepts_speed_knobs():
 
 def test_do_magicquant_hash_source_includes_new_knobs():
     src = (ROOT / "ui" / "app.py").read_text()
-    hash_block = src[src.index("async def do_magicquant"):src.index("existing_ggufs = sorted(mq_dir.glob")]
+    hash_block = src[src.index("async def do_magicquant"):src.index("done, mq_key = await _check_marker(")]
     for key in ("use_imatrix", "imatrix_corpus", "enable_kl", "kl_weight",
                 "enable_speed_bench", "measurement_chunks",
                 "stream_aware", "head_aggressive"):
@@ -977,7 +977,7 @@ def test_do_magicquant_hash_source_includes_new_knobs():
 
 def test_do_magicquant_hash_source_includes_speed_knobs():
     src = (ROOT / "ui" / "app.py").read_text()
-    hash_block = src[src.index("async def do_magicquant"):src.index("existing_ggufs = sorted(mq_dir.glob")]
+    hash_block = src[src.index("async def do_magicquant"):src.index("done, mq_key = await _check_marker(")]
     for key in ("speed_aware", "speed_metric", "speed_weight", "use_bytes_tps",
                 "calibration_source", "write_calibration"):
         assert f'"{key}": mc.{key}' in hash_block, key

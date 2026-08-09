@@ -107,6 +107,27 @@
   `hf_upload_cfg`/`fake_gguf`/`GIB_96`; all three files now import them
   (aliased to their old local names to keep call sites unchanged). Test-only,
   no production-code risk.
+- **Completion-marker resume check deduplicated across all 7 stage runners
+  (cleanup):** `do_training`/`do_export`/`do_heretic`/`do_reap`/`do_qat`/
+  `do_magicquant`/`do_rocmfpx` each repeated the same ~10-line shape (glob or
+  fixed key file, `markers.is_stage_complete`, skip-log, `COMPLETE` state,
+  100% progress). Extracted to `_check_marker(stage, display_name, stage_dir,
+  cfg_hash, key_glob, default_key_name)`. Each stage's own hash-field dict and
+  its post-run `write_marker` logic (which genuinely varies -- some stages
+  re-glob after the run and fall back to the pre-run key, `magicquant`/
+  `rocmfpx` don't -- so intentionally NOT unified) are untouched. Also
+  normalizes the skip-log message to one consistent format across all 7
+  (`"{name} already complete (marker matches) at {dir} — skipping"`),
+  fixing `do_heretic`'s stray `--` (every other stage already used `—`) and
+  dropping the redundant trailing "skipping X" repetition on `export`/
+  `heretic`/`reap` -- cosmetic log-text only, no test depended on the old
+  wording. Two tests that source-scraped `do_magicquant`'s body via a
+  `"existing_ggufs = sorted(mq_dir.glob"` string anchor to check specific
+  config keys are hashed (`test_do_magicquant_hash_source_includes_new_knobs`/
+  `_speed_knobs` in `test_magicquant_knobs.py`,
+  `test_do_magicquant_passes_budget_gib_to_build_script` in
+  `test_ui_magicquant_budget.py`) had that anchor removed by the extraction;
+  updated to anchor on `"done, mq_key = await _check_marker("` instead.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
