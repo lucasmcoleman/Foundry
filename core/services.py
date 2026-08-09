@@ -15,56 +15,12 @@ import os
 from pathlib import Path
 from typing import Callable, Awaitable, Optional
 
-# Stages whose body has been extracted into an importable core/_<stage>_entry.py
-# module (audit H2). The Service.build_script for these emits a thin shim that
-# writes a JSON config and invokes the entry module's run().
-ENTRY_MODULES = ("_train_entry",)
-
 # Type alias for the async subprocess runner used by the UI.
 # Signature: (script_text, output_dir) -> exit_code
 RunScriptFn = Callable[[str, str], Awaitable[int]]
 
 # Type alias for the async log callback used by the UI.
 AsyncLogFn = Callable[[str, str], Awaitable[None]]
-
-
-def _env_preamble() -> str:
-    """Return the standard ROCm environment setup block for subprocess scripts."""
-    return (
-        'import os\n'
-        'os.environ["HSA_ENABLE_SDMA"] = "0"\n'
-        'os.environ["PYTORCH_HIP_ALLOC_CONF"] = '
-        '"backend:native,expandable_segments:True"\n'
-        'os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"\n'
-        'os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"\n'
-    )
-
-
-def _hf_cache_check(model_id_repr: str) -> str:
-    """Return an HF cache probe snippet for subprocess scripts."""
-    return (
-        "from pathlib import Path as _P\n"
-        f"_model_id = {model_id_repr}\n"
-        "_is_local = _P(_model_id).exists()\n"
-        "if _is_local:\n"
-        '    print(f"Loading from local path: {_model_id}")\n'
-        "else:\n"
-        "    try:\n"
-        "        from huggingface_hub import scan_cache_dir\n"
-        "        _cached = False\n"
-        "        for _repo in scan_cache_dir().repos:\n"
-        "            if _repo.repo_id == _model_id:\n"
-        "                _size_gb = _repo.size_on_disk / 1e9\n"
-        '                print(f"Model found in HF cache '
-        '({_size_gb:.1f} GB) — no download needed")\n'
-        "                _cached = True\n"
-        "                break\n"
-        "        if not _cached:\n"
-        '            print(f"Model not in cache — will download '
-        'from HuggingFace: {_model_id}")\n'
-        "    except Exception:\n"
-        '        print(f"Loading model: {_model_id}")\n'
-    )
 
 
 def _entry_shim(entry_module: str, cfg: dict, pipeline_root: Path) -> str:
