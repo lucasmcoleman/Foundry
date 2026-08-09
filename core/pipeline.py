@@ -1401,18 +1401,8 @@ STAGES = [
 ]
 
 
-def run_pipeline(config: PipelineConfig, log: LogFn = _default_log,
-                 force: bool = False, stage_timeout: Optional[float] = None,
-                 skip_preflight: bool = False) -> dict[str, bool]:
-    """Run the full pipeline. Returns {stage_name: success/None(skipped)}.
-
-    ``force`` re-runs every stage even when a completion marker matches.
-    ``stage_timeout`` (seconds) kills a wedged stage subprocess (advisory).
-    ``skip_preflight`` disables the GPU-memory preflight check.
-    """
-    artifacts = Artifacts(config.output_dir)
-    results = {}
-
+def _compute_enabled_stages(config: PipelineConfig) -> set[str]:
+    """Which stages are enabled, from config section presence."""
     enabled = set()
     if config.training is not None:
         enabled.add("training")
@@ -1430,6 +1420,22 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log,
         enabled.add("rocmfpx")
     if config.upload is not None:
         enabled.add("upload")
+    return enabled
+
+
+def run_pipeline(config: PipelineConfig, log: LogFn = _default_log,
+                 force: bool = False, stage_timeout: Optional[float] = None,
+                 skip_preflight: bool = False) -> dict[str, bool]:
+    """Run the full pipeline. Returns {stage_name: success/None(skipped)}.
+
+    ``force`` re-runs every stage even when a completion marker matches.
+    ``stage_timeout`` (seconds) kills a wedged stage subprocess (advisory).
+    ``skip_preflight`` disables the GPU-memory preflight check.
+    """
+    artifacts = Artifacts(config.output_dir)
+    results = {}
+
+    enabled = _compute_enabled_stages(config)
 
     log(f"Pipeline: {' → '.join(s for s, _ in STAGES if s in enabled)}", "stage")
 
@@ -1811,25 +1817,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print("ERROR: --dry-run requires --upload-to <repo_id>")
                 return 1
         artifacts = Artifacts(cfg.output_dir)
-        # Build the enabled set from config presence (same logic as run_pipeline).
-        _dry_enabled = set()
-        if cfg.training is not None:
-            _dry_enabled.add("training")
-        if cfg.export is not None:
-            _dry_enabled.add("export")
-        if cfg.heretic is not None:
-            _dry_enabled.add("heretic")
-        if cfg.reap is not None:
-            _dry_enabled.add("reap")
-        if cfg.qat is not None:
-            _dry_enabled.add("qat")
-        if cfg.magicquant is not None:
-            _dry_enabled.add("magicquant")
-        if cfg.rocmfpx is not None:
-            _dry_enabled.add("rocmfpx")
-        if cfg.upload is not None:
-            _dry_enabled.add("upload")
-        report = stage_upload_dry_run(cfg, artifacts, _default_log, enabled=_dry_enabled)
+        report = stage_upload_dry_run(cfg, artifacts, _default_log, enabled=_compute_enabled_stages(cfg))
         return 0 if report and report.ok else 1
 
     results = run_pipeline(
