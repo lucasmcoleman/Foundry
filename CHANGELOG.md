@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **UI MagicQuant imatrix silently disabled (cleanup):** the web UI's frontend
+  default for `use_imatrix` was hardcoded `false` in `ui/index.html`, overriding
+  the backend's `true` default (set when imatrix became the default) on every
+  UI-driven run, including a fresh browser with no saved state. CLI and
+  direct-API runs were unaffected. Frontend default now matches the backend;
+  a form-state migration (`LS_VERSION` 7→8) drops any saved `false` from before
+  the fix so existing browsers pick up the corrected default too.
+
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
 ### Changed (behavior)
