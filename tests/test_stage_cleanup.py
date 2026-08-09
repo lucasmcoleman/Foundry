@@ -6,7 +6,6 @@ the simplified Pareto-min.
 """
 
 import sys
-from pathlib import Path
 
 import pipeline
 
@@ -53,27 +52,16 @@ def test_marker_written_on_success_with_key_file(tmp_path):
 
 
 def test_llamacpp_clone_is_pinned():
-    """L-supply-chain: pin constant + --branch usage in the auto-install path."""
-    src = Path(pipeline.__file__).read_text()
-    assert "LLAMACPP_PIN" in src
-    assert "--branch" in src
-    # The MagicQuant entry module's clone (audit H2: moved out of services.py
-    # into core/_magicquant_entry.py) is also pinned.
+    """L-supply-chain: pin constant + --branch usage in the auto-install path.
+
+    The auto-install path lives solely in core/_magicquant_entry.py (audit H2
+    moved it out of services.py there; a since-removed duplicate in
+    pipeline.py -- the original target of this test -- was dead code with no
+    callers and has been deleted, leaving this module the single source)."""
     from pathlib import Path as _P
     entry_src = (_P(pipeline.__file__).parent / "_magicquant_entry.py").read_text()
     assert "LLAMACPP_PIN" in entry_src
     assert "--branch" in entry_src
-
-
-def test_llamacpp_pin_is_single_sourced():
-    """R3: pipeline.py must import LLAMACPP_REPO/LLAMACPP_PIN from
-    _magicquant_entry.py rather than keeping its own literal copy -- same
-    object, not just an equal-valued duplicate, so bumping the pin in one
-    place can never leave the other stale."""
-    import _magicquant_entry
-
-    assert pipeline.LLAMACPP_PIN is _magicquant_entry.LLAMACPP_PIN
-    assert pipeline.LLAMACPP_REPO is _magicquant_entry.LLAMACPP_REPO
 
 
 def test_rocmfpx_clone_is_pinned():

@@ -17,6 +17,18 @@
   entire upload stage instead of retrying. Now carries the same `@retry`
   decorator as its siblings.
 
+### Removed
+- **Dead llama.cpp auto-installer in `core/pipeline.py` (cleanup):** `_find_llamacpp`/
+  `ensure_llamacpp` had zero callers -- the real, tested auto-install path is
+  `core/_magicquant_entry.py`'s, which every stage that needs llama.cpp actually
+  uses and which (unlike the dead copy) correctly prefers a ROCmFPX fork build
+  when present. The dead copy had already silently drifted to lack that
+  preference. `tests/test_stage_cleanup.py`'s supply-chain-pin tests, which
+  targeted the dead copy from before the H2 entry-shim migration, now check
+  `_magicquant_entry.py` directly (matching how the ROCmFPX equivalent test
+  already worked); the now-inapplicable single-sourcing test was removed since
+  there is no longer a second copy to keep in sync.
+
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
 ### Changed (behavior)

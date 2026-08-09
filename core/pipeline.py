@@ -423,20 +423,6 @@ def _find_python() -> str:
 # Project root (the directory containing core/). Used by the Service classes.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Pinned llama.cpp ref for reproducible auto-install (audit L-supply-chain).
-# Bump deliberately; clone uses --branch so it pins a tag, not the default branch.
-#
-# Single-sourced from core/_magicquant_entry.py (stdlib-only importable, see
-# that module's docstring) rather than a second hand-typed literal here --
-# pipeline.py's own llama.cpp auto-install (below) and
-# _magicquant_entry.py's need to agree on exactly the same pin, and a second
-# copy is a drift hazard the moment one gets bumped without the other.
-try:
-    from _magicquant_entry import LLAMACPP_REPO, LLAMACPP_PIN
-except ImportError:  # pragma: no cover - package-import fallback
-    from core._magicquant_entry import LLAMACPP_REPO, LLAMACPP_PIN
-
-
 def _services():
     """Import the shared service classes (core/services.py).
 
@@ -518,25 +504,6 @@ def _preflight_stage(stage: str, config: PipelineConfig, log: LogFn, skip: bool 
     params_b = _pf.estimate_params_b(str(cfg_json)) if cfg_json.exists() else None
     needed = _pf.estimate_stage_gb(stage, params_b)
     return _pf.check_gpu_memory(needed, log=log, skip=skip)
-
-
-def _find_llamacpp(hint: Optional[str] = None) -> Optional[Path]:
-    candidates = [
-        hint,
-        os.environ.get("LLAMACPP_PATH"),
-        str(Path.home() / "llama.cpp"),
-        "./llama.cpp",
-        "/usr/local",
-    ]
-    for c in candidates:
-        if not c:
-            continue
-        p = Path(c)
-        for sub in [p / "convert_hf_to_gguf.py", p / "bin" / "convert_hf_to_gguf.py",
-                     p / "build" / "bin" / "llama-perplexity"]:
-            if sub.exists():
-                return p
-    return None
 
 
 # ── Improvement #3: Dataset validation ───────────────────────────────────────
@@ -661,45 +628,6 @@ def validate_dataset(dataset_path_or_sources, log: LogFn) -> bool:
     if all_ok:
         log("Dataset validation passed", "success")
     return all_ok
-
-
-# ── Improvement #4: Auto-install llama.cpp ───────────────────────────────────
-
-def ensure_llamacpp(hint: Optional[str], log: LogFn) -> Optional[Path]:
-    """Find llama.cpp, or auto-install it if missing."""
-    found = _find_llamacpp(hint)
-    if found:
-        log(f"llama.cpp found at: {found}")
-        return found
-
-    install_dir = Path.home() / "llama.cpp"
-    log("llama.cpp not found — auto-installing", "stage")
-
-    # Clone a pinned ref (not the default branch) for reproducibility.
-    log(f"Cloning llama.cpp from GitHub (pinned {LLAMACPP_PIN})...")
-    rc = _run(["git", "clone", "--depth", "1", "--branch", LLAMACPP_PIN,
-               LLAMACPP_REPO, str(install_dir)], log)
-    if rc != 0:
-        log("Failed to clone llama.cpp", "error")
-        return None
-
-    # Build
-    log("Building llama.cpp (cmake)...")
-    build_dir = install_dir / "build"
-    rc = _run(["cmake", "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release", str(install_dir)], log)
-    if rc != 0:
-        log("cmake configure failed", "error")
-        return None
-
-    import multiprocessing
-    jobs = str(multiprocessing.cpu_count())
-    rc = _run(["cmake", "--build", str(build_dir), "-j", jobs], log)
-    if rc != 0:
-        log("cmake build failed", "error")
-        return None
-
-    log(f"llama.cpp installed at: {install_dir}", "success")
-    return install_dir
 
 
 # ── Stage: Training (with completion-only loss) ─────────────────────────────
