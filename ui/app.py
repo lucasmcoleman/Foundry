@@ -973,6 +973,9 @@ async def do_qat(cfg: RunRequest) -> bool:
         await state.set_stage("qat", StageStatus.FAILED)
         return False
 
+    if not await _mem_preflight("qat"):
+        return False
+
     config_source = _resolve_qat_config_source(qc, out_abs)
     if config_source is None:
         await state.log(
