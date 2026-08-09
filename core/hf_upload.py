@@ -1438,6 +1438,11 @@ def _resolve_hf_token() -> Optional[str]:
     return get_token()
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=2, max=30),
+    retry=retry_if_exception_type(requests.exceptions.RequestException),
+)
 def _create_repo_with_retry(api, **kwargs):
     """Create or verify a HuggingFace repo with automatic retry on transient failures."""
     return api.create_repo(**kwargs)
