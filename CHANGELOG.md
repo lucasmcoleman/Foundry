@@ -16,6 +16,20 @@
   passthrough. A transient network blip during repo creation could kill an
   entire upload stage instead of retrying. Now carries the same `@retry`
   decorator as its siblings.
+- **`do_heretic`/`do_reap` crashed opaquely on a missing stage config:** both
+  stage configs are `Optional[...] = None` on `RunRequest`, reachable via the
+  documented headless `/api/run`. `do_qat`/`do_rocmfpx` already guarded this
+  with an actionable error; `do_heretic`/`do_reap` instead hit an
+  `AttributeError` on first field access, surfacing as an opaque
+  `Pipeline error: 'NoneType' object has no attribute ...`. Both now fail with
+  the same clear message as their siblings.
+- **QAT stage skipped the system-memory preflight gate:** every other heavy UI
+  stage (training/export/heretic/magicquant/rocmfpx) calls `_mem_preflight`
+  before running; QAT did not, despite `preflight.py` giving it its own
+  dedicated 32 GB constant ("frozen base held fake-quantized in host RAM while
+  LoRA adapters train against it") -- the same risk category (`MemAvailable`
+  collapse -> kernel OOM-killer livelock) the gate exists to catch. `do_qat`
+  now calls it like its siblings.
 
 ### Removed
 - **Dead llama.cpp auto-installer in `core/pipeline.py` (cleanup):** `_find_llamacpp`/
@@ -33,13 +47,6 @@
   migration and had zero callers -- every service now unconditionally uses
   `_entry_shim()`, and the env-setup/cache-probe logic they generated as
   strings now lives as real Python in the entry modules.
-- **`do_heretic`/`do_reap` crashed opaquely on a missing stage config
-  (cleanup):** both stage configs are `Optional[...] = None` on `RunRequest`,
-  reachable via the documented headless `/api/run`. `do_qat`/`do_rocmfpx`
-  already guarded this with an actionable error; `do_heretic`/`do_reap` instead
-  hit an `AttributeError` on first field access, surfacing as an opaque
-  `Pipeline error: 'NoneType' object has no attribute ...`. Both now fail with
-  the same clear message as their siblings.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
