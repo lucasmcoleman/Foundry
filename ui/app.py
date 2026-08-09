@@ -777,6 +777,11 @@ async def do_heretic(cfg: RunRequest) -> bool:
     out_abs = _resolve_out(out)
     hc = cfg.heretic
 
+    if hc is None:
+        await state.log("Heretic stage enabled but no heretic config provided", "error")
+        await state.set_stage("heretic", StageStatus.FAILED)
+        return False
+
     if not await _mem_preflight("heretic"):
         return False
 
@@ -851,6 +856,11 @@ async def do_reap(cfg: RunRequest) -> bool:
     out = cfg.training.output_dir
     out_abs = _resolve_out(out)
     rc = cfg.reap
+
+    if rc is None:
+        await state.log("REAP stage enabled but no REAP config provided", "error")
+        await state.set_stage("reap", StageStatus.FAILED)
+        return False
 
     # Completion-marker resume (audit M-skip-marker).
     reap_dir = out_abs / "reap_model"

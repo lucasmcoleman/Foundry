@@ -33,6 +33,13 @@
   migration and had zero callers -- every service now unconditionally uses
   `_entry_shim()`, and the env-setup/cache-probe logic they generated as
   strings now lives as real Python in the entry modules.
+- **`do_heretic`/`do_reap` crashed opaquely on a missing stage config
+  (cleanup):** both stage configs are `Optional[...] = None` on `RunRequest`,
+  reachable via the documented headless `/api/run`. `do_qat`/`do_rocmfpx`
+  already guarded this with an actionable error; `do_heretic`/`do_reap` instead
+  hit an `AttributeError` on first field access, surfacing as an opaque
+  `Pipeline error: 'NoneType' object has no attribute ...`. Both now fail with
+  the same clear message as their siblings.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
