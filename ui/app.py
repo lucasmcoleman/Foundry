@@ -32,7 +32,6 @@ from pydantic import BaseModel, ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 import markers
-from config import settings as foundry_settings
 from pipeline import validate_dataset as _core_validate_dataset
 from preflight import check_system_memory
 from reap_common import REAP_SUPPORTED_ARCHS, detect_model_arch as _detect_model_arch
@@ -92,7 +91,7 @@ app = FastAPI(title="Foundry")
 # Origins come from FOUNDRY_UI_ORIGINS (comma-separated) when set, else a
 # built-in list covering loopback + this box's LAN addresses/hostname on the
 # UI port. Extend FOUNDRY_UI_ORIGINS if the box gets a new LAN IP.
-_UI_PORT = os.environ.get("FOUNDRY_UI_PORT", str(foundry_settings.ui_port))
+_UI_PORT = os.environ.get("FOUNDRY_UI_PORT", "7865")
 _default_origins = [
     f"http://localhost:{_UI_PORT}", f"http://127.0.0.1:{_UI_PORT}",
     f"http://192.168.0.29:{_UI_PORT}",      # eno1 (static LAN)
@@ -2065,7 +2064,7 @@ def select_host(requested: Optional[str], api_key: str, require_auth: bool = Fal
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("FOUNDRY_UI_PORT", foundry_settings.ui_port))
+    port = int(os.environ.get("FOUNDRY_UI_PORT", 7865))
     host = select_host(os.environ.get("FOUNDRY_UI_HOST"), API_KEY, REQUIRE_AUTH)
     if host not in ("127.0.0.1", "::1", "localhost"):
         print(f"WARNING: binding {host} — the pipeline grants shell-equivalent host access; "

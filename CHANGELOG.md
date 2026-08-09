@@ -148,6 +148,19 @@
   `test_ui_magicquant_budget.py`) had that anchor removed by the extraction;
   updated to anchor on `"done, mq_key = await _check_marker("` instead.
 
+### Removed
+- **`core/config.py` (`FoundrySettings`) deleted (user-confirmed):** ~28
+  pydantic-settings fields, of which only `.ui_port` was ever read anywhere
+  (`ui/app.py`, itself behind an `os.environ.get("FOUNDRY_UI_PORT", ...)`
+  fallback already reading the same env var) -- and two other fields had
+  already silently drifted from `pipeline.py`'s real training defaults
+  (`max_seq_length` 8192 vs 4096; `optim` `adamw_8bit` vs `paged_adamw_8bit`).
+  `ui/app.py` now reads `FOUNDRY_UI_PORT` directly (default `7865`), matching
+  how it already reads `FOUNDRY_API_KEY`/`FOUNDRY_REQUIRE_AUTH`. Also drops
+  `pydantic-settings` and `python-dotenv` from `pyproject.toml` -- both were
+  pulled in solely for this module (`env_file=".env"` support) and had no
+  other consumer anywhere in the repo.
+
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
 ### Changed (behavior)
