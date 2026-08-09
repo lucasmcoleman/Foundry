@@ -1286,70 +1286,20 @@ def _resolve_license(uc: UploadConfig, model_name: str, log: LogFn) -> str:
     return lic
 
 
-def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
-                 enabled: set = None) -> bool:
-    """Upload artifacts to HuggingFace Hub.
+def _build_hf_upload_config(config: PipelineConfig, log: LogFn, enabled: set = None):
+    """Assemble the HFUploadConfig shared by stage_upload and stage_upload_dry_run.
 
-    Delegates to hf_upload module for model card generation, progress
-    reporting, and file upload. Supports dry-run mode via stage_upload_dry_run().
+    Returns None (having already logged the error) if no repo_id is configured.
 
     Args:
         enabled: set of stage names that actually ran. Used to determine
                  did_training / did_heretic / did_magicquant flags for the
                  model card. Falls back to config presence check if not provided.
+                 config.training is always non-None (non-optional field with a
+                 default), so `config.training is not None` is always True --
+                 `enabled` is what actually distinguishes ran-vs-not.
     """
-    from hf_upload import HFUploadConfig, upload
-
-    uc = config.upload
-    if not uc or not uc.repo_id:
-        log("No repo_id configured for upload", "error")
-        return False
-
-    tc = config.training
-    license_id = _resolve_license(uc, tc.model_name, log)
-
-    # Determine which stages actually ran, not just which configs are present.
-    # config.training is always non-None (non-optional field with a default),
-    # so `config.training is not None` is always True -- use `enabled` instead.
-    _enabled = enabled or set()
-    hf_cfg = HFUploadConfig(
-        repo_id=uc.repo_id,
-        private=uc.private,
-        license=license_id,
-        upload_gguf=uc.upload_gguf,
-        upload_lora=uc.upload_lora,
-        upload_merged=uc.upload_merged,
-        base_model=uc.base_model or tc.model_name,
-        dataset_name=tc.dataset_path,
-        did_training="training" in _enabled,
-        did_heretic="heretic" in _enabled,
-        did_reap="reap" in _enabled,
-        did_magicquant="magicquant" in _enabled,
-        lora_r=tc.lora_r,
-        lora_alpha=tc.lora_alpha,
-        lora_dropout=tc.lora_dropout,
-        num_epochs=tc.num_train_epochs,
-        learning_rate=tc.learning_rate,
-        max_seq_length=tc.max_seq_length,
-        batch_size=tc.per_device_train_batch_size,
-        gradient_accumulation=tc.gradient_accumulation_steps,
-        optimizer=tc.optim,
-        lr_scheduler=tc.lr_scheduler_type,
-    )
-
-    return upload(hf_cfg, config.output_dir, log=log)
-
-
-def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
-                         enabled: set = None):
-    """Dry-run upload: validate credentials and report what would be uploaded.
-
-    Returns a DryRunReport (from hf_upload module).
-
-    Args:
-        enabled: set of stage names that actually ran. See stage_upload().
-    """
-    from hf_upload import HFUploadConfig, dry_run
+    from hf_upload import HFUploadConfig
 
     uc = config.upload
     if not uc or not uc.repo_id:
@@ -1359,7 +1309,7 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
     tc = config.training
     license_id = _resolve_license(uc, tc.model_name, log)
     _enabled = enabled or set()
-    hf_cfg = HFUploadConfig(
+    return HFUploadConfig(
         repo_id=uc.repo_id,
         private=uc.private,
         license=license_id,
@@ -1384,6 +1334,33 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
         lr_scheduler=tc.lr_scheduler_type,
     )
 
+
+def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+                 enabled: set = None) -> bool:
+    """Upload artifacts to HuggingFace Hub.
+
+    Delegates to hf_upload module for model card generation, progress
+    reporting, and file upload. Supports dry-run mode via stage_upload_dry_run().
+    """
+    from hf_upload import upload
+
+    hf_cfg = _build_hf_upload_config(config, log, enabled)
+    if hf_cfg is None:
+        return False
+    return upload(hf_cfg, config.output_dir, log=log)
+
+
+def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+                         enabled: set = None):
+    """Dry-run upload: validate credentials and report what would be uploaded.
+
+    Returns a DryRunReport (from hf_upload module).
+    """
+    from hf_upload import dry_run
+
+    hf_cfg = _build_hf_upload_config(config, log, enabled)
+    if hf_cfg is None:
+        return None
     return dry_run(hf_cfg, config.output_dir, log=log)
 
 
