@@ -106,3 +106,21 @@ def test_gated_stages_call_system_memory_gate():
 def test_reap_does_not_call_system_memory_gate():
     body = _stage_body("stage_reap")
     assert "_system_memory_gate" not in body
+
+
+def test_every_heavy_stage_also_calls_the_gpu_preflight_check():
+    """stage_magicquant used to accept skip_preflight but never actually call
+    _preflight_stage (the GPU-VRAM advisory check) at all -- discovered while
+    wiring the system-memory gate, fixed as a follow-up. Every other heavy
+    stage already called it; this locks in that stage_magicquant now does
+    too, matching stage_rocmfpx's identical structure and placement."""
+    for stage_func, stage_name in [
+        ("stage_training", "training"),
+        ("stage_export", "export"),
+        ("stage_heretic", "heretic"),
+        ("stage_qat", "qat"),
+        ("stage_magicquant", "magicquant"),
+        ("stage_rocmfpx", "rocmfpx"),
+    ]:
+        body = _stage_body(stage_func)
+        assert f'_preflight_stage("{stage_name}", config, log, skip=skip_preflight)' in body, stage_func

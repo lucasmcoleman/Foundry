@@ -1174,6 +1174,8 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         log(f"MagicQuant already complete (marker matches) at {artifacts.magicquant_dir} — skipping", "success")
         return True
 
+    _preflight_stage("magicquant", config, log, skip=skip_preflight)
+
     model_name = config.training.model_name.split("/")[-1]
     import json as _json
     svc = _services().MagicQuantService(PROJECT_ROOT, _find_python())
