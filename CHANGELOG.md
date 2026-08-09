@@ -49,6 +49,14 @@
   LoRA adapters train against it") -- the same risk category (`MemAvailable`
   collapse -> kernel OOM-killer livelock) the gate exists to catch. `do_qat`
   now calls it like its siblings.
+- **`stage_magicquant` never called the GPU-VRAM preflight check:** it
+  accepted a `skip_preflight` parameter like every other stage but never
+  actually called `_preflight_stage` with it -- discovered while wiring the
+  system-memory gate above, logged as a follow-up, now fixed. Every other
+  heavy CLI stage (training/export/heretic/qat/rocmfpx) already called it;
+  `stage_magicquant` now does too, at the identical placement `stage_rocmfpx`
+  uses (right after the completion-marker check, before building the stage
+  script).
 
 ### Removed
 - **Dead llama.cpp auto-installer in `core/pipeline.py` (cleanup):** `_find_llamacpp`/
