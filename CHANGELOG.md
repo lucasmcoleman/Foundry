@@ -74,6 +74,12 @@
   resolution and core's CWD-relative resolution agree, since
   `foundry-ui.service`'s `WorkingDirectory=/server/programming/Foundry`
   guarantees the two are the same directory.
+- **Enabled-stage-set computation deduplicated (cleanup):** `run_pipeline()`
+  and `main()`'s `--dry-run` branch each rebuilt the same 8-line
+  `if config.X is not None: enabled.add("X")` block from `PipelineConfig`
+  section presence (the dry-run branch's own comment already said "same
+  logic as run_pipeline"). Factored into `_compute_enabled_stages(config)`,
+  called from both.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
