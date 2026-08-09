@@ -10,6 +10,12 @@
   direct-API runs were unaffected. Frontend default now matches the backend;
   a form-state migration (`LS_VERSION` 7→8) drops any saved `false` from before
   the fix so existing browsers pick up the corrected default too.
+- **`_create_repo_with_retry` didn't actually retry (cleanup):** its name and
+  docstring promised the same retry-on-transient-failure behavior as its two
+  siblings (`_upload_with_retry`, `_whoami_with_retry`), but it was a bare
+  passthrough. A transient network blip during repo creation could kill an
+  entire upload stage instead of retrying. Now carries the same `@retry`
+  decorator as its siblings.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
