@@ -48,6 +48,14 @@
   `_entry_shim()`, and the env-setup/cache-probe logic they generated as
   strings now lives as real Python in the entry modules.
 
+### Changed
+- **`hf_cache_probe()` deduplicated (cleanup):** `core/_train_entry.py` and
+  `core/_export_entry.py` carried character-for-character identical copies.
+  Moved to a new `core/entry_common.py` (stdlib-only, matching each entry
+  module's no-heavy-deps-at-import-time constraint) and imported lazily at
+  the existing call sites, same pattern already used for `dataset_format`/
+  `markers`/`reap_common`.
+
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
 ### Changed (behavior)
