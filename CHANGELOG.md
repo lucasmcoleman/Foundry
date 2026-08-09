@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Changed (behavior)
+- **CLI now enforces the system-memory OOM-freeze gate (user-confirmed
+  behavior change):** `core/preflight.py`'s `check_system_memory` is the
+  PRIMARY GATE against the documented unified-memory OOM-freeze livelock
+  (resident model pins GTT → `MemAvailable` collapses → kernel OOM-kills
+  bystander processes → box livelock), but it was only ever wired into the
+  UI's `_mem_preflight`. The CLI's own `_preflight_stage` only ever checked
+  GPU VRAM, advisory-only (logs, never blocks -- callers discard its return
+  value). Added a new `_system_memory_gate(stage, log, skip)` -- unlike
+  `_preflight_stage`, this one actually blocks -- wired into
+  `stage_training`/`stage_export`/`stage_heretic`/`stage_qat`/
+  `stage_magicquant`/`stage_rocmfpx` (every heavy stage `_mem_preflight`
+  gates on the UI side). `stage_reap` is intentionally excluded, matching
+  `preflight.py`'s own documented exception and the UI's `do_reap`. Bypass
+  with `--skip-preflight` or `FOUNDRY_SKIP_MEM_PREFLIGHT=1`, same as the UI.
+  **This can newly block a CLI run that previously proceeded** when
+  `MemAvailable` is genuinely low -- that is the intended fix, confirmed
+  before implementing.
+
 ### Fixed
 - **UI MagicQuant imatrix silently disabled (cleanup):** the web UI's frontend
   default for `use_imatrix` was hardcoded `false` in `ui/index.html`, overriding

@@ -506,6 +506,28 @@ def _preflight_stage(stage: str, config: PipelineConfig, log: LogFn, skip: bool 
     return _pf.check_gpu_memory(needed, log=log, skip=skip)
 
 
+def _system_memory_gate(stage: str, log: LogFn, skip: bool = False) -> bool:
+    """System-memory (MemAvailable) preflight gate -- unlike ``_preflight_stage``
+    (GPU VRAM, advisory-only), this one blocks: callers check the return value
+    and abort the stage on False.
+
+    Mirrors ``ui/app.py``'s ``_mem_preflight`` exactly, including which stages
+    it gates (every heavy stage except REAP, which ``preflight.py`` itself
+    documents as an intentional lighter/unlisted exception) -- this is the
+    PRIMARY GATE against the unified-memory OOM-freeze livelock documented in
+    ``core/preflight.py``'s module docstring; before this, only the UI path
+    called ``check_system_memory`` at all.
+    """
+    try:
+        try:
+            import preflight as _pf
+        except ImportError:  # pragma: no cover
+            from core import preflight as _pf
+    except Exception:
+        return True
+    return _pf.check_system_memory(stage, log=log, skip=skip)
+
+
 # ── Improvement #3: Dataset validation ───────────────────────────────────────
 
 def _validate_local_dataset(path: Path, log: LogFn) -> bool:
@@ -662,6 +684,9 @@ def stage_training(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     """
     tc = config.training
 
+    if not _system_memory_gate("training", log, skip=skip_preflight):
+        return False
+
     # Completion-marker resume: skip only when a valid marker matches the config
     # AND the key adapter file is present and non-empty (not bare existence).
     key_file = artifacts.lora_dir / "adapter_model.safetensors"
@@ -732,6 +757,9 @@ def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     """
     if not artifacts.lora_dir.exists():
         log("No LoRA adapters found — run training first", "error")
+        return False
+
+    if not _system_memory_gate("export", log, skip=skip_preflight):
         return False
 
     # Read the adapter_config.json to find the base model ID.
@@ -809,6 +837,9 @@ def stage_heretic(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     """
     if not artifacts.merged_dir.exists():
         log("No merged model found \u2014 run export first", "error")
+        return False
+
+    if not _system_memory_gate("heretic", log, skip=skip_preflight):
         return False
 
     hc = config.heretic
@@ -1014,6 +1045,9 @@ def stage_qat(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     """
     log("Starting QAT-LoRA", "stage")
 
+    if not _system_memory_gate("qat", log, skip=skip_preflight):
+        return False
+
     qc = config.qat
     source_model = config.training.model_name
 
@@ -1089,6 +1123,9 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     source of truth with the UI). Skips on a valid completion marker.
     """
     log("Starting MagicQuant evolutionary quantization", "stage")
+
+    if not _system_memory_gate("magicquant", log, skip=skip_preflight):
+        return False
 
     mc = config.magicquant
 
@@ -1208,6 +1245,9 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     completion marker.
     """
     log("Starting ROCmFPX quantization", "stage")
+
+    if not _system_memory_gate("rocmfpx", log, skip=skip_preflight):
+        return False
 
     rc_cfg = config.rocmfpx
 
