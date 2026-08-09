@@ -26,27 +26,6 @@ def parse_config(cfg_path: str) -> dict:
     return json.loads(Path(cfg_path).read_text())
 
 
-def hf_cache_probe(model_id: str) -> None:
-    """Log whether the base model is local / cached / will be downloaded."""
-    if Path(model_id).exists():
-        print(f"Loading from local path: {model_id}", flush=True)
-        return
-    try:
-        from huggingface_hub import scan_cache_dir
-
-        for repo in scan_cache_dir().repos:
-            if repo.repo_id == model_id:
-                print(
-                    f"Model found in HF cache ({repo.size_on_disk / 1e9:.1f} GB) — "
-                    "no download needed",
-                    flush=True,
-                )
-                return
-        print(f"Model not in cache — will download from HuggingFace: {model_id}", flush=True)
-    except Exception:
-        print(f"Loading model: {model_id}", flush=True)
-
-
 def run(cfg_path: str | None = None) -> None:
     import os
 
@@ -63,6 +42,10 @@ def run(cfg_path: str | None = None) -> None:
 
     from fast_export import streaming_merge
 
+    try:
+        from entry_common import hf_cache_probe
+    except ImportError:
+        from core.entry_common import hf_cache_probe
     hf_cache_probe(cfg["base_model_id"])
     lora_dir = cfg["lora_source"] if cfg["has_lora"] else None
     streaming_merge(

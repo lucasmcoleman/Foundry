@@ -43,27 +43,6 @@ _CHATML_TEMPLATE = (
 _EXT_TO_BUILDER = {"jsonl": "json", "json": "json", "csv": "csv", "parquet": "parquet"}
 
 
-def hf_cache_probe(model_id: str) -> None:
-    """Log whether the model is local / cached / will be downloaded (info only)."""
-    if Path(model_id).exists():
-        print(f"Loading from local path: {model_id}", flush=True)
-        return
-    try:
-        from huggingface_hub import scan_cache_dir
-
-        for repo in scan_cache_dir().repos:
-            if repo.repo_id == model_id:
-                print(
-                    f"Model found in HF cache ({repo.size_on_disk / 1e9:.1f} GB) — "
-                    "no download needed",
-                    flush=True,
-                )
-                return
-        print(f"Model not in cache — will download from HuggingFace: {model_id}", flush=True)
-    except Exception:
-        print(f"Loading model: {model_id}", flush=True)
-
-
 def parse_config(cfg_path: str) -> dict:
     """Read the JSON config the shim wrote. Pure (no torch); unit-testable."""
     return json.loads(Path(cfg_path).read_text())
@@ -214,6 +193,10 @@ def run(cfg_path: str | None = None) -> None:
             "--model at the original safetensors repo."
         )
 
+    try:
+        from entry_common import hf_cache_probe
+    except ImportError:
+        from core.entry_common import hf_cache_probe
     hf_cache_probe(model_name)
     from fast_train_zeroclaw import resolve_attn_implementation, resolve_packing
     attn_implementation = resolve_attn_implementation()
