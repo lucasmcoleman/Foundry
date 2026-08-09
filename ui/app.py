@@ -548,6 +548,43 @@ async def _mem_preflight(stage: str) -> bool:
     return ok
 
 
+async def _check_marker(
+    stage: str, display_name: str, stage_dir: Path, cfg_hash: str,
+    key_glob: str | None, default_key_name: str,
+) -> tuple[bool, Path]:
+    """Completion-marker resume check shared by all do_* stage runners
+    (audit M-skip-marker): skip only when a valid marker matches the config
+    hash AND the key artifact is present and non-empty.
+
+    ``cfg_hash`` is the caller's already-computed ``markers.config_hash(...)``
+    (each stage hashes a different field set, so that stays with the caller).
+
+    ``key_glob=None`` means the key is a single fixed filename
+    (``default_key_name``); otherwise the first sorted match of ``key_glob``
+    in ``stage_dir`` is used, falling back to ``stage_dir/default_key_name``
+    when nothing matches yet (mirrors each stage's original glob-or-default
+    logic exactly).
+
+    Returns ``(done, key)``. When ``done`` is True, the log message, COMPLETE
+    state, and 100% progress have already been set — the caller should
+    immediately ``return True``. When False, ``key`` is handed back so the
+    caller's post-run ``write_marker`` call (which varies per stage -- some
+    re-glob after the run, some don't -- and is intentionally left to each
+    stage) can reuse the same fallback key.
+    """
+    if key_glob is None:
+        key = stage_dir / default_key_name
+    else:
+        existing = sorted(stage_dir.glob(key_glob)) if stage_dir.exists() else []
+        key = existing[0] if existing else (stage_dir / default_key_name)
+    if markers.is_stage_complete(stage_dir, key, cfg_hash):
+        await state.log(f"{display_name} already complete (marker matches) at {stage_dir} — skipping", "success")
+        await state.set_stage(stage, StageStatus.COMPLETE)
+        await state.set_progress(100)
+        return True, key
+    return False, key
+
+
 async def do_training(cfg: RunRequest) -> bool:
     """Run the QLoRA training stage. Skips if LoRA adapters already exist."""
     tc = cfg.training
@@ -556,17 +593,15 @@ async def do_training(cfg: RunRequest) -> bool:
     if not await _mem_preflight("training"):
         return False
 
-    # Completion-marker resume: skip only when a valid marker matches the config
-    # AND the key adapter file (adapter_model.safetensors) is present and
-    # non-empty. PEFT writes adapter_config.json early, so existence alone is not
-    # proof the stage finished (audit M-skip-marker).
+    # Completion-marker resume: PEFT writes adapter_config.json early, so
+    # existence alone is not proof the stage finished (audit M-skip-marker).
     lora_dir = out / "lora_adapters"
-    key_file = lora_dir / "adapter_model.safetensors"
     cfg_hash = _training_marker_hash(tc)
-    if markers.is_stage_complete(lora_dir, key_file, cfg_hash):
-        await state.log(f"Training already complete (marker matches) at {lora_dir} — skipping", "success")
-        await state.set_stage("training", StageStatus.COMPLETE)
-        await state.set_progress(100)
+    done, key_file = await _check_marker(
+        "training", "Training", lora_dir, cfg_hash,
+        key_glob=None, default_key_name="adapter_model.safetensors",
+    )
+    if done:
         return True
 
     # Validate dataset(s) before committing GPU time
@@ -621,20 +656,18 @@ async def do_export(cfg: RunRequest) -> bool:
     if not await _mem_preflight("export"):
         return False
 
-    # Completion-marker resume (audit M-skip-marker): skip only when a valid
-    # marker matches AND the key artifact is present + non-empty.
+    # Completion-marker resume (audit M-skip-marker).
     merged = out_abs / "merged_model"
     export_hash = markers.config_hash({
         "model_name": cfg.training.model_name,
         "source_model": cfg.export.source_model if cfg.export else "",
         "training_enabled": training_enabled,
     })
-    existing_st = sorted(merged.glob("*.safetensors")) if merged.exists() else []
-    export_key = existing_st[0] if existing_st else (merged / "model.safetensors")
-    if markers.is_stage_complete(merged, export_key, export_hash):
-        await state.log(f"Export already complete (marker matches) at {merged} — skipping export", "success")
-        await state.set_stage("export", StageStatus.COMPLETE)
-        await state.set_progress(100)
+    done, export_key = await _check_marker(
+        "export", "Export", merged, export_hash,
+        key_glob="*.safetensors", default_key_name="model.safetensors",
+    )
+    if done:
         return True
 
     await state.set_stage("export", StageStatus.RUNNING)
@@ -722,12 +755,11 @@ async def do_heretic(cfg: RunRequest) -> bool:
         "orthogonalize_direction": hc.orthogonalize_direction,
         "row_normalization": hc.row_normalization,
     })
-    existing_h = sorted(heretic_dir.glob("*.safetensors")) if heretic_dir.exists() else []
-    heretic_key = existing_h[0] if existing_h else (heretic_dir / "model.safetensors")
-    if markers.is_stage_complete(heretic_dir, heretic_key, heretic_hash):
-        await state.log(f"Heretic already complete (marker matches) at {heretic_dir} -- skipping heretic", "success")
-        await state.set_stage("heretic", StageStatus.COMPLETE)
-        await state.set_progress(100)
+    done, heretic_key = await _check_marker(
+        "heretic", "Heretic", heretic_dir, heretic_hash,
+        key_glob="*.safetensors", default_key_name="model.safetensors",
+    )
+    if done:
         return True
 
     # Determine model source: prefer merged_model from export stage
@@ -799,12 +831,11 @@ async def do_reap(cfg: RunRequest) -> bool:
         "model_max_length": rc.model_max_length, "dataset_name": rc.dataset_name,
         "seed": rc.seed,
     })
-    existing_r = sorted(reap_dir.glob("*.safetensors")) if reap_dir.exists() else []
-    reap_key = existing_r[0] if existing_r else (reap_dir / "model.safetensors")
-    if markers.is_stage_complete(reap_dir, reap_key, reap_hash):
-        await state.log(f"REAP already complete (marker matches) at {reap_dir} — skipping REAP", "success")
-        await state.set_stage("reap", StageStatus.COMPLETE)
-        await state.set_progress(100)
+    done, reap_key = await _check_marker(
+        "reap", "REAP", reap_dir, reap_hash,
+        key_glob="*.safetensors", default_key_name="model.safetensors",
+    )
+    if done:
         return True
 
     # Determine model source: prefer heretic output, fall back to merged_model
@@ -928,11 +959,11 @@ async def do_qat(cfg: RunRequest) -> bool:
         "lora_alpha": qc.lora_alpha, "epochs": qc.epochs, "max_steps": qc.max_steps,
         "lr": qc.lr, "max_seq_len": qc.max_seq_len,
     })
-    qat_key = qat_dir / "qat_meta.json"
-    if markers.is_stage_complete(qat_dir, qat_key, qat_hash):
-        await state.log(f"QAT already complete (marker matches) at {qat_dir} — skipping", "success")
-        await state.set_stage("qat", StageStatus.COMPLETE)
-        await state.set_progress(100)
+    done, qat_key = await _check_marker(
+        "qat", "QAT", qat_dir, qat_hash,
+        key_glob=None, default_key_name="qat_meta.json",
+    )
+    if done:
         return True
 
     await state.set_stage("qat", StageStatus.RUNNING)
@@ -996,12 +1027,11 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         "allow_dequant_source": mc.allow_dequant_source,
         "budget_gib": mc.budget_gib,
     })
-    existing_ggufs = sorted(mq_dir.glob("*.gguf")) if mq_dir.exists() else []
-    mq_key = existing_ggufs[0] if existing_ggufs else (mq_dir / "_placeholder.gguf")
-    if markers.is_stage_complete(mq_dir, mq_key, mq_hash):
-        await state.log(f"MagicQuant already complete (marker matches) at {mq_dir} — skipping", "success")
-        await state.set_stage("magicquant", StageStatus.COMPLETE)
-        await state.set_progress(100)
+    done, mq_key = await _check_marker(
+        "magicquant", "MagicQuant", mq_dir, mq_hash,
+        key_glob="*.gguf", default_key_name="_placeholder.gguf",
+    )
+    if done:
         return True
 
     await state.set_stage("magicquant", StageStatus.RUNNING)
@@ -1085,12 +1115,11 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
         "source_model": rc_cfg.source_model,
         "allow_requantize": rc_cfg.allow_requantize,
     })
-    existing_ggufs = sorted(rc_dir.glob("*.gguf")) if rc_dir.exists() else []
-    rc_key = existing_ggufs[0] if existing_ggufs else (rc_dir / "_placeholder.gguf")
-    if markers.is_stage_complete(rc_dir, rc_key, rc_hash):
-        await state.log(f"ROCmFPX already complete (marker matches) at {rc_dir} — skipping", "success")
-        await state.set_stage("rocmfpx", StageStatus.COMPLETE)
-        await state.set_progress(100)
+    done, rc_key = await _check_marker(
+        "rocmfpx", "ROCmFPX", rc_dir, rc_hash,
+        key_glob="*.gguf", default_key_name="_placeholder.gguf",
+    )
+    if done:
         return True
 
     await state.set_stage("rocmfpx", StageStatus.RUNNING)

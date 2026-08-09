@@ -44,7 +44,7 @@ def test_do_magicquant_passes_budget_gib_to_build_script():
     do_magicquant_start = src.index("async def do_magicquant")
     do_magicquant_body = src[do_magicquant_start:src.index("\nasync def ", do_magicquant_start + 1)]
 
-    hash_block = do_magicquant_body[:do_magicquant_body.index("existing_ggufs = sorted(mq_dir.glob")]
+    hash_block = do_magicquant_body[:do_magicquant_body.index("done, mq_key = await _check_marker(")]
     assert '"budget_gib": mc.budget_gib' in hash_block
 
     build_script_call = do_magicquant_body[do_magicquant_body.index("svc.build_script("):do_magicquant_body.index("rc = await run_script(script, out)")]
