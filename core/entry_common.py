@@ -10,6 +10,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+# ROCm env vars each entry module's run() sets before importing torch (must run
+# first, preserving the original ordering requirement). Shared by every entry
+# module except _reap_entry.py, whose copy is intentionally a 3-key subset
+# (missing UNSLOTH_SKIP_TORCHVISION_CHECK) -- left untouched here pending a
+# decision on whether that's deliberate or a gap (see CHANGELOG).
+ROCM_ENV = {
+    "HSA_ENABLE_SDMA": "0",
+    "PYTORCH_HIP_ALLOC_CONF": "backend:native,expandable_segments:True",
+    "UNSLOTH_SKIP_TORCHVISION_CHECK": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+}
+
 
 def hf_cache_probe(model_id: str) -> None:
     """Log whether the model is local / cached / will be downloaded (info only)."""

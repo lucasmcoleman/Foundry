@@ -55,6 +55,14 @@
   module's no-heavy-deps-at-import-time constraint) and imported lazily at
   the existing call sites, same pattern already used for `dataset_format`/
   `markers`/`reap_common`.
+- **`_ROCM_ENV` deduplicated into `core/entry_common.py` (cleanup):** identical
+  4-key dict was copy-pasted across `_train_entry.py`, `_export_entry.py`,
+  `_heretic_entry.py`, `_qat_entry.py`. `_reap_entry.py`'s copy is a 3-key
+  subset (missing `UNSLOTH_SKIP_TORCHVISION_CHECK`) and was left as its own
+  local dict, unchanged, with a comment explaining the divergence -- whether
+  that's intentional or a copy-paste gap is a still-open question from the
+  cleanup audit; this change only removes the duplication that was actually
+  identical.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
