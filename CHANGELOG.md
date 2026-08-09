@@ -80,6 +80,12 @@
   section presence (the dry-run branch's own comment already said "same
   logic as run_pipeline"). Factored into `_compute_enabled_stages(config)`,
   called from both.
+- **`HFUploadConfig` assembly deduplicated (cleanup):** `stage_upload` and
+  `stage_upload_dry_run` each independently assembled the same ~50-line
+  `HFUploadConfig` from `PipelineConfig` (every field, the missing-repo_id
+  guard, the `_resolve_license()` call). Factored into
+  `_build_hf_upload_config(config, log, enabled)`, called from both; each now
+  only branches on `upload()` vs `dry_run()`.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
