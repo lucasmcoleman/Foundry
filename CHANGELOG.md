@@ -183,6 +183,24 @@
   `fixture not found` errors, the exact failure mode this fixes). A full
   live GPU run is still the way to fully validate the training/export path
   itself.
+- **`scripts/patch_gguf_metadata.py` no longer hardcodes stale paths
+  (user-confirmed, B5):** `main()` hardcoded a model id and two directory
+  paths from before the project's rename from `/server/programming/pipeline`
+  to Foundry -- both directories confirmed gone, so running the script as
+  committed just printed "No GGUF files found!" and exited 1, even though
+  CLAUDE.md's Known Issues section points users here as the fix for GGUFs
+  missing a chat template. Now takes `--model-id` and one or more
+  `--gguf-dir` directories as CLI args (`argparse`), matching how the rest
+  of `scripts/` takes its per-run parameters. The directory-scan logic is
+  now a standalone `find_gguf_files(dirs)` helper. Also dropped an unused
+  top-level `import shutil` noticed while touching this file (pre-existing,
+  unrelated to the path fix). Added `tests/test_patch_gguf_metadata.py`:
+  `find_gguf_files` is fully covered (multi-dir collection, nonexistent-dir
+  skip, empty case); the CLI's `--help` and missing-required-arg behavior
+  are covered via subprocess (no network needed, since `argparse` rejects
+  before `main()` reaches the tokenizer download) -- the actual GGUF
+  byte-patching and tokenizer load are unchanged from before and still
+  exercised only by hand / in real runs, not by this new test file.
 
 ## [0.3.0] - 2026-06-09 — Audit Corrections (CLI/UI consolidation, resume markers, secure-by-default UI)
 
