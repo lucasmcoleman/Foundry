@@ -195,7 +195,11 @@ def test_run_dispatches_budget_with_converted_source_and_honors_smoke_gate(
     import ppl_smoke
     from core import _magicquant_entry as entry
 
-    monkeypatch.setattr(entry, "find_llamacpp", lambda hint="": "/fake/llamacpp")
+    # **kw absorbs the arch-aware `source_gguf_path` keyword (Improvement 3)
+    # -- run()'s post-conversion re-resolve call passes it once the fake
+    # _ensure_bf16_gguf below hands back a .gguf path; this stub's fake
+    # llamacpp is arch-agnostic (always the same fixed path) regardless.
+    monkeypatch.setattr(entry, "find_llamacpp", lambda hint="", **kw: "/fake/llamacpp")
 
     raw_source_dir = tmp_path / "raw_src"
     raw_source_dir.mkdir()
