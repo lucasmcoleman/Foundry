@@ -53,13 +53,66 @@ def apply_dequant_env(cfg: dict, environ) -> bool:
     return True
 
 
-def find_llamacpp(hint: str = "") -> str | None:
+_PERPLEXITY_TOOL_NAMES = ("llama-perplexity.exe", "llama-perplexity", "perplexity.exe", "perplexity")
+
+
+def _find_perplexity_binary(llamacpp_dir: str) -> str | None:
+    """Best-effort locate llama-perplexity under *llamacpp_dir*, for the
+    arch pre-check in ``find_llamacpp`` below.
+
+    Mirrors (name list + search dirs) ``magicquant.utils.llamacpp.
+    LlamaCppTools``'s own perplexity-binary resolution, but does NOT
+    construct a ``LlamaCppTools`` to get it: that also resolves llama-bench
+    (``_find_bench_tool``), which falls back to a real ``which llama-bench``
+    subprocess call when no sibling binary exists -- unwanted overhead (and
+    a subprocess dependency in what should be a pure filesystem check) for
+    every candidate scanned here. This is a fast, side-effect-free,
+    never-raising equivalent. Returns None when nothing is found --
+    ``magicquant.utils.llamacpp.binary_supports_arch`` itself treats a
+    None/empty ``perplexity_tool`` as "undeterminable", not an error.
+    """
+    base = Path(llamacpp_dir)
+    for d in (base, base / "build" / "bin", base / "build", base / "bin"):
+        for name in _PERPLEXITY_TOOL_NAMES:
+            p = d / name
+            if p.exists():
+                return str(p)
+    return None
+
+
+def find_llamacpp(hint: str = "", *, source_gguf_path: str | None = None) -> str | None:
     """Return a llama.cpp dir that contains the converter or quantize binary.
 
     Accepts the same layouts LlamaCppTools itself searches (repo root with
     build/bin, a standalone build dir with bin/, or a bare bin dir) so a
     user-supplied hint like a ROCmFPX build directory isn't silently
     rejected in favor of an auto-detected -- possibly incompatible -- build.
+
+    ``source_gguf_path``, when given AND readable as a GGUF carrying a
+    ``general.architecture`` key (via ``magicquant.utils.llamacpp.
+    resolve_source_gguf_arch``), turns on arch-aware candidate filtering
+    (field report Improvement 3 -- a muse-glimmer run defaulted to the
+    ROCmFPX fork preference below, which couldn't load that arch, and died
+    40 minutes into baseline measurement). A candidate whose resolved
+    llama-perplexity binary DEFINITIVELY does not support that architecture
+    (``binary_supports_arch`` verdict ``False``) is skipped in favor of the
+    next candidate, with the skip logged. A ``None`` verdict (undeterminable
+    -- couldn't locate/scan a binary) does NOT skip: it proceeds exactly
+    like the arch-agnostic behavior below. ``hint``, when it resolves to a
+    valid llama.cpp dir, is NEVER skipped for an arch mismatch (user
+    authority) -- it is still arch-checked, but only to log a warning before
+    returning it. If every OTHER candidate is definitively False, the first
+    one found is returned anyway with a loud warning: MagicQuant's own
+    fail-fast (``LlamaBinaryArchError`` / ``_run_arch_support_check``,
+    MagicQuant commit 22a17e0) is the actual hard-failure backstop here --
+    this function only STEERS toward a compatible build when it can tell;
+    it never duplicates that hard failure itself.
+
+    Omitting ``source_gguf_path`` (the default) is byte-for-byte the
+    original arch-agnostic behavior -- this is what ``ensure_llamacpp``'s
+    first call in ``run()`` uses, since the source model path isn't known
+    yet that early in the pipeline (see ``run()``'s post-conversion
+    re-resolve call for where the arch-aware path is actually exercised).
     """
     import os
 
@@ -67,27 +120,72 @@ def find_llamacpp(hint: str = "") -> str | None:
     # stock can, auto-offload to GPU, and are the only builds that handle the
     # rocmfp* types this pipeline exists to produce. Stock stays as fallback
     # (it tracks upstream master, so a brand-new arch may load there first --
-    # override with the explicit hint / LLAMACPP_PATH when that happens).
+    # override with the explicit hint / LLAMACPP_PATH when that happens, or
+    # rely on the arch-aware skip below when source_gguf_path is known).
     fork_builds = sorted(
         str(d) for d in (Path.home() / "ROCmFPX").glob("build-*")
         if (d / "bin" / "llama-quantize").exists()
     )
     candidates = [hint, os.environ.get("LLAMACPP_PATH", ""), *fork_builds,
                   str(Path.home() / "llama.cpp"), "./llama.cpp", "/usr/local"]
+
+    arch = None
+    if source_gguf_path:
+        from magicquant.utils.llamacpp import resolve_source_gguf_arch
+        arch = resolve_source_gguf_arch(source_gguf_path)
+
+    first_found = None  # first candidate located on disk at all -- the
+                         # all-candidates-False fallback returns this.
     for p in candidates:
         if not p:
             continue
         pp = Path(p)
+        found = None
         for sub in [pp / "convert_hf_to_gguf.py",
                     pp / "build" / "bin" / "llama-quantize",
                     pp / "bin" / "llama-quantize",
                     pp / "llama-quantize"]:
             if sub.exists():
-                return str(pp)
+                found = str(pp)
+                break
+        if found is None:
+            if p == hint:
+                print(f"WARNING: llamacpp path hint {hint!r} has no "
+                      "convert_hf_to_gguf.py or llama-quantize (searched ., bin/, "
+                      "build/bin/) -- falling back to auto-detection", flush=True)
+            continue
+
+        if arch is None:
+            return found
+        if first_found is None:
+            first_found = found
+
+        from magicquant.utils.llamacpp import binary_supports_arch
+        verdict = binary_supports_arch(_find_perplexity_binary(found), arch)
+
         if p == hint:
-            print(f"WARNING: llamacpp path hint {hint!r} has no "
-                  "convert_hf_to_gguf.py or llama-quantize (searched ., bin/, "
-                  "build/bin/) -- falling back to auto-detection", flush=True)
+            # User authority: the explicit hint is never skipped for an arch
+            # mismatch -- warn (when the verdict is definitively False) and
+            # honor it regardless.
+            if verdict is False:
+                print(f"WARNING: llamacpp hint {found!r} lacks arch {arch!r} "
+                      "-- honoring the explicit hint anyway (MagicQuant's own "
+                      "fail-fast will raise a clear, named error if it truly "
+                      "cannot load this model)", flush=True)
+            return found
+
+        if verdict is False:
+            print(f"{found} lacks arch {arch!r}, trying next candidate", flush=True)
+            continue
+
+        return found
+
+    if arch is not None and first_found is not None:
+        print(f"WARNING: no candidate llama.cpp build definitively supports "
+              f"arch {arch!r} -- using {first_found} anyway (MagicQuant's own "
+              "fail-fast will raise a clear, named error if it truly cannot "
+              "load this model)", flush=True)
+        return first_found
     return None
 
 
@@ -535,6 +633,30 @@ def run(cfg_path: str | None = None) -> None:
             "conversion this stage normally performs.",
             flush=True,
         )
+
+    # Arch-aware re-resolve (field report Improvement 3). This is deliberately
+    # ONE hook, placed here rather than once before AND once after the
+    # conversion block above: the source GGUF (if there's going to be one at
+    # all) isn't reliably knowable until `source` has settled into its final
+    # form -- for a directory source that gets converted above, that's only
+    # true AFTER _ensure_bf16_gguf runs; for a source that was already a
+    # .gguf (a cached model-bf16.gguf, or an override pointing straight at
+    # one), it was already final before the conversion block even ran. By
+    # this point `source` is whichever of those it's ever going to be, or
+    # still a plain directory (llama.cpp unavailable, or a source this
+    # reader can't parse) -- in which case there's no GGUF to read an
+    # architecture from and this is a no-op. The mmproj export and the BF16
+    # conversion itself above intentionally keep using the FIRST
+    # (arch-unaware) `llamacpp` resolution: both only need *some* llama.cpp
+    # checkout with a working converter script, not specifically one whose
+    # llama-perplexity binary can dispatch this arch -- only the measurement
+    # path below (the orchestrator / v2 budget search) actually needs that.
+    if llamacpp and source.endswith(".gguf"):
+        reresolved = find_llamacpp(cfg.get("llamacpp_hint", ""), source_gguf_path=source)
+        if reresolved and reresolved != llamacpp:
+            print(f"llama.cpp: re-resolved to {reresolved} for arch "
+                  f"compatibility (was {llamacpp})", flush=True)
+        llamacpp = reresolved or llamacpp
 
     if cfg.get("budget_gib") is not None:
         # Size-target mode: v2 budget search instead of the v1 tier ladder.

@@ -588,7 +588,11 @@ def fake_orchestrator(monkeypatch, tmp_path):
     fake_orch_mod.MagicQuantOrchestrator = _FakeOrchestrator
     monkeypatch.setitem(sys.modules, "magicquant", fake_pkg)
     monkeypatch.setitem(sys.modules, "magicquant.orchestrator", fake_orch_mod)
-    monkeypatch.setattr(entry, "find_llamacpp", lambda hint="": "/fake/llamacpp")
+    # **kw absorbs the arch-aware `source_gguf_path` keyword (Improvement 3)
+    # -- run()'s post-conversion re-resolve call passes it once the fake
+    # _ensure_bf16_gguf below hands back a .gguf path; this fixture's fake
+    # llamacpp is arch-agnostic (always the same fixed path) regardless.
+    monkeypatch.setattr(entry, "find_llamacpp", lambda hint="", **kw: "/fake/llamacpp")
     # Measured runs auto-convert a safetensors source to BF16 GGUF via
     # convert_hf_to_gguf.py, which the fake llamacpp dir doesn't have.
     monkeypatch.setattr(

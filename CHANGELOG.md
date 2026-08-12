@@ -20,6 +20,25 @@
   **This can newly block a CLI run that previously proceeded** when
   `MemAvailable` is genuinely low -- that is the intended fix, confirmed
   before implementing.
+- **`find_llamacpp` now steers away from an arch-incompatible llama.cpp
+  build when it can tell (field report Issue B, resolve improvement):** the
+  candidate order (hint, `LLAMACPP_PATH`, ROCmFPX fork builds, stock
+  `~/llama.cpp`, `./llama.cpp`, `/usr/local`) deliberately prefers the
+  ROCmFPX fork, which can't load every arch stock llama.cpp supports -- a
+  muse-glimmer run once defaulted onto exactly that fork and died 40
+  minutes into baseline measurement. `find_llamacpp` (and
+  `core/_magicquant_entry.py:run()`, which re-resolves once the source has
+  settled into its final BF16-GGUF-or-not form -- the arch isn't knowable
+  at the first, pre-source-resolution call) now skips a candidate whose
+  `llama-perplexity` binary *definitively* lacks the source GGUF's
+  architecture (via MagicQuant's `magicquant.utils.llamacpp.
+  binary_supports_arch`), logging each skip. An explicit hint is never
+  skipped (user authority -- arch-checked only to warn); an undeterminable
+  verdict never skips either. If every candidate is definitively
+  incompatible, the first one found is still returned, with a loud warning
+  -- MagicQuant's own fail-fast (`LlamaBinaryArchError`, master commit
+  `22a17e0`) is the actual hard-failure backstop; this only steers toward a
+  working build when it can tell, it never duplicates that error itself.
 
 ### Fixed
 - **UI MagicQuant imatrix silently disabled (cleanup):** the web UI's frontend
@@ -57,6 +76,33 @@
   `stage_magicquant` now does too, at the identical placement `stage_rocmfpx`
   uses (right after the completion-marker check, before building the stage
   script).
+- **Silent marker-write failures made a successful export undiagnosable
+  (field report Issue B, defect 1):** every `do_*` stage runner
+  (`ui/app.py`) wrote its completion marker inside a bare
+  `try: markers.write_marker(...) except OSError: pass` -- non-fatal by
+  design (a marker failure must never fail an otherwise-successful stage)
+  but SILENT, with nothing in the logs either way. A successful Aug 9
+  export produced no marker with no way to tell why after the fact, forcing
+  a spurious re-export. The same pattern repeated at all 7 marker-write
+  sites (training/export/heretic/reap/qat/magicquant/rocmfpx). Extracted a
+  single `_write_stage_marker()` helper used by all 7 -- logs a marker
+  write at `info` and a marker-write failure at `warn` (still non-fatal),
+  so this logging can never drift out of sync between stages again.
+- **`export_hash` invalidated by a field that couldn't affect the export
+  (field report Issue B, defect 2):** the completion-marker hash included
+  `cfg.training.model_name` unconditionally, even with Training disabled --
+  with training off, export output depends only on `export.source_model`,
+  so stale browser-form drift in the (dead-weight when training is off)
+  Training section invalidated an otherwise-good marker and forced a
+  spurious re-export (observed live: Muse re-exported at 22:03 for exactly
+  this). Now folds `training.model_name` into the hash only when
+  `training_enabled` (when training is on it legitimately determines the
+  base model). **Blast radius:** a training-ENABLED run dir's hash is
+  unchanged (both the old and new formula use `cfg.training.model_name`
+  identically when training is on), so it does NOT re-export. A
+  training-DISABLED run dir's hash changes (old always hashed the live
+  `model_name` value; new hashes a constant `None`), so it re-exports
+  **ONCE** after this lands -- expected and cheap, not engineered around.
 
 ### Removed
 - **Dead llama.cpp auto-installer in `core/pipeline.py` (cleanup):** `_find_llamacpp`/
