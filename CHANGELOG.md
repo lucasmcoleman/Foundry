@@ -22,6 +22,44 @@
   before implementing.
 
 ### Fixed
+- **Stale/mis-derived model names could resolve to the wrong run directory or
+  ship a mis-named GGUF (issues #5, #6):** `_derive_model_short_name`'s final
+  `else` returned `cfg.training.model_name` with no check that training was
+  actually enabled for the run -- a standalone re-run of just
+  `["magicquant", "upload"]` against an already-completed run resolved the
+  run directory from a stale `training.model_name` left over from the
+  template a workflow was cloned from (reproduced character-for-character:
+  `output/ThinkingCap-Qwen3.6-27B`), got created fresh and empty, and then
+  failed validation with a message that didn't say which directory it had
+  checked. Separately, the derivation never stripped a trailing upstream
+  precision tag, so `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`
+  produced GGUF filenames like `...-A3B-BF16-Q4_K_M.gguf` -- a Q4 file
+  advertising BF16. `core/pipeline.py` (the CLI) had the same defect in a
+  cruder form: `config.training.model_name.split("/")[-1]` with no fallback,
+  no extension/suffix stripping, and no sanitization at all.
+  Fixed with one shared implementation (`core/services.py::
+  derive_model_short_name`, imported by both `ui/app.py` and
+  `core/pipeline.py` so the two orchestrators can't drift back into separate
+  copies): a layered fallback in pipeline order (training, only when
+  actually enabled for this run -> export.source_model ->
+  magicquant.source_model -> rocmfpx.source_model -- the last of these was a
+  real pre-existing gap, since `do_rocmfpx` already honored its own
+  `source_model` override but the deriver never consulted it), a trailing
+  `-BF16`/`-FP16`/`-FP8`/`-F16`/`-F8`/`-FP32`/`-F32` precision suffix is now
+  stripped (final path segment only -- `Foo-BF16-Instruct` is untouched),
+  and when no config field resolves anything, an already-populated run
+  directory under the output path is used as the one safe last resort
+  (so a component re-run against a completed run resolves to its own prior
+  output) -- ambiguous or empty candidates are never guessed at. Otherwise
+  the run now raises `ModelNameUnresolvedError` instead of silently
+  creating a wrongly-named directory; `ui/app.py::run_pipeline` resolves the
+  name and aborts cleanly *before* creating any directory (previously this
+  happened outside its `try`, so the wrong directory got created before
+  validation could object). The MagicQuant/ROCmFPX "no existing model
+  artifacts" validation messages now name the directory that was actually
+  checked. `ui/index.html::suggestRepoId()` gets the same precision-suffix
+  strip (the directory-refusal half is intentionally UI-backend-only -- a
+  wrong repo-ID *suggestion* is low-stakes and editable).
 - **UI MagicQuant imatrix silently disabled (cleanup):** the web UI's frontend
   default for `use_imatrix` was hardcoded `false` in `ui/index.html`, overriding
   the backend's `true` default (set when imatrix became the default) on every

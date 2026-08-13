@@ -12,8 +12,9 @@ Usage from the UI:
 
 import json
 import os
+import re
 from pathlib import Path
-from typing import Callable, Awaitable, Optional
+from typing import Callable, Awaitable, Optional, Union
 
 # Type alias for the async subprocess runner used by the UI.
 # Signature: (script_text, output_dir) -> exit_code
@@ -43,6 +44,207 @@ def _entry_shim(entry_module: str, cfg: dict, pipeline_root: Path) -> str:
         f"import {entry_module}\n"
         f"{entry_module}.run(str(_cfg_path))\n"
     )
+
+
+# ── Model-name derivation (shared by ui/app.py and core/pipeline.py) ────────
+#
+# A run directory name and every GGUF filename prefix come from one of these:
+# training's model, or -- when training didn't produce this run's model --
+# the explicit source_model an operator points a later stage at directly.
+# Getting this wrong is silent and expensive: a wrong run-directory name
+# either collides with an unrelated model's output or gets created fresh and
+# empty, and a wrong GGUF filename prefix ships a file whose name lies about
+# its own precision (e.g. a Q4 file suffixed "-BF16").
+
+# Upstream repo IDs often carry the source precision as a trailing tag
+# (`...-A3B-BF16`). A quantized artifact must not inherit that tag in its own
+# name. Matches the FINAL path segment only -- "Foo-BF16-Instruct" must not
+# be touched, only a tag that is the actual end of the name.
+# Trailing precision tokens to strip when deriving a model name, so a Q4 file
+# stops advertising itself as BF16 (issue #6: ...-A3B-BF16-Q4_K_M.gguf).
+#
+# FP8/F8 are deliberately NOT in this class. For several real upstream repos
+# FP8 is the model's IDENTITY, not a redundant suffix -- nvidia/
+# Llama-3.3-70B-Instruct-FP8 and deepseek-ai/DeepSeek-V3-FP8 are distinct
+# published models from their BF16 originals, and stripping it would merge
+# them into one run directory and one GGUF prefix. There is also no upside:
+# the writer rejects a pre-quantized source outright, so an FP8 repo never
+# reaches the naming path as a quantization source anyway.
+_PRECISION_SUFFIX_RE = re.compile(
+    r"[-_](?:BF16|FP16|F16|FP32|F32)$", re.IGNORECASE
+)
+
+# Names that carry no model identity at all. Foundry writes `model-bf16.gguf`
+# into EVERY run directory, and pointing MagicQuant at a GGUF source is a
+# documented workflow (--magicquant-source-model <file.gguf>), so stripping
+# the extension and then the precision token turns that into the bare word
+# "model" -- which would give every such run the same directory and the same
+# GGUF prefix. Keep the pre-strip name when the strip would leave one of
+# these; `model-bf16` is ugly but unique, `model` is a collision.
+_NON_IDENTIFYING_NAMES = frozenset({"model", "models", "output", "gguf", "merged"})
+
+# Basenames Foundry itself writes into EVERY run directory. A quant-only
+# workflow points magicquant.source_model at one of these, and deriving the
+# run name from the basename then gives every model on the box the same
+# directory and the same GGUF prefix ("model-bf16", "merged_model", ...).
+# These are artifact names, not model identities -- when one is the final
+# path segment, the model's identity is its PARENT directory.
+_FOUNDRY_ARTIFACT_BASENAMES = frozenset({
+    "model-bf16", "model-bf16-nomtp", "model-f16", "model",
+    "merged_model", "reap_model", "heretic_model",
+})
+
+# Directories/files that mark an output directory as belonging to a real,
+# already-executed run. Mirrors the exact artifact set core.reap_common.
+# resolve_artifact_source() and ui/app.py's validate_pipeline() already treat
+# as "this stage's upstream artifacts exist" -- kept as one definition so a
+# fourth marker never gets added in only one of the three places.
+_RUN_ARTIFACT_MARKERS = ("reap_model", "heretic_model", "merged_model", "model-bf16.gguf")
+# Stage output directories identified by containing at least one *.gguf,
+# rather than by a fixed name -- MagicQuant/ROCmFPX write multiple tier files.
+_RUN_ARTIFACT_GLOB_DIRS = ("magicquant", "rocmfpx")
+
+
+class ModelNameUnresolvedError(RuntimeError):
+    """No stage config (and no existing run directory) yields a usable model
+    name for this run. Raised instead of silently falling back to a stale or
+    default value -- callers must abort before creating any directory, never
+    mkdir a wrongly-named one."""
+
+
+def _has_run_artifacts(path: Path) -> bool:
+    """True if ``path`` looks like a real (at least partially executed) run
+    directory -- i.e. it has any of the artifacts a pipeline stage produces."""
+    if not path.is_dir():
+        return False
+    if any((path / marker).exists() for marker in _RUN_ARTIFACT_MARKERS):
+        return True
+    # NOTE: `.glob()` returns a (truthy) generator regardless of whether it
+    # yields anything -- `any(p.glob(...) for ...)` would always be True.
+    # Each glob must itself be consumed by `any()` to test for a real match.
+    return any(any((path / sub).glob("*.gguf")) for sub in _RUN_ARTIFACT_GLOB_DIRS)
+
+
+def _existing_run_basename(output_dir: Union[str, Path]) -> Optional[str]:
+    """The one safe last-resort model-name fallback: an already-populated run
+    directory, so a standalone component re-run (e.g. magicquant-only against
+    a completed run) resolves to its own prior output instead of a stale
+    config field. Never guesses among ambiguous candidates.
+
+    Checks ``output_dir`` ITSELF ONLY. It deliberately does not look at
+    sibling directories.
+
+    An earlier version scanned the immediate children and accepted the answer
+    when exactly one of them had run artifacts, on the theory that "exactly
+    one" means "unambiguous". It does not. On this box `output/` currently
+    holds exactly one child with artifacts, because the 08-12 cleanup deleted
+    the rest -- so every workflow narrowed to ["magicquant","upload"] resolved
+    to that one unrelated model's 346 GB run directory. `validate_pipeline`
+    then PASSED, because the directory genuinely contains a merged model, and
+    the pipeline would have quantized that model and uploaded it under the
+    loaded workflow's repo_id. Issue #5 at least failed loudly on an empty
+    directory; guessing a sibling fails silently and does work, publishing the
+    wrong model. "Exactly one candidate" was a property of disk cleanup state,
+    not a safety guarantee, and it can become true again at any time.
+
+    If a caller genuinely needs the shared-base-directory behaviour, it must
+    pass the model-specific directory instead of asking this to infer it.
+    """
+    base = Path(output_dir)
+    if not base.is_dir():
+        return None
+    if _has_run_artifacts(base):
+        return base.name
+    return None
+
+
+def _strip_known_extension(name: str) -> str:
+    for ext in (".gguf", ".safetensors", ".bin", ".pt", ".pth"):
+        if name.lower().endswith(ext):
+            return name[: -len(ext)]
+    return name
+
+
+def derive_model_short_name(
+    *,
+    training_model_name: str = "",
+    training_enabled: bool = False,
+    export_source_model: str = "",
+    export_enabled: bool = False,
+    magicquant_source_model: str = "",
+    magicquant_enabled: bool = False,
+    rocmfpx_source_model: str = "",
+    rocmfpx_enabled: bool = False,
+    output_dir: Optional[Union[str, Path]] = None,
+) -> str:
+    """Derive a short, filesystem-safe model name for run-directory naming
+    and GGUF filename prefixes. ONE implementation shared by ui/app.py and
+    core/pipeline.py so the two orchestrators can't drift apart again.
+
+    Layered fallback, in pipeline order -- the first stage that is both
+    enabled for this run AND has a usable name wins:
+    training.model_name -> export.source_model -> magicquant.source_model ->
+    rocmfpx.source_model -> an already-populated run directory under
+    ``output_dir`` (see ``_existing_run_basename``).
+
+    Raises ModelNameUnresolvedError when nothing resolves -- callers must
+    treat that as a clean abort and must NOT create a directory first.
+    """
+    raw = ""
+    if training_enabled and training_model_name:
+        raw = training_model_name
+    elif export_enabled and export_source_model:
+        raw = export_source_model
+    elif magicquant_enabled and magicquant_source_model:
+        raw = magicquant_source_model
+    elif rocmfpx_enabled and rocmfpx_source_model:
+        raw = rocmfpx_source_model
+
+    if not raw:
+        existing = _existing_run_basename(output_dir) if output_dir is not None else None
+        if existing:
+            # Fall through to the SAME normalization every other layer gets.
+            # Returning it raw here meant issue #6 was unfixed on precisely the
+            # path issue #5 travels: a re-run resolving through this fallback
+            # got its "-BF16" back.
+            raw = existing
+        else:
+            where = f" under {output_dir}" if output_dir is not None else ""
+            raise ModelNameUnresolvedError(
+                "Could not determine a model name for this run: no enabled "
+                "stage provided a source model, and no existing run artifacts "
+                f"were found{where}. Set a Source Model "
+                "(Export/MagicQuant/ROCmFPX) or enable Training."
+            )
+
+    segments = [seg for seg in raw.rstrip("/").split("/") if seg]
+    name = _strip_known_extension(segments[-1] if segments else "")
+    # A quant-only workflow points magicquant.source_model at an artifact
+    # INSIDE a run directory -- model-bf16.gguf, merged_model, ... -- and every
+    # run directory on the box contains identically-named ones. Deriving from
+    # that basename gives every model the same run directory and the same GGUF
+    # prefix. When the final segment is a known Foundry artifact, the model's
+    # identity is its PARENT directory, so use that instead.
+    # ...but only when the parent is itself identifying. `/runs/model-bf16.gguf`
+    # must NOT become "runs": walking up blindly just moves the collision one
+    # level, from every-model-is-"model-bf16" to every-model-is-"runs". If the
+    # parent is no better, keep the artifact basename -- ugly and unique beats
+    # short and colliding, same rule as _NON_IDENTIFYING_NAMES.
+    if name.lower() in _FOUNDRY_ARTIFACT_BASENAMES and len(segments) >= 2:
+        parent = _strip_known_extension(segments[-2])
+        if parent and parent.lower() not in _NON_IDENTIFYING_NAMES | _FOUNDRY_ARTIFACT_BASENAMES:
+            name = parent
+    stripped = _PRECISION_SUFFIX_RE.sub("", name)
+    # Only take the strip if what's left still identifies a model -- see
+    # _NON_IDENTIFYING_NAMES for why `model-bf16.gguf` must not become `model`.
+    if stripped.lower() not in _NON_IDENTIFYING_NAMES:
+        name = stripped
+    sanitized = "".join(c if c.isalnum() or c in "-_." else "-" for c in name).strip("-")
+    if not sanitized:
+        raise ModelNameUnresolvedError(
+            f"Resolved model name {raw!r} sanitizes to an empty string."
+        )
+    return sanitized
 
 
 class TrainingService:

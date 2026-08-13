@@ -445,6 +445,47 @@ def _markers():
     return _m
 
 
+def _resolve_model_name(
+    config: "PipelineConfig",
+    artifacts: "Artifacts",
+    log: LogFn,
+    *,
+    source_model_field: str,
+    source: Optional[Path] = None,
+) -> Optional[str]:
+    """Resolve this run's model short name via the ONE shared derivation in
+    core/services.py (also used by ui/app.py) -- so the two orchestrators
+    can't drift back into two implementations.
+
+    ``source_model_field`` names which stage is calling ("magicquant" or
+    "rocmfpx"); ``source`` is that stage's already-resolved artifact source
+    (an explicit source_model override, or whatever resolve_artifact_source()
+    found under this run's output directory) and is threaded in as that
+    layer's candidate, matching the shared function's pipeline-order
+    fallback. Returns None (after logging, this module's stage-failure
+    convention) instead of raising when nothing resolves.
+    """
+    enabled = _compute_enabled_stages(config)
+    svc = _services()
+    kwargs = dict(
+        training_model_name=config.training.model_name,
+        training_enabled="training" in enabled,
+        export_source_model="",
+        export_enabled="export" in enabled,
+        magicquant_source_model="",
+        magicquant_enabled="magicquant" in enabled,
+        rocmfpx_source_model="",
+        rocmfpx_enabled="rocmfpx" in enabled,
+        output_dir=artifacts.output_dir,
+    )
+    kwargs[f"{source_model_field}_source_model"] = str(source) if source is not None else ""
+    try:
+        return svc.derive_model_short_name(**kwargs)
+    except svc.ModelNameUnresolvedError as e:
+        log(f"Cannot determine a model name for this run: {e}", "error")
+        return None
+
+
 def _run_stage_script(
     script: str,
     script_path: Path,
@@ -1176,7 +1217,9 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     _preflight_stage("magicquant", config, log, skip=skip_preflight)
 
-    model_name = config.training.model_name.split("/")[-1]
+    model_name = _resolve_model_name(config, artifacts, log, source_model_field="magicquant", source=source)
+    if model_name is None:
+        return False
     import json as _json
     svc = _services().MagicQuantService(PROJECT_ROOT, _find_python())
     script = svc.build_script(
@@ -1279,7 +1322,9 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     _preflight_stage("rocmfpx", config, log, skip=skip_preflight)
 
-    model_name = config.training.model_name.split("/")[-1]
+    model_name = _resolve_model_name(config, artifacts, log, source_model_field="rocmfpx", source=source)
+    if model_name is None:
+        return False
     import json as _json
     svc = _services().ROCmFPXService(PROJECT_ROOT, _find_python())
     script = svc.build_script(
