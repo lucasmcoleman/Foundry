@@ -1188,6 +1188,11 @@ function suggestRepoId() {
   }
   let short = modelName.includes('/') ? modelName.split('/').pop() : modelName;
   short = short.replace(/\.(gguf|bin|safetensors)$/i, '');
+  // Strip a trailing upstream precision tag (e.g. "-BF16") so a suggested repo
+  // name doesn't advertise the SOURCE model's precision as if it were the
+  // quantized output's. Final segment only -- keep in sync with Python's
+  // _PRECISION_SUFFIX_RE in core/services.py (see test_model_name_derivation.py).
+  short = short.replace(/[-_](?:BF16|FP16|F16|FP32|F32)$/i, '');
 
   // Infer training-data tags from all dataset sources
   let dataTag = '';

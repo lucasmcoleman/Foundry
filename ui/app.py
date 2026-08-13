@@ -44,6 +44,8 @@ from services import (
     MagicQuantService,
     ROCmFPXService,
     UploadService,
+    ModelNameUnresolvedError,
+    derive_model_short_name as _shared_derive_model_short_name,
 )
 from serving import build_serve_command, detect_mtp, format_serve_command
 
@@ -1323,9 +1325,9 @@ async def validate_pipeline(cfg: RunRequest) -> bool:
         has_merged = (out_abs / "merged_model").exists()
         has_gguf = (out_abs / "model-bf16.gguf").exists()
         if not source and not has_reap and not has_heretic and not has_merged and not has_gguf:
-            await state.log("MagicQuant is enabled without Export, and no existing model artifacts "
-                            "were found in the output directory. Set a Source Model path in MagicQuant "
-                            "config, or enable Export.", "error")
+            await state.log(f"MagicQuant is enabled without Export, and no existing model artifacts "
+                            f"were found in {out_abs}. Set a Source Model path in MagicQuant "
+                            f"config, or enable Export.", "error")
             return False
         if source:
             await state.log(f"Export skipped — MagicQuant will use source: {source}")
@@ -1347,9 +1349,9 @@ async def validate_pipeline(cfg: RunRequest) -> bool:
         has_merged = (out_abs / "merged_model").exists()
         has_gguf = (out_abs / "model-bf16.gguf").exists()
         if not source and not has_reap and not has_heretic and not has_merged and not has_gguf:
-            await state.log("ROCmFPX is enabled without Export, and no existing model artifacts "
-                            "were found in the output directory. Set a Source Model path in ROCmFPX "
-                            "config, or enable Export.", "error")
+            await state.log(f"ROCmFPX is enabled without Export, and no existing model artifacts "
+                            f"were found in {out_abs}. Set a Source Model path in ROCmFPX "
+                            f"config, or enable Export.", "error")
             return False
         if source:
             await state.log(f"Export skipped — ROCmFPX will use source: {source}")
@@ -1373,24 +1375,26 @@ async def validate_pipeline(cfg: RunRequest) -> bool:
 
 
 def _derive_model_short_name(cfg: RunRequest) -> str:
-    """Extract a short model name from the first available source across stages."""
+    """Extract a short model name from the first available, enabled source
+    across stages. Thin wrapper around the shared derivation (core/services.py)
+    so ui/app.py and core/pipeline.py can't drift apart -- see
+    ``derive_model_short_name`` there for the fallback order and the
+    ``ModelNameUnresolvedError`` this raises when nothing resolves (never
+    silently falls back to a stale field).
+    """
     enabled = set(cfg.enabled_stages)
-    if "training" in enabled:
-        raw = cfg.training.model_name
-    elif "export" in enabled and cfg.export and cfg.export.source_model:
-        raw = cfg.export.source_model
-    elif "magicquant" in enabled and cfg.magicquant and cfg.magicquant.source_model:
-        raw = cfg.magicquant.source_model
-    else:
-        raw = cfg.training.model_name
-    # Strip org/user prefix, path components, and known model file extensions
-    name = raw.rstrip("/").split("/")[-1]
-    for ext in (".gguf", ".safetensors", ".bin", ".pt", ".pth"):
-        if name.lower().endswith(ext):
-            name = name[:-len(ext)]
-            break
-    # Sanitize for filesystem
-    return "".join(c if c.isalnum() or c in "-_." else "-" for c in name).strip("-") or "model"
+    out_abs = _resolve_out(cfg.training.output_dir)
+    return _shared_derive_model_short_name(
+        training_model_name=cfg.training.model_name,
+        training_enabled="training" in enabled,
+        export_source_model=(cfg.export.source_model if cfg.export else ""),
+        export_enabled="export" in enabled,
+        magicquant_source_model=(cfg.magicquant.source_model if cfg.magicquant else ""),
+        magicquant_enabled="magicquant" in enabled,
+        rocmfpx_source_model=(cfg.rocmfpx.source_model if cfg.rocmfpx else ""),
+        rocmfpx_enabled="rocmfpx" in enabled,
+        output_dir=out_abs,
+    )
 
 
 async def run_pipeline(cfg: RunRequest):
@@ -1400,19 +1404,23 @@ async def run_pipeline(cfg: RunRequest):
     state.progress = 0
     enabled = set(cfg.enabled_stages)
 
-    # Create model-specific output subdirectory (avoid nested dirs on re-run)
-    model_name = _derive_model_short_name(cfg)
-    base_out = cfg.training.output_dir
-    if not base_out.rstrip("/").endswith(f"/{model_name}") and Path(base_out).name != model_name:
-        cfg.training.output_dir = f"{base_out}/{model_name}"
-    out_abs = _resolve_out(cfg.training.output_dir)
-    out_abs.mkdir(parents=True, exist_ok=True)
-    await state.log(f"Output directory: {out_abs}", "info")
-
-    for s in ALL_STAGES:
-        await state.set_stage(s, StageStatus.SKIPPED if s not in enabled else StageStatus.PENDING)
-
     try:
+        # Resolve the run's model name -- and therefore its output directory
+        # -- BEFORE creating anything. An unresolvable name must abort
+        # cleanly (via the except below); it must never mkdir a directory
+        # first and only THEN discover the name was wrong (that's what let a
+        # stale name silently create/adopt the wrong run directory).
+        model_name = _derive_model_short_name(cfg)
+        base_out = cfg.training.output_dir
+        if not base_out.rstrip("/").endswith(f"/{model_name}") and Path(base_out).name != model_name:
+            cfg.training.output_dir = f"{base_out}/{model_name}"
+        out_abs = _resolve_out(cfg.training.output_dir)
+        out_abs.mkdir(parents=True, exist_ok=True)
+        await state.log(f"Output directory: {out_abs}", "info")
+
+        for s in ALL_STAGES:
+            await state.set_stage(s, StageStatus.SKIPPED if s not in enabled else StageStatus.PENDING)
+
         if not await validate_pipeline(cfg):
             await state.log("Pipeline aborted due to validation errors.", "error")
             return
@@ -1430,6 +1438,8 @@ async def run_pipeline(cfg: RunRequest):
 
         if all(state.stages[s] in (StageStatus.COMPLETE, StageStatus.SKIPPED) for s in ALL_STAGES):
             await state.log("Pipeline complete!", "success")
+    except ModelNameUnresolvedError as e:
+        await state.log(f"Pipeline aborted: {e}", "error")
     except Exception as e:
         await state.log(f"Pipeline error: {e}", "error")
     finally:
