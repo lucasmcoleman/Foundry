@@ -569,9 +569,11 @@ async def _check_marker(
     Returns ``(done, key)``. When ``done`` is True, the log message, COMPLETE
     state, and 100% progress have already been set — the caller should
     immediately ``return True``. When False, ``key`` is handed back so the
-    caller's post-run ``write_marker`` call (which varies per stage -- some
-    re-glob after the run, some don't -- and is intentionally left to each
-    stage) can reuse the same fallback key.
+    caller's post-run marker write (``_write_stage_marker``, shared by all 7
+    stages) can reuse the same fallback key -- WHICH key file to pass still
+    varies per stage (some re-glob after the run, some don't) and that
+    key-selection logic is intentionally left to each stage; only the
+    write-and-log mechanics are now shared.
     """
     if key_glob is None:
         key = stage_dir / default_key_name
@@ -584,6 +586,33 @@ async def _check_marker(
         await state.set_progress(100)
         return True, key
     return False, key
+
+
+async def _write_stage_marker(stage_dir: Path, stage: str, key_file: Path, cfg_hash: str) -> None:
+    """Write ``stage``'s completion marker, logging the outcome either way.
+
+    Shared by all 7 ``do_*`` stage runners' post-run marker write (field
+    report Issue B, defect 1): a marker-write failure (``OSError``) must
+    stay NON-fatal -- the caller has already verified the real artifact
+    exists, so a marker hiccup must never turn a successful stage into a
+    failed one -- but it must never be SILENT either. A bare
+    ``except OSError: pass`` at each of the 7 sites once let a successful
+    Aug 9 export finish with NO marker on disk, with nothing in the logs to
+    explain why -- undiagnosable after the fact, and it forced a spurious
+    re-export. Extracted to one helper (rather than fixing 7 call sites
+    identically) so this logging can never drift out of sync between
+    stages again.
+    """
+    try:
+        markers.write_marker(stage_dir, stage, key_file, cfg_hash)
+    except OSError as e:
+        await state.log(
+            f"{stage}: failed to write completion marker at {stage_dir} ({e}) "
+            "-- stage succeeded, but a future run will not be able to skip it",
+            "warn",
+        )
+    else:
+        await state.log(f"{stage}: wrote completion marker at {stage_dir}", "info")
 
 
 async def do_training(cfg: RunRequest) -> bool:
@@ -636,10 +665,7 @@ async def do_training(cfg: RunRequest) -> bool:
     rc = await run_script(script, tc.output_dir)
     ok = rc == 0
     if ok and key_file.exists() and key_file.stat().st_size > 0:
-        try:
-            markers.write_marker(lora_dir, "training", key_file, cfg_hash)
-        except OSError:
-            pass
+        await _write_stage_marker(lora_dir, "training", key_file, cfg_hash)
     await state.set_stage("training", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
@@ -660,7 +686,15 @@ async def do_export(cfg: RunRequest) -> bool:
     # Completion-marker resume (audit M-skip-marker).
     merged = out_abs / "merged_model"
     export_hash = markers.config_hash({
-        "model_name": cfg.training.model_name,
+        # DEFECT 2 fix (field report Issue B): with training disabled, export
+        # output depends ONLY on export.source_model -- keying the hash on
+        # training.model_name unconditionally meant stale browser-form drift
+        # in the (dead-weight when training is off) training section
+        # invalidated an otherwise-good marker and forced a spurious
+        # re-export (observed live: a 22:03 re-export for exactly this).
+        # Only fold it in when training is actually enabled, i.e. when it
+        # legitimately determines the base model being exported.
+        "model_name": cfg.training.model_name if training_enabled else None,
         "source_model": cfg.export.source_model if cfg.export else "",
         "training_enabled": training_enabled,
     })
@@ -724,10 +758,7 @@ async def do_export(cfg: RunRequest) -> bool:
         st = sorted(merged.glob("*.safetensors"))
         kf = st[0] if st else export_key
         if kf.exists() and kf.stat().st_size > 0:
-            try:
-                markers.write_marker(merged, "export", kf, export_hash)
-            except OSError:
-                pass
+            await _write_stage_marker(merged, "export", kf, export_hash)
     await state.set_stage("export", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
@@ -794,10 +825,7 @@ async def do_heretic(cfg: RunRequest) -> bool:
         st = sorted(heretic_dir.glob("*.safetensors"))
         kf = st[0] if st else heretic_key
         if kf.exists() and kf.stat().st_size > 0:
-            try:
-                markers.write_marker(heretic_dir, "heretic", kf, heretic_hash)
-            except OSError:
-                pass
+            await _write_stage_marker(heretic_dir, "heretic", kf, heretic_hash)
     await state.set_stage("heretic", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
@@ -894,10 +922,7 @@ async def do_reap(cfg: RunRequest) -> bool:
         st = sorted(reap_dir.glob("*.safetensors"))
         kf = st[0] if st else reap_key
         if kf.exists() and kf.stat().st_size > 0:
-            try:
-                markers.write_marker(reap_dir, "reap", kf, reap_hash)
-            except OSError:
-                pass
+            await _write_stage_marker(reap_dir, "reap", kf, reap_hash)
     await state.set_stage("reap", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
@@ -988,10 +1013,7 @@ async def do_qat(cfg: RunRequest) -> bool:
     rc = await run_script(script, out)
     ok = rc == 0 and qat_key.exists()
     if ok:
-        try:
-            markers.write_marker(qat_dir, "qat", qat_key, qat_hash)
-        except OSError:
-            pass
+        await _write_stage_marker(qat_dir, "qat", qat_key, qat_hash)
     await state.set_stage("qat", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
@@ -1084,10 +1106,7 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     if ok and mq_dir.exists():
         ggufs = sorted(mq_dir.glob("*.gguf"))
         if ggufs:
-            try:
-                markers.write_marker(mq_dir, "magicquant", ggufs[0], mq_hash)
-            except OSError:
-                pass
+            await _write_stage_marker(mq_dir, "magicquant", ggufs[0], mq_hash)
     await state.set_stage("magicquant", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
@@ -1146,10 +1165,7 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
     if ok and rc_dir.exists():
         ggufs = sorted(rc_dir.glob("*.gguf"))
         if ggufs:
-            try:
-                markers.write_marker(rc_dir, "rocmfpx", ggufs[0], rc_hash)
-            except OSError:
-                pass
+            await _write_stage_marker(rc_dir, "rocmfpx", ggufs[0], rc_hash)
     await state.set_stage("rocmfpx", StageStatus.COMPLETE if ok else StageStatus.FAILED)
     if ok:
         await state.set_progress(100)
