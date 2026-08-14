@@ -824,6 +824,35 @@ def _ensure_bf16_gguf(rocmfpx_dir: str, source: str, out_dir: Path,
     return str(cached)
 
 
+def _refusal_key_for_spec(spec: str, out_dir: Path) -> str | None:
+    """Map a requested format spec to the ``_refusals.json`` key that would
+    disclose its refusal, mirroring the same tier/key resolution ``run()``'s
+    own quantize loop uses -- so a spec is only ever considered "disclosed"
+    via the exact key its own quantize path would have recorded under.
+
+    Returns ``None`` when the spec has no possible key at all:
+
+    - A uniform preset (``parse_mq_spec`` returns ``None``, e.g.
+      ``rocmfp4-agent``) never writes a refusal record -- see
+      ``_quantize_preset`` and the memo's "Uniform presets can never satisfy
+      the predicate" note. Correctly always falls through to undisclosed.
+    - A bare ``mq-budget`` spec whose ``BUDGET-*`` key can't be resolved
+      (missing/malformed ``search_results.json``, zero or multiple
+      ``BUDGET-*`` tiers) has no key to look up either -- also correctly
+      undisclosed, the same fail-closed direction ``_resolve_budget_key``
+      itself takes.
+    """
+    tier = parse_mq_spec(spec)
+    if tier is None:
+        return None
+    if tier == "BUDGET" or tier.startswith("BUDGET-"):
+        try:
+            return _resolve_budget_key(out_dir, tier)
+        except (FileNotFoundError, KeyError, ValueError):
+            return None
+    return tier
+
+
 def run(cfg_path: str | None = None) -> None:
     if cfg_path is None:
         cfg_path = sys.argv[1]
@@ -860,10 +889,12 @@ def run(cfg_path: str | None = None) -> None:
     imatrix = cfg.get("imatrix", "")
     model_name = cfg["model_name"]
     allow_requantize = cfg.get("allow_requantize", False)
+    allow_partial = cfg.get("allow_partial", False)
 
     import subprocess
 
     produced = []
+    built_specs = []
     for spec in formats:
         tier = parse_mq_spec(spec)
         if tier is not None and (tier == "BUDGET" or tier.startswith("BUDGET-")):
@@ -886,10 +917,62 @@ def run(cfg_path: str | None = None) -> None:
             )
         if out_path is not None:
             produced.append(out_path)
+            built_specs.append(spec)
+
+    # Disclosure predicate (docs/decisions/rocmfpx-stage-failure-handling.md,
+    # "Option D"): `produced == []` is NOT synonymous with "cleanly refused".
+    # A requested format that failed silently (no _refusals.json entry -- a
+    # typo'd spec, a stale fork build missing a type, a quantizer crash, ...)
+    # must always abort, flag or no flag. --allow-partial only ever licenses
+    # continuing past gaps that are *disclosed* -- never past silent ones.
+    #
+    # Keyed by re-reading _refusals.json after the loop rather than plumbing
+    # reason codes back through the three _quantize_* helpers: testing the
+    # disclosure channel itself (what a public model card actually renders
+    # from) is stronger than testing a parallel in-memory signal that could
+    # pass this gate while the card still had a silent gap.
+    requested = set(formats)
+    built = set(built_specs)
+    missing = requested - built
+    disclosed = set()
+    if missing:
+        try:
+            from publish_records import read_refusals
+        except ImportError:  # pragma: no cover - when imported as the `core` package
+            from core.publish_records import read_refusals
+        refusals = read_refusals(rocmfpx_out_dir, family=ROCMFPX_FAMILY)
+        refusal_keys = {r.get("tier") for r in refusals}
+        for spec in missing:
+            key = _refusal_key_for_spec(spec, out_dir)
+            if key is not None and key in refusal_keys:
+                disclosed.add(spec)
+    undisclosed = missing - disclosed
+
+    if undisclosed:
+        # Regardless of --allow-partial: a licence to ship an incomplete
+        # ladder is never a licence to ignore errors.
+        print(
+            "Error: requested ROCmFPX format(s) failed with no disclosed "
+            f"refusal record in {REFUSALS_FILENAME}: {sorted(undisclosed)} "
+            "-- aborting. --allow-partial only covers cleanly-disclosed "
+            "gaps, never silent failures.",
+            flush=True,
+        )
+        sys.exit(1)
 
     if not produced:
-        print("Error: no ROCmFPX GGUF files produced", flush=True)
-        sys.exit(1)
+        # Every requested format was cleanly refused with a disclosed record
+        # (a deliberate band/budget guard) -- nothing to ship this run.
+        if not allow_partial:
+            print("Error: no ROCmFPX GGUF files produced", flush=True)
+            sys.exit(1)
+        print(
+            "Warning: no ROCmFPX GGUF files produced, but every requested "
+            f"format's refusal is disclosed in {REFUSALS_FILENAME} -- "
+            "continuing past ROCmFPX under --allow-partial. Upload will "
+            "proceed without a ROCmFPX repo split.",
+            flush=True,
+        )
     print(f"Generated {len(produced)} ROCmFPX GGUF files", flush=True)
 
     # Post-generation PPL smoke gate (mirrors _magicquant_entry.run's -- see

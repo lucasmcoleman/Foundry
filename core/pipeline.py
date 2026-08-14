@@ -218,6 +218,13 @@ class ROCmFPXConfig:
     # already-quantized GGUF source can be requantized. Double-quantization --
     # output quality is bounded by the source quant's error floor.
     allow_requantize: bool = False
+    # allow_partial: continue past a ROCmFPX stage failure to upload, but
+    # ONLY when every requested format that failed to build has a matching
+    # disclosed entry in <out>/rocmfpx/_refusals.json (docs/decisions/
+    # rocmfpx-stage-failure-handling.md, "Option D" + disclosure predicate).
+    # A format that fails silently (no refusal record) still aborts the run
+    # regardless of this flag.
+    allow_partial: bool = False
 
 
 @dataclass
@@ -1313,6 +1320,7 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     cfg_hash = _markers().config_hash({
         "src": str(source), "formats": rc_cfg.formats, "imatrix": rc_cfg.imatrix,
         "allow_requantize": rc_cfg.allow_requantize,
+        "allow_partial": rc_cfg.allow_partial,
     })
     existing = sorted(artifacts.rocmfpx_dir.glob("*.gguf")) if artifacts.rocmfpx_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.rocmfpx_dir / "_placeholder.gguf")
@@ -1336,6 +1344,7 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         model_name=model_name,
         imatrix=rc_cfg.imatrix,
         allow_requantize=rc_cfg.allow_requantize,
+        allow_partial=rc_cfg.allow_partial,
     )
 
     rc = _run_stage_script(
@@ -1348,8 +1357,16 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     ggufs = sorted(artifacts.rocmfpx_dir.glob("*.gguf")) if artifacts.rocmfpx_dir.exists() else []
     if not ggufs:
-        log("No GGUF files produced by ROCmFPX", "error")
-        return False
+        # rc == 0 with an empty rocmfpx/ dir is only reachable under
+        # --allow-partial (docs/decisions/rocmfpx-stage-failure-handling.md):
+        # every requested format was cleanly refused and disclosed, and
+        # _rocmfpx_entry.run() chose to log a warning and exit 0 rather than
+        # abort. No completion marker is written, so a later run without the
+        # flag still re-attempts the stage. This mirrors do_rocmfpx
+        # (ui/app.py), whose success/failure was already rc-only and never
+        # gated on ggufs being non-empty.
+        log("No GGUF files produced by ROCmFPX", "warn")
+        return True
     for p in ggufs:
         log(f"  {p.name} ({p.stat().st_size / 1e9:.1f} GB)")
     try:
@@ -1746,6 +1763,12 @@ def build_arg_parser() -> "argparse.ArgumentParser":
                              "already-quantized GGUF source can be requantized. "
                              "Double-quantization -- output quality is bounded by "
                              "the source quant's error floor")
+    parser.add_argument("--rocmfpx-allow-partial", action="store_true",
+                        help="Continue to upload past a ROCmFPX stage failure, "
+                             "but only when every requested format that failed "
+                             "to build has a disclosed refusal record in "
+                             "<out>/rocmfpx/_refusals.json. A silently-failed "
+                             "format (no record) still aborts the run")
     parser.add_argument("--upload-to", type=str, help="HF repo ID")
     parser.add_argument("--llamacpp-path", type=str)
     parser.add_argument("--dry-run", action="store_true",
@@ -1863,6 +1886,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             source_model=args.rocmfpx_source_model,
             rocmfpx_hint=args.rocmfpx_hint,
             allow_requantize=args.rocmfpx_allow_requantize,
+            allow_partial=args.rocmfpx_allow_partial,
             **({"formats": args.rocmfpx_formats} if args.rocmfpx_formats else {}),
         )
     if args.no_rocmfpx:

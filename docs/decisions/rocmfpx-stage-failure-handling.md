@@ -1,7 +1,12 @@
 # Decision: ROCmFPX Stage Failure Must Not Block Upload
 
 **Date:** 2026-08-13
-**Status:** Proposed — decision memo only, nothing implemented
+**Status:** **ACCEPTED 2026-08-14 by Lucas** — Option D with the disclosure
+predicate, exactly as recommended below. Implementation is its own change with
+its own verification (see "Acceptance criteria"); it is not folded into any
+other work. The quarantine hazard named under "What this does and does not fix"
+was filed first, as a precondition of this acceptance:
+[Foundry #2](https://github.com/lucasmcoleman/Foundry/issues/2).
 **Issue:** Foundry #7
 **Scope:** `core/_rocmfpx_entry.py`, `core/services.py`, `core/pipeline.py`, `ui/app.py`
 **Recommendation:** Option D (run-level `--allow-partial`), **gated on a disclosure predicate** — not a blanket "continue past any failure"

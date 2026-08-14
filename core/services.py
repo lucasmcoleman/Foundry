@@ -658,6 +658,7 @@ class ROCmFPXService:
         model_name: str,
         imatrix: str = "",
         allow_requantize: bool = False,
+        allow_partial: bool = False,
     ) -> dict:
         """Build the JSON config consumed by core/_rocmfpx_entry.py."""
         return {
@@ -670,6 +671,7 @@ class ROCmFPXService:
             "model_name": model_name,
             "imatrix": imatrix,
             "allow_requantize": allow_requantize,
+            "allow_partial": allow_partial,
         }
 
     def build_script(self, **kwargs) -> str:

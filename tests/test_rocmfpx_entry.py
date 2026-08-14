@@ -424,6 +424,14 @@ def test_rocmfpx_config_allow_requantize_default():
     assert rc.allow_requantize is False
 
 
+def test_rocmfpx_config_allow_partial_default():
+    """Mirrors allow_requantize: --allow-partial is off by default (docs/
+    decisions/rocmfpx-stage-failure-handling.md, Option D)."""
+    pl = _pipeline()
+    rc = pl.ROCmFPXConfig()
+    assert rc.allow_partial is False
+
+
 def test_rocmfpx_allow_requantize_cli_flag_wires_into_config(monkeypatch):
     pl = _pipeline()
     captured = {}
@@ -447,10 +455,130 @@ def test_rocmfpx_allow_requantize_cli_flag_wires_into_config(monkeypatch):
     assert captured["cfg"].rocmfpx.allow_requantize is True
 
 
+def test_rocmfpx_allow_partial_cli_flag_wires_into_config(monkeypatch):
+    pl = _pipeline()
+    captured = {}
+
+    def _fake_run_pipeline(cfg, **kwargs):
+        captured["cfg"] = cfg
+        return {"rocmfpx": True}
+
+    monkeypatch.setattr(pl, "run_pipeline", _fake_run_pipeline)
+
+    pl.main([
+        "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
+        "--rocmfpx",
+    ])
+    assert captured["cfg"].rocmfpx.allow_partial is False
+
+    pl.main([
+        "--model", "org/m", "--no-export", "--no-heretic", "--no-reap",
+        "--rocmfpx", "--rocmfpx-allow-partial",
+    ])
+    assert captured["cfg"].rocmfpx.allow_partial is True
+
+
 def test_stage_rocmfpx_hash_source_includes_allow_requantize():
     src = (ROOT / "core" / "pipeline.py").read_text()
     hash_block = src[src.index('def stage_rocmfpx'):src.index('existing = sorted(artifacts.rocmfpx_dir')]
     assert '"allow_requantize": rc_cfg.allow_requantize' in hash_block
+
+
+def test_stage_rocmfpx_hash_source_includes_allow_partial():
+    src = (ROOT / "core" / "pipeline.py").read_text()
+    hash_block = src[src.index('def stage_rocmfpx'):src.index('existing = sorted(artifacts.rocmfpx_dir')]
+    assert '"allow_partial": rc_cfg.allow_partial' in hash_block
+
+
+def test_stage_rocmfpx_allow_partial_empty_produced_returns_true_no_marker(tmp_path, monkeypatch):
+    """CLI path (core/pipeline.py's stage_rocmfpx): when the stage script
+    exits 0 with zero GGUFs on disk -- only reachable under --allow-partial,
+    when _rocmfpx_entry.run() logged a warning and returned success because
+    every requested format was cleanly refused and disclosed -- the stage
+    must still report success (so the orchestrator's `if not ok: break`
+    does not stop the run before upload) and must NOT write a completion
+    marker (so a later run without the flag still re-attempts the stage).
+
+    Before this fix, stage_rocmfpx's own `if not ggufs: return False`
+    silently converted that success back into a failure -- a divergence
+    from do_rocmfpx (ui/app.py), whose ok/return was already rc-only, that
+    would have defeated --allow-partial for every CLI run.
+    """
+    pl = _pipeline()
+
+    write_marker_calls = []
+
+    class _StubMarkers:
+        def config_hash(self, d):
+            return "stub-hash"
+
+        def is_stage_complete(self, *a, **kw):
+            return False
+
+        def write_marker(self, *a, **kw):
+            write_marker_calls.append((a, kw))
+
+    monkeypatch.setattr(pl, "_run_stage_script", lambda *a, **kw: 0)
+    monkeypatch.setattr(pl, "_system_memory_gate", lambda *a, **kw: True)
+    monkeypatch.setattr(pl, "_preflight_stage", lambda *a, **kw: True)
+    monkeypatch.setattr(pl, "_resolve_model_name", lambda *a, **kw: "TestModel")
+    monkeypatch.setattr(pl, "_markers", lambda: _StubMarkers())
+
+    logs = []
+    config = pl.PipelineConfig(
+        output_dir=str(tmp_path),
+        rocmfpx=pl.ROCmFPXConfig(allow_partial=True, source_model="dummy.gguf"),
+    )
+    artifacts = pl.Artifacts(str(tmp_path))
+
+    ok = pl.stage_rocmfpx(config, artifacts, lambda msg, level="info": logs.append((level, msg)))
+
+    assert ok is True
+    assert write_marker_calls == []
+    assert not artifacts.rocmfpx_dir.exists() or not list(artifacts.rocmfpx_dir.glob("*.gguf"))
+
+
+def test_stage_rocmfpx_still_writes_marker_when_ggufs_present(tmp_path, monkeypatch):
+    """Regression guard on the fix above: the ordinary (today's) success
+    path -- rc == 0 and real GGUFs on disk -- must still write the
+    completion marker exactly as before."""
+    pl = _pipeline()
+
+    write_marker_calls = []
+
+    class _StubMarkers:
+        def config_hash(self, d):
+            return "stub-hash"
+
+        def is_stage_complete(self, *a, **kw):
+            return False
+
+        def write_marker(self, *a, **kw):
+            write_marker_calls.append((a, kw))
+
+    def _fake_run_stage_script(*a, **kw):
+        rc_dir = tmp_path / "rocmfpx"
+        rc_dir.mkdir(parents=True, exist_ok=True)
+        (rc_dir / "TestModel-Q4_0_ROCMFP4.gguf").write_bytes(b"x")
+        return 0
+
+    monkeypatch.setattr(pl, "_run_stage_script", _fake_run_stage_script)
+    monkeypatch.setattr(pl, "_system_memory_gate", lambda *a, **kw: True)
+    monkeypatch.setattr(pl, "_preflight_stage", lambda *a, **kw: True)
+    monkeypatch.setattr(pl, "_resolve_model_name", lambda *a, **kw: "TestModel")
+    monkeypatch.setattr(pl, "_markers", lambda: _StubMarkers())
+
+    logs = []
+    config = pl.PipelineConfig(
+        output_dir=str(tmp_path),
+        rocmfpx=pl.ROCmFPXConfig(source_model="dummy.gguf"),
+    )
+    artifacts = pl.Artifacts(str(tmp_path))
+
+    ok = pl.stage_rocmfpx(config, artifacts, lambda msg, level="info": logs.append((level, msg)))
+
+    assert ok is True
+    assert len(write_marker_calls) == 1
 
 
 # ── core/services.py: ROCmFPXService.build_config carries allow_requantize ───
@@ -462,6 +590,26 @@ def test_rocmfpx_build_config_allow_requantize_default_false():
         out_abs_str="/o", formats_json='["rocmfp4-agent"]', model_name="m",
     )
     assert cfg["allow_requantize"] is False
+
+
+def test_rocmfpx_build_config_allow_partial_default_false():
+    svc = ROCmFPXService(ROOT, "python")
+    cfg = svc.build_config(
+        rocmfpx_hint="", pipeline_root_str="/repo", source_override="/src",
+        out_abs_str="/o", formats_json='["rocmfp4-agent"]', model_name="m",
+    )
+    assert cfg["allow_partial"] is False
+
+
+def test_rocmfpx_build_config_allow_partial_explicit_true():
+    svc = ROCmFPXService(ROOT, "python")
+    cfg = svc.build_config(
+        rocmfpx_hint="", pipeline_root_str="/repo", source_override="/src",
+        out_abs_str="/o", formats_json='["rocmfp4-agent"]', model_name="m",
+        allow_partial=True,
+    )
+    assert cfg["allow_partial"] is True
+    assert json.loads(json.dumps(cfg)) == cfg
 
 
 def test_rocmfpx_build_config_allow_requantize_explicit_true():

@@ -103,6 +103,22 @@ def test_no_quants_stays_auto(tmp_path):
     assert plan_gguf_repos(out, "user/Model-GGUF") == [("user/Model-GGUF", "auto")]
 
 
+def test_allow_partial_empty_rocmfpx_dir_stays_single_repo(tmp_path):
+    """Acceptance criterion 6 (docs/decisions/rocmfpx-stage-failure-handling.md,
+    Option D): the degradation property Option D relies on. An EXISTING but
+    empty ``rocmfpx/`` dir -- exactly the state left behind by a
+    --allow-partial run where every requested format was cleanly refused and
+    disclosed, nothing built -- must collapse to the single-repo plan, the
+    same as if the dir were absent entirely. ``has_fpx`` is computed via
+    ``glob("*.gguf")``, which is empty either way, but this pins the
+    dir-exists-with-zero-files case specifically rather than trusting that
+    by inference."""
+    out = _out_with(tmp_path, mq=True)
+    (Path(out) / "rocmfpx").mkdir(parents=True, exist_ok=True)
+    assert not list((Path(out) / "rocmfpx").glob("*.gguf"))
+    assert plan_gguf_repos(out, "user/Model-GGUF") == [("user/Model-GGUF", "auto")]
+
+
 # ── generate_model_card: ROCmFPX flavor + sibling links ──────────────────
 
 def _cfg(repo_id="user/Model-ROCmFPX-GGUF"):
