@@ -15,6 +15,7 @@ left byte-for-byte unchanged (other things match on it).
 import json
 import os
 import stat
+import types
 from pathlib import Path
 
 import pytest
@@ -430,3 +431,296 @@ def test_recorded_reason_renders_on_a_card_the_way_the_consumer_expects(tmp_path
     card = generate_model_card(cfg, [], rocmfpx=True)
     assert "- **Q5** -- rendering MagicQuant's Q5 config" in card
     assert "Refusing" not in card
+
+
+# ── Change 3: --allow-partial disclosure predicate (run()) ─────────────────
+#
+# docs/decisions/rocmfpx-stage-failure-handling.md, "Option D" + disclosure
+# predicate. `produced == []` is NOT synonymous with "cleanly refused" -- of
+# the eleven code paths that can shorten `produced`, only three (band guard,
+# budget-unpriceable, budget-over-tolerance) write a refusal record; the
+# other eight fail silently. `run()`'s predicate at the end of the quantize
+# loop is:
+#
+#   requested   = formats from cfg
+#   built       = specs whose helper returned a path
+#   missing     = requested - built
+#   disclosed   = {s in missing : refusal_key(s) has an entry in
+#                  _refusals.json with family == "rocmfpx"}
+#   undisclosed = missing - disclosed
+#
+#   undisclosed non-empty  -> sys.exit(1), regardless of the flag
+#   undisclosed empty, built non-empty -> proceed (today's behaviour)
+#   undisclosed empty, built empty     -> exit 1 without the flag,
+#                                          log + return success with it
+#
+# Every test below drives the REAL entry.run() end to end (not a hand-rolled
+# stand-in for it), with only the heavy/environmental bits faked: ROCmFPX
+# discovery, source resolution, and BF16 conversion. The PPL smoke gate is
+# untouched and unmocked -- the fake rocmfpx_dir has no real
+# llama-perplexity binary, so ppl_smoke.find_perplexity_bin resolves to None
+# and the gate is advisory-skip for whatever DOES get produced, exactly as
+# it is for any environment lacking a real binary.
+
+def _rocmfpx_run_cfg(tmp_path, formats, allow_partial=False, allow_requantize=False,
+                      model_name="TestModel"):
+    cfg = {
+        "pipeline_root": str(tmp_path),
+        "rocmfpx_hint": "",
+        "pipeline_root_str": str(tmp_path),
+        "source_override": "",
+        "out_abs_str": str(tmp_path / "output"),
+        "formats_json": json.dumps(formats),
+        "model_name": model_name,
+        "imatrix": "",
+        "allow_requantize": allow_requantize,
+        "allow_partial": allow_partial,
+    }
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    return str(cfg_path)
+
+
+def _install_run_environment(monkeypatch, tmp_path):
+    """Bypass real ROCmFPX discovery/build/source-resolution/BF16-conversion
+    -- none of this decision touches that machinery, and none of it is
+    reachable in an offline test sandbox anyway."""
+    fake_rocmfpx_dir = tmp_path / "fake-rocmfpx"  # deliberately has no binaries
+    monkeypatch.setattr(entry, "ensure_rocmfpx", lambda hint="": str(fake_rocmfpx_dir))
+    monkeypatch.setattr(
+        entry, "resolve_source",
+        lambda override, out_dir, root: str(tmp_path / "source.gguf"),
+    )
+    monkeypatch.setattr(
+        entry, "_ensure_bf16_gguf",
+        lambda rocmfpx_dir, source, out_dir, model_name=None: str(tmp_path / "model-bf16.gguf"),
+    )
+
+
+def _install_quantize_fakes(monkeypatch, plan):
+    """``plan``: ``{spec: "built" | "fail_recorded" | "fail_silent"}``.
+
+    ``fail_recorded`` drives the REAL ``_record_refusal`` so the on-disk
+    ``_refusals.json`` is genuinely written and re-read by ``run()`` --
+    exactly the disclosure channel the memo says is the right thing to test
+    against ("testing the disclosure channel itself is stronger than a
+    parallel in-memory signal").
+    """
+
+    def fake_preset(spec, out_dir, model_name, quantize_bin, bf16_gguf, imatrix,
+                    allow_requantize=False, head_type=None):
+        action = plan[spec]
+        assert action != "fail_recorded", (
+            "uniform presets never write refusal records -- see "
+            "_refusal_key_for_spec / the memo's 'uniform presets can never "
+            "satisfy the predicate' note"
+        )
+        if action == "built":
+            p = out_dir / f"{model_name}-{spec}.gguf"
+            p.write_bytes(b"x")
+            return p
+        return None  # fail_silent
+
+    def fake_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name, quantize_bin,
+                    bf16_gguf, imatrix, allow_requantize=False):
+        action = plan[spec]
+        if action == "built":
+            p = rocmfpx_out_dir / f"{model_name}-ROCMFPX-MQ-{tier}.gguf"
+            p.write_bytes(b"x")
+            return p
+        if action == "fail_recorded":
+            entry._record_refusal(
+                rocmfpx_out_dir, tier=tier, family=entry.ROCMFPX_FAMILY,
+                reason=f"test band refusal for {spec}",
+                predicted_gib=1.0, baseline_gib=2.0,
+                predicted_band="Q6", claimed_band=tier,
+            )
+            return None
+        return None  # fail_silent
+
+    def fake_budget(spec, requested, out_dir, rocmfpx_out_dir, model_name, quantize_bin,
+                    bf16_gguf, imatrix, allow_requantize=False):
+        action = plan[spec]
+        key = requested if requested != "BUDGET" else "BUDGET-TEST"
+        if action == "built":
+            p = rocmfpx_out_dir / f"{model_name}-ROCMFPX-MQ-{key}.gguf"
+            p.write_bytes(b"x")
+            return p
+        if action == "fail_recorded":
+            entry._record_refusal(
+                rocmfpx_out_dir, tier=key, family=entry.ROCMFPX_FAMILY,
+                reason=f"test budget refusal for {spec}",
+                predicted_gib=1.0, baseline_gib=2.0,
+                predicted_band="", claimed_band="",
+                rule="budget", requested_budget_gib=1.0,
+            )
+            return None
+        return None  # fail_silent
+
+    monkeypatch.setattr(entry, "_quantize_preset", fake_preset)
+    monkeypatch.setattr(entry, "_quantize_mq_hybrid", fake_hybrid)
+    monkeypatch.setattr(entry, "_quantize_mq_budget", fake_budget)
+
+
+def _run(monkeypatch, tmp_path, formats, plan, allow_partial):
+    _install_run_environment(monkeypatch, tmp_path)
+    _install_quantize_fakes(monkeypatch, plan)
+    cfg_path = _rocmfpx_run_cfg(tmp_path, formats, allow_partial=allow_partial)
+    entry.run(cfg_path)
+
+
+# Criteria 1 + 2: every requested format refused WITH a record.
+
+def test_criterion_1_all_disclosed_refused_with_flag_exits_0_and_discloses_on_card(
+    tmp_path, monkeypatch,
+):
+    formats = ["mq-q4", "mq-q5"]
+    plan = {"mq-q4": "fail_recorded", "mq-q5": "fail_recorded"}
+
+    # entry.run() must complete normally (no SystemExit) under the flag.
+    _run(monkeypatch, tmp_path, formats, plan, allow_partial=True)
+
+    rocmfpx_out_dir = tmp_path / "output" / "rocmfpx"
+    assert list(rocmfpx_out_dir.glob("*.gguf")) == []
+
+    records = _read(rocmfpx_out_dir)
+    assert {r["tier"] for r in records} == {"Q4", "Q5"}
+
+    from core.hf_upload import HFUploadConfig, generate_model_card
+    cfg = HFUploadConfig(
+        repo_id="u/m-ROCmFPX-GGUF",
+        refused_tiers=[{"tier": r["tier"], "family": r["family"], "reason": r["reason"]}
+                       for r in records],
+    )
+    card = generate_model_card(cfg, [], rocmfpx=True)
+    assert "- **Q4** -- test band refusal for mq-q4" in card
+    assert "- **Q5** -- test band refusal for mq-q5" in card
+
+
+def test_criterion_2_same_scenario_without_flag_exits_1_default_unchanged(tmp_path, monkeypatch):
+    formats = ["mq-q4", "mq-q5"]
+    plan = {"mq-q4": "fail_recorded", "mq-q5": "fail_recorded"}
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run(monkeypatch, tmp_path, formats, plan, allow_partial=False)
+    assert exc_info.value.code == 1
+
+
+def test_criterion_2_error_message_is_byte_identical_to_pre_change_behaviour(
+    tmp_path, monkeypatch, capsys,
+):
+    """Pins the exact message the un-flagged, fully-disclosed-empty-ladder
+    abort prints, so this scenario provably still behaves exactly as it did
+    before the disclosure predicate existed."""
+    formats = ["mq-q4"]
+    plan = {"mq-q4": "fail_recorded"}
+    with pytest.raises(SystemExit):
+        _run(monkeypatch, tmp_path, formats, plan, allow_partial=False)
+    out = capsys.readouterr().out
+    assert "Error: no ROCmFPX GGUF files produced" in out
+
+
+# Criterion 3: the refinement's regression pin -- one disclosed refusal, one
+# SILENT failure (a real bad format spec, going through the real
+# _quantize_preset code path, not a fake), flag set -> must still exit 1.
+
+def test_criterion_3_regression_pin_disclosed_plus_undisclosed_still_exits_1(
+    tmp_path, monkeypatch,
+):
+    _install_run_environment(monkeypatch, tmp_path)
+
+    def fake_hybrid(spec, tier, out_dir, rocmfpx_out_dir, model_name, quantize_bin,
+                    bf16_gguf, imatrix, allow_requantize=False):
+        entry._record_refusal(
+            rocmfpx_out_dir, tier=tier, family=entry.ROCMFPX_FAMILY,
+            reason=f"test band refusal for {spec}",
+            predicted_gib=1.0, baseline_gib=2.0,
+            predicted_band="Q6", claimed_band=tier,
+        )
+        return None
+
+    monkeypatch.setattr(entry, "_quantize_mq_hybrid", fake_hybrid)
+    # _quantize_preset is left REAL: "totally-bogus-spec" fails
+    # parse_format_spec with a ValueError (row 4 -- ``_quantize_preset``
+    # returns None and writes no record at all), exactly the silent-failure
+    # shape this predicate exists to catch.
+
+    formats = ["mq-q4", "totally-bogus-spec"]
+    cfg_path = _rocmfpx_run_cfg(tmp_path, formats, allow_partial=True)
+    with pytest.raises(SystemExit) as exc_info:
+        entry.run(cfg_path)
+    assert exc_info.value.code == 1
+
+    # And the disclosed one really was recorded -- this is a genuine mixed
+    # disclosed/undisclosed case, not an accident of nothing being recorded.
+    rocmfpx_out_dir = tmp_path / "output" / "rocmfpx"
+    assert [r["tier"] for r in _read(rocmfpx_out_dir)] == ["Q4"]
+
+
+# Criterion 4: a real llama-quantize non-zero exit (row 6) -- no record --
+# with the flag set must still exit 1.
+
+def test_criterion_4_quantize_subprocess_failure_with_flag_exits_1(tmp_path, monkeypatch):
+    _install_run_environment(monkeypatch, tmp_path)
+    # Real _quantize_preset, real subprocess.run call inside it -- faked at
+    # the subprocess boundary (not the helper), and validate_types_supported
+    # short-circuited so the failure is genuinely the quantize exit code
+    # (row 6), not a type-probe rejection (row 5).
+    monkeypatch.setattr(entry, "validate_types_supported", lambda types_, quantize_bin: None)
+    monkeypatch.setattr("subprocess.run",
+                        lambda cmd, *a, **kw: types.SimpleNamespace(returncode=1))
+
+    formats = ["rocmfp4-agent"]
+    cfg_path = _rocmfpx_run_cfg(tmp_path, formats, allow_partial=True)
+    with pytest.raises(SystemExit) as exc_info:
+        entry.run(cfg_path)
+    assert exc_info.value.code == 1
+
+    rocmfpx_out_dir = tmp_path / "output" / "rocmfpx"
+    assert not (rocmfpx_out_dir / "_refusals.json").exists()  # row 6 writes no record
+
+
+# Criterion 5: a partial success (some built, one cleanly refused) -> exit 0
+# with AND without the flag. Pins today's behaviour against accidental
+# change -- this scenario needs no flag at all.
+
+@pytest.mark.parametrize("allow_partial", [False, True])
+def test_criterion_5_partial_success_with_disclosed_gap_exits_0_regardless_of_flag(
+    tmp_path, monkeypatch, allow_partial,
+):
+    formats = ["rocmfp4-agent", "mq-q5"]
+    plan = {"rocmfp4-agent": "built", "mq-q5": "fail_recorded"}
+    # No SystemExit raised at all -- run() completes normally either way.
+    _run(monkeypatch, tmp_path, formats, plan, allow_partial=allow_partial)
+
+    rocmfpx_out_dir = tmp_path / "output" / "rocmfpx"
+    ggufs = list(rocmfpx_out_dir.glob("*.gguf"))
+    assert len(ggufs) == 1
+    assert [r["tier"] for r in _read(rocmfpx_out_dir)] == ["Q5"]
+
+
+# Criterion 7: an all-preset formats list, all failing, flag set -> exit 1,
+# because uniform presets write no refusal records at all (documented
+# limitation, not a bug -- must never silently start "passing" if someone
+# later changes preset failure handling without also giving presets refusal
+# records).
+
+def test_criterion_7_all_preset_list_all_failing_flag_set_still_exits_1(tmp_path, monkeypatch):
+    _install_run_environment(monkeypatch, tmp_path)
+    # Real _quantize_preset; force every preset to fail the type-support
+    # probe (row 5 -- a stale fork build missing a type). No record is ever
+    # possible for a preset spec, by construction of _refusal_key_for_spec.
+    monkeypatch.setattr(
+        entry, "validate_types_supported",
+        lambda types, quantize_bin: (_ for _ in ()).throw(RuntimeError("type missing")),
+    )
+
+    formats = ["rocmfp4-agent", "rocmfp6-agent"]
+    cfg_path = _rocmfpx_run_cfg(tmp_path, formats, allow_partial=True)
+    with pytest.raises(SystemExit) as exc_info:
+        entry.run(cfg_path)
+    assert exc_info.value.code == 1
+
+    rocmfpx_out_dir = tmp_path / "output" / "rocmfpx"
+    assert not (rocmfpx_out_dir / "_refusals.json").exists()
+    assert not list(rocmfpx_out_dir.glob("*.gguf"))

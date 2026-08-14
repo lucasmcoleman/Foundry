@@ -298,6 +298,12 @@ class ROCmFPXCfg(BaseModel):
     source_model: str = ""  # when export is skipped: path to GGUF or merged model dir
     imatrix: str = ""  # optional path to an imatrix GGUF
     allow_requantize: bool = False  # pass --allow-requantize (quantized GGUF source, double-quantization opt-in)
+    # allow_partial: continue past a ROCmFPX stage failure to upload, but only
+    # when every requested format that failed to build has a matching
+    # disclosed entry in <out>/rocmfpx/_refusals.json (docs/decisions/
+    # rocmfpx-stage-failure-handling.md, "Option D" + disclosure predicate).
+    # A silently-failed format (no refusal record) still aborts the run.
+    allow_partial: bool = False
 
 class UploadCfg(BaseModel):
     repo_id: str = ""
@@ -1134,6 +1140,7 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
         "formats": rc_cfg.formats, "imatrix": rc_cfg.imatrix,
         "source_model": rc_cfg.source_model,
         "allow_requantize": rc_cfg.allow_requantize,
+        "allow_partial": rc_cfg.allow_partial,
     })
     done, rc_key = await _check_marker(
         "rocmfpx", "ROCmFPX", rc_dir, rc_hash,
@@ -1159,6 +1166,7 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
         model_name=model_name,
         imatrix=rc_cfg.imatrix,
         allow_requantize=rc_cfg.allow_requantize,
+        allow_partial=rc_cfg.allow_partial,
     )
     rc = await run_script(script, out)
     ok = rc == 0
