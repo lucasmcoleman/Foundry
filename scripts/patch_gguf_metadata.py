@@ -77,6 +77,29 @@ def write_kv_uint32(f, key, value):
     f.write(struct.pack('<I', value))
 
 
+def _tensor_info_length(rest_data, n_tensors):
+    """Byte length of the tensor-info section at the head of ``rest_data``.
+
+    Needed because the tensor DATA section must begin at a file offset that is
+    a multiple of ``general.alignment``. Growing the KV section shifts
+    everything after it, so the original padding cannot simply be replayed --
+    doing that leaves the data section misaligned and every tensor reads from
+    the wrong offset (silently: the file still loads, the weights are garbage).
+
+    Entry layout: name (u64 len + bytes), n_dims (u32), dims (n_dims x u64),
+    ggml type (u32), offset (u64).
+    """
+    pos = 0
+    for _ in range(n_tensors):
+        (name_len,) = struct.unpack_from('<Q', rest_data, pos)
+        pos += 8 + name_len
+        (n_dims,) = struct.unpack_from('<I', rest_data, pos)
+        pos += 4 + n_dims * 8
+        pos += 4  # ggml type
+        pos += 8  # offset
+    return pos
+
+
 def patch_gguf(input_path, chat_template, eos_token_id, pad_token_id):
     """Patch a GGUF file to add chat template and token IDs."""
     print(f"Patching {os.path.basename(input_path)}...")
@@ -94,12 +117,15 @@ def patch_gguf(input_path, chat_template, eos_token_id, pad_token_id):
         # Read all existing KV pairs
         kv_pairs = []
         existing_keys = set()
+        alignment = 32  # GGUF default when general.alignment is absent
         for i in range(n_kv):
             key = read_string(fin)
             vtype = struct.unpack('<I', fin.read(4))[0]
-            _, raw = read_value(fin, vtype)
+            val, raw = read_value(fin, vtype)
             kv_pairs.append((key, vtype, raw))
             existing_keys.add(key)
+            if key == 'general.alignment':
+                alignment = val
 
         # Position after KV section = start of tensor info + data
         rest_start = fin.tell()
@@ -146,25 +172,21 @@ def patch_gguf(input_path, chat_template, eos_token_id, pad_token_id):
             elif isinstance(value, int):
                 write_kv_uint32(fout, key, value)
 
-        # The tensor info section uses absolute offsets from the start of the file.
-        # Since we added KV data, the tensor data offsets need adjustment.
-        # BUT: GGUF tensor data offsets are relative to the END of the header
-        # (after padding to alignment). We need to check if tensor data uses
-        # absolute or relative offsets.
+        # rest_data is: tensor_info entries + alignment padding + tensor data.
         #
-        # In GGUF v3, tensor data offset is relative to the start of tensor data
-        # (after all metadata + tensor info + alignment padding).
-        # So we just need to re-pad correctly.
-
-        # Write tensor info + data as-is, but we need to handle alignment.
-        # The original file had alignment after KV+tensor_info.
-        # We're changing the KV section size, so alignment changes.
-        # BUT tensor info offsets are relative to tensor data start, not file start.
-        # So we just need to ensure proper alignment before tensor data.
-
-        # The rest_data contains: tensor_info entries + alignment padding + tensor data
-        # We can write it directly - tensor offsets are relative to data section start
-        fout.write(rest_data)
+        # Per-tensor offsets inside tensor_info are relative to the START of the
+        # tensor data section, so they need no adjustment. What DOES move is the
+        # data section itself: it must begin at a file offset that is a multiple
+        # of general.alignment, and we just grew the KV section by an arbitrary
+        # number of bytes. Replaying the original padding verbatim leaves the
+        # data section off its boundary; the file still opens, and every tensor
+        # then reads from the wrong place. Recompute the padding instead.
+        info_len = _tensor_info_length(rest_data, n_tensors)
+        orig_data_start = (rest_start + info_len + alignment - 1) // alignment * alignment
+        fout.write(rest_data[:info_len])
+        pad = -fout.tell() % alignment
+        fout.write(b'\x00' * pad)
+        fout.write(rest_data[orig_data_start - rest_start:])
 
     # Replace original
     os.replace(output_path, input_path)
