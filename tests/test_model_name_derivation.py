@@ -492,20 +492,27 @@ def test_cli_shares_the_one_implementation():
     assert pl._services().ModelNameUnresolvedError is services.ModelNameUnresolvedError
 
 
-def test_cli_training_is_structurally_always_enabled():
-    """Documents a real, pre-existing CLI limitation this fix does NOT
-    change (out of scope -- no --no-training flag exists): `training` is a
-    required field on PipelineConfig, so _compute_enabled_stages() always
-    reports it enabled. The shared deriver's training layer therefore wins
-    for every CLI run whose training.model_name is non-empty (i.e. almost
-    every CLI run, since it defaults to a real value). This test exists so a
-    future reader doesn't mistake that for a bug in the shared function."""
+def test_cli_training_is_genuinely_optional():
+    """Foundry #3 regression pin (supersedes the old
+    test_cli_training_is_structurally_always_enabled, which documented this
+    exact behavior as an accepted limitation): a default/bare PipelineConfig
+    no longer force-enables training. training is Optional[TrainingConfig]
+    with no default_factory, so a config nobody explicitly configured for
+    training has none, and _compute_enabled_stages() correctly reports it
+    disabled -- for every other stage's config state, not just the "nothing
+    else configured either" case this used to document."""
     import pipeline as pl
 
     config = pl.PipelineConfig()
-    assert "training" in pl._compute_enabled_stages(config)
+    assert config.training is None
+    assert "training" not in pl._compute_enabled_stages(config)
     config.export = config.heretic = config.reap = config.qat = None
     config.magicquant = config.rocmfpx = config.upload = None
+    assert "training" not in pl._compute_enabled_stages(config)
+
+    # And the positive case: a genuinely-configured training section IS
+    # reported enabled -- pins the other half of the same gate.
+    config.training = pl.TrainingConfig()
     assert "training" in pl._compute_enabled_stages(config)
 
 
@@ -582,8 +589,13 @@ def test_stage_magicquant_strips_precision_suffix_from_gguf_model_name(tmp_path,
 
     out_dir = tmp_path / "out"
     artifacts = pl.Artifacts(str(out_dir))
-    config = pl.PipelineConfig(output_dir=str(out_dir))
-    config.training.model_name = "org/Some-Model-BF16"
+    # training must be explicitly constructed (Foundry #3: no longer a
+    # non-optional default) so the training layer of the naming fallback
+    # actually wins here, matching this test's original intent.
+    config = pl.PipelineConfig(
+        output_dir=str(out_dir),
+        training=pl.TrainingConfig(model_name="org/Some-Model-BF16"),
+    )
     config.magicquant.source_model = "unused-but-non-empty"
 
     captured = {}
