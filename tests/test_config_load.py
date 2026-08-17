@@ -25,8 +25,9 @@ def test_every_config_loads_without_error(yaml_file):
 def test_default_yaml_is_no_longer_a_noop():
     """default.yaml is flat; it sets model_name/lora_r/max_seq_length etc."""
     cfg = PipelineConfig()
-    # Sanity: a fresh config does NOT have these flat-file values.
-    assert cfg.training.model_name != "unsloth/Qwen3-8B"
+    # Sanity: a fresh config has no training section at all (Foundry #3:
+    # training is genuinely optional, not force-populated with a default).
+    assert cfg.training is None
     load_yaml_into_config(str(CONFIGS / "default.yaml"), cfg)
     assert cfg.training.model_name == "unsloth/Qwen3-8B"
     assert cfg.training.lora_r == 32

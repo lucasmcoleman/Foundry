@@ -18,7 +18,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as _dataclass_fields
 from pathlib import Path
 from typing import Optional
 
@@ -285,7 +285,11 @@ class UploadConfig:
 @dataclass
 class PipelineConfig:
     output_dir: str = "./output"
-    training: TrainingConfig = field(default_factory=TrainingConfig)
+    # Optional (Foundry #3): training must be gated on genuine intent, not on
+    # a dataclass default that's always truthy. See _compute_enabled_stages
+    # and main()'s --train/--no-training handling below -- a bare/default
+    # PipelineConfig() no longer silently starts a QLoRA run.
+    training: Optional[TrainingConfig] = None
     export: Optional[ExportConfig] = field(default_factory=ExportConfig)
     heretic: Optional[HereticConfig] = None
     reap: Optional[ReapConfig] = None
@@ -475,7 +479,7 @@ def _resolve_model_name(
     enabled = _compute_enabled_stages(config)
     svc = _services()
     kwargs = dict(
-        training_model_name=config.training.model_name,
+        training_model_name=config.training.model_name if config.training else "",
         training_enabled="training" in enabled,
         export_source_model="",
         export_enabled="export" in enabled,
@@ -815,9 +819,12 @@ def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     if adapter_config_path.exists():
         with open(adapter_config_path) as f:
             adapter_cfg = json.load(f)
-        base_model_id = adapter_cfg.get("base_model_name_or_path", config.training.model_name)
+        base_model_id = adapter_cfg.get(
+            "base_model_name_or_path",
+            config.training.model_name if config.training else "",
+        )
     else:
-        base_model_id = config.training.model_name
+        base_model_id = config.training.model_name if config.training else ""
 
     # Completion-marker resume: a merged_model dir with safetensors + a marker.
     cfg_hash = _markers().config_hash({"base_model_id": base_model_id, "src": str(artifacts.lora_dir)})
@@ -1097,7 +1104,7 @@ def stage_qat(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         return False
 
     qc = config.qat
-    source_model = config.training.model_name
+    source_model = config.training.model_name if config.training else ""
 
     config_source = _resolve_qat_config_source(qc, artifacts)
     if config_source is None:
@@ -1398,10 +1405,11 @@ def _build_hf_upload_config(config: PipelineConfig, log: LogFn, enabled: set = N
     Args:
         enabled: set of stage names that actually ran. Used to determine
                  did_training / did_heretic / did_magicquant flags for the
-                 model card. Falls back to config presence check if not provided.
-                 config.training is always non-None (non-optional field with a
-                 default), so `config.training is not None` is always True --
-                 `enabled` is what actually distinguishes ran-vs-not.
+                 model card. Falls back to config presence check if not
+                 provided. config.training is now Optional (Foundry #3) --
+                 None on a genuine quantize-only run -- so `enabled` is what
+                 distinguishes ran-vs-not, and every `tc.*` read below is
+                 None-guarded rather than assuming training always ran.
     """
     from hf_upload import HFUploadConfig
 
@@ -1411,8 +1419,24 @@ def _build_hf_upload_config(config: PipelineConfig, log: LogFn, enabled: set = N
         return None
 
     tc = config.training
-    license_id = _resolve_license(uc, tc.model_name, log)
+    # base_model/license need the REAL source model, not a training-disabled
+    # placeholder -- falling back to TrainingConfig()'s dummy default here
+    # would misreport a quantize-only run's card as based on
+    # "Tesslate/OmniCoder-9B". Same pipeline-order fallback used elsewhere
+    # (training -> magicquant -> rocmfpx); "" (today's behavior when
+    # model_name was blank) is the last resort.
+    model_name_fallback = (
+        (tc.model_name if tc else "")
+        or (config.magicquant.source_model if config.magicquant else "")
+        or (config.rocmfpx.source_model if config.rocmfpx else "")
+    )
+    license_id = _resolve_license(uc, model_name_fallback, log)
     _enabled = enabled or set()
+    # LoRA/training hyperparameters are only ever rendered on the card behind
+    # `if cfg.did_training`, so a throwaway default TrainingConfig() is a
+    # safe stand-in when training didn't run -- unlike model_name above,
+    # nothing here is displayed unless did_training is also True.
+    tc_or_default = tc or TrainingConfig()
     return HFUploadConfig(
         repo_id=uc.repo_id,
         private=uc.private,
@@ -1420,22 +1444,22 @@ def _build_hf_upload_config(config: PipelineConfig, log: LogFn, enabled: set = N
         upload_gguf=uc.upload_gguf,
         upload_lora=uc.upload_lora,
         upload_merged=uc.upload_merged,
-        base_model=uc.base_model or tc.model_name,
-        dataset_name=tc.dataset_path,
+        base_model=uc.base_model or model_name_fallback,
+        dataset_name=tc.dataset_path if tc else "",
         did_training="training" in _enabled,
         did_heretic="heretic" in _enabled,
         did_reap="reap" in _enabled,
         did_magicquant="magicquant" in _enabled,
-        lora_r=tc.lora_r,
-        lora_alpha=tc.lora_alpha,
-        lora_dropout=tc.lora_dropout,
-        num_epochs=tc.num_train_epochs,
-        learning_rate=tc.learning_rate,
-        max_seq_length=tc.max_seq_length,
-        batch_size=tc.per_device_train_batch_size,
-        gradient_accumulation=tc.gradient_accumulation_steps,
-        optimizer=tc.optim,
-        lr_scheduler=tc.lr_scheduler_type,
+        lora_r=tc_or_default.lora_r,
+        lora_alpha=tc_or_default.lora_alpha,
+        lora_dropout=tc_or_default.lora_dropout,
+        num_epochs=tc_or_default.num_train_epochs,
+        learning_rate=tc_or_default.learning_rate,
+        max_seq_length=tc_or_default.max_seq_length,
+        batch_size=tc_or_default.per_device_train_batch_size,
+        gradient_accumulation=tc_or_default.gradient_accumulation_steps,
+        optimizer=tc_or_default.optim,
+        lr_scheduler=tc_or_default.lr_scheduler_type,
     )
 
 
@@ -1557,6 +1581,11 @@ _CONFIG_SECTIONS = {
     "upload": ("upload", UploadConfig),
 }
 
+# Real TrainingConfig field names -- used by load_yaml_into_config's flat-layout
+# branch to decide whether a section-less YAML file actually carries training
+# intent (vs. being empty, or full of keys meant for some other tool).
+_TRAINING_FIELD_NAMES = {f.name for f in _dataclass_fields(TrainingConfig)}
+
 
 def _set_known_fields(obj, values: dict) -> None:
     """Set only attributes that already exist on the dataclass instance.
@@ -1582,6 +1611,15 @@ def load_yaml_into_config(config_path: str, cfg: "PipelineConfig") -> "PipelineC
     ignored. For optional sections (export/heretic/reap/magicquant/upload) that
     are currently ``None`` on ``cfg``, the section is instantiated when present
     in the YAML so its values are honored.
+
+    ``training`` is genuinely optional (Foundry #3): an explicit nested
+    ``training: null`` clears/keeps-cleared the section (a config that used to
+    train can be pointed at a quantize-only run without deleting its training
+    block). A flat-layout file (no section wrapper) is, by construction, only
+    ever training keys -- see the layout note above -- but an empty or
+    irrelevant flat file (no key recognized by TrainingConfig) must not
+    spuriously switch training on; it's only treated as training intent when
+    at least one real TrainingConfig field is present.
     """
     import yaml
 
@@ -1593,16 +1631,31 @@ def load_yaml_into_config(config_path: str, cfg: "PipelineConfig") -> "PipelineC
 
     if has_sections:
         for section, (attr, dc_cls) in _CONFIG_SECTIONS.items():
-            if section not in data or not isinstance(data[section], dict):
+            if section not in data:
+                continue
+            value = data[section]
+            if value is None:
+                if section == "training":
+                    # Explicit `training: null` -- disables the stage,
+                    # exactly like never having configured it (AC4).
+                    cfg.training = None
+                continue
+            if not isinstance(value, dict):
                 continue
             current = getattr(cfg, attr, None)
             if current is None:
                 current = dc_cls()
                 setattr(cfg, attr, current)
-            _set_known_fields(current, data[section])
+            _set_known_fields(current, value)
     else:
-        # Flat layout: treat all top-level keys as training-section keys.
-        _set_known_fields(cfg.training, data)
+        # Flat layout: no section-wrapper key present, so by construction
+        # this can only be training keys (default.yaml's shape) -- but only
+        # actually training intent if at least one key is real training
+        # config, not e.g. an empty file or one full of typos/unknown keys.
+        if any(k in _TRAINING_FIELD_NAMES for k in data):
+            if cfg.training is None:
+                cfg.training = TrainingConfig()
+            _set_known_fields(cfg.training, data)
 
     return cfg
 
@@ -1621,9 +1674,23 @@ def build_arg_parser() -> "argparse.ArgumentParser":
     parser = argparse.ArgumentParser(description="Training + Quantization Pipeline")
     parser.add_argument("--config", type=str, help="YAML config file")
     parser.add_argument("--output-dir", type=str, default="./output")
-    parser.add_argument("--model", type=str)
-    parser.add_argument("--dataset", type=str, help="Single dataset (local path or HF ID)")
-    parser.add_argument("--datasets", nargs="+", help="Multiple datasets (local paths or HF IDs)")
+    parser.add_argument("--model", type=str,
+                        help="Model name/path -- applies to the training stage when it's "
+                             "enabled (--train, --dataset(s), or a training: YAML section). "
+                             "Does NOT by itself enable training (Foundry #3) -- other "
+                             "stages take their own source model (--magicquant-source-model, "
+                             "--rocmfpx-source-model, or an existing run directory).")
+    parser.add_argument("--train", action="store_true",
+                        help="Explicitly enable the training stage (off by default -- "
+                             "Foundry #3). Also implied by --dataset/--datasets, since "
+                             "no other stage consumes a dataset.")
+    parser.add_argument("--no-training", action="store_true",
+                        help="Explicitly disable the training stage, overriding --train, "
+                             "--dataset(s), and any YAML training: section for this run.")
+    parser.add_argument("--dataset", type=str, help="Single dataset (local path or HF ID) "
+                        "-- implies --train unless --no-training is also given")
+    parser.add_argument("--datasets", nargs="+", help="Multiple datasets (local paths or HF "
+                        "IDs) -- implies --train unless --no-training is also given")
     parser.add_argument("--no-export", action="store_true")
     parser.add_argument("--heretic", action="store_true", help="Enable heretic abliteration stage")
     parser.add_argument("--no-heretic", action="store_true", help="Disable heretic abliteration stage")
@@ -1796,12 +1863,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.config:
         load_yaml_into_config(args.config, cfg)
 
-    if args.model:
-        cfg.training.model_name = args.model
-    if args.datasets:
-        cfg.training.datasets = args.datasets
-    elif args.dataset:
-        cfg.training.datasets = [args.dataset]
+    # Training is genuinely optional (Foundry #3): enabled only by explicit
+    # intent -- --train, a --dataset/--datasets value (training-specific;
+    # no other stage consumes a dataset), or a YAML training section/flat
+    # training file loaded above. --model alone does NOT enable training
+    # (a quantize-only invocation naming --model <repo> as the thing to
+    # quantize must not silently start a QLoRA run on it -- the incident
+    # this issue exists to close) -- it only customizes training when it's
+    # otherwise enabled. --no-training always wins, overriding all of the above.
+    wants_training = args.train or bool(args.datasets) or bool(args.dataset)
+    if wants_training and not args.no_training and cfg.training is None:
+        cfg.training = TrainingConfig()
+    if args.no_training:
+        cfg.training = None
+
+    if cfg.training is not None:
+        if args.model:
+            cfg.training.model_name = args.model
+        if args.datasets:
+            cfg.training.datasets = args.datasets
+        elif args.dataset:
+            cfg.training.datasets = [args.dataset]
+
     if args.no_export:
         cfg.export = None
     if args.heretic and not args.no_heretic:
@@ -1904,8 +1987,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             else:
                 print("ERROR: --dry-run requires --upload-to <repo_id>")
                 return 1
+        # A dry run that doesn't say which stages will execute is checking
+        # the wrong thing (Foundry #3, AC2) -- print the SAME resolved stage
+        # list run_pipeline() would log for a real run of this exact config.
+        enabled = _compute_enabled_stages(cfg)
+        stage_plan = [s for s, _ in STAGES if s in enabled]
+        print(f"Pipeline: {' → '.join(stage_plan)}")
         artifacts = Artifacts(cfg.output_dir)
-        report = stage_upload_dry_run(cfg, artifacts, _default_log, enabled=_compute_enabled_stages(cfg))
+        report = stage_upload_dry_run(cfg, artifacts, _default_log, enabled=enabled)
         return 0 if report and report.ok else 1
 
     results = run_pipeline(
