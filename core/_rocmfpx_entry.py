@@ -979,9 +979,28 @@ def run(cfg_path: str | None = None) -> None:
     # ppl_smoke module docstring for the incident this closes). Advisory on
     # unknown binary/corpus; a completed run that comes back pathological
     # hard-fails the stage before upload.
+    #
+    # smoke_reasons captures each FAILED file's reason via the log callback
+    # (rather than re-running the smoke test) so the file can be quarantined
+    # with its actual failure reason recorded (Foundry #2) -- upload discovers
+    # GGUFs by glob("*.gguf") with no smoke-status filter, so a failed file
+    # left in place is publishable by any later upload-only run.
     perplexity_bin = ppl_smoke.find_perplexity_bin(rocmfpx_dir)
-    failed = [p for p in produced if not ppl_smoke.smoke_test_gguf(perplexity_bin, Path(p))]
+    smoke_reasons: dict[str, str] = {}
+
+    def _smoke_log(msg: str, _reasons=smoke_reasons) -> None:
+        print(msg, flush=True)
+        prefix = "PPL smoke test FAILED: "
+        if msg.startswith(prefix):
+            name, _, reason = msg[len(prefix):].partition(" -- ")
+            _reasons[name] = reason
+
+    failed = [p for p in produced if not ppl_smoke.smoke_test_gguf(perplexity_bin, Path(p), log=_smoke_log)]
     if failed:
+        for p in failed:
+            path = Path(p)
+            reason = smoke_reasons.get(path.name, "PPL smoke test failed (reason unavailable)")
+            ppl_smoke.quarantine_gguf(path, reason)
         print(
             f"Error: PPL smoke test FAILED for {len(failed)}/{len(produced)} "
             f"file(s): {[Path(p).name for p in failed]} -- aborting before "
