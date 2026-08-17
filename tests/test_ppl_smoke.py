@@ -9,6 +9,7 @@ real subprocess is ever spawned here, matching _rocmfpx_entry's own
 no-real-checkout test discipline).
 """
 
+import json
 import math
 from pathlib import Path
 
@@ -278,3 +279,107 @@ def test_smoke_test_gguf_default_log_uses_print(tmp_path, capsys):
     ppl_smoke.smoke_test_gguf(None, gguf)
     out = capsys.readouterr().out
     assert "SKIPPED" in out
+
+
+# ── quarantine_gguf (Foundry #2) ─────────────────────────────────────────────
+#
+# The smoke gate above only decides pass/fail; it never touches the file.
+# quarantine_gguf is what actually keeps a failed file out of
+# hf_upload.discover_upload_files's glob("*.gguf") reach -- see
+# tests/test_smoke_quarantine.py for the entry-module (_rocmfpx_entry /
+# _magicquant_entry) wiring and the discover_upload_files integration.
+
+def test_quarantine_gguf_renames_with_failed_smoke_suffix(tmp_path):
+    gguf = tmp_path / "model-Q4.gguf"
+    gguf.write_bytes(b"fake gguf bytes")
+
+    result = ppl_smoke.quarantine_gguf(gguf, "PPL 999.00 exceeds threshold 100.0")
+
+    assert result == tmp_path / "model-Q4.gguf.failed-smoke"
+    assert result.exists()
+    assert not gguf.exists()
+    assert result.read_bytes() == b"fake gguf bytes"
+
+
+def test_quarantine_gguf_writes_reason_and_timestamp_sidecar(tmp_path):
+    gguf = tmp_path / "model-Q4.gguf"
+    gguf.write_bytes(b"x")
+
+    result = ppl_smoke.quarantine_gguf(gguf, "PPL 999.00 exceeds threshold 100.0")
+
+    sidecar = tmp_path / "model-Q4.gguf.failed-smoke.json"
+    assert sidecar.exists()
+    record = json.loads(sidecar.read_text())
+    assert record["original_name"] == "model-Q4.gguf"
+    assert record["reason"] == "PPL 999.00 exceeds threshold 100.0"
+    # Parseable ISO-8601 UTC timestamp -- doesn't raise.
+    from datetime import datetime as _dt
+    _dt.fromisoformat(record["quarantined_at"])
+
+
+def test_quarantine_gguf_no_longer_matches_gguf_glob(tmp_path):
+    gguf = tmp_path / "model-Q4.gguf"
+    gguf.write_bytes(b"x")
+    ppl_smoke.quarantine_gguf(gguf, "some reason")
+    assert list(tmp_path.glob("*.gguf")) == []
+
+
+def test_quarantine_gguf_logs_via_provided_callback(tmp_path):
+    gguf = tmp_path / "model-Q4.gguf"
+    gguf.write_bytes(b"x")
+    logs = []
+    ppl_smoke.quarantine_gguf(gguf, "some reason", log=logs.append)
+    assert any("Quarantined smoke-failed GGUF" in m for m in logs)
+    assert any("model-Q4.gguf" in m and "model-Q4.gguf.failed-smoke" in m for m in logs)
+
+
+def test_quarantine_gguf_default_log_uses_print(tmp_path, capsys):
+    gguf = tmp_path / "model-Q4.gguf"
+    gguf.write_bytes(b"x")
+    ppl_smoke.quarantine_gguf(gguf, "some reason")
+    out = capsys.readouterr().out
+    assert "Quarantined smoke-failed GGUF" in out
+
+
+def test_quarantine_gguf_rename_failure_is_advisory_not_raising(tmp_path, monkeypatch):
+    """A rename that fails (permission error, cross-device, ...) must log and
+    return the ORIGINAL path rather than raise -- matching publish_records.py's
+    fail-safe write philosophy. The caller's sys.exit(1) right after is still
+    the real safety backstop."""
+    gguf = tmp_path / "model-Q4.gguf"
+    gguf.write_bytes(b"x")
+
+    def _boom(self, target):
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(Path, "rename", _boom)
+    logs = []
+    result = ppl_smoke.quarantine_gguf(gguf, "some reason", log=logs.append)
+
+    assert result == gguf
+    assert gguf.exists()  # untouched, still a normal .gguf
+    assert any("WARNING" in m and "could not quarantine" in m for m in logs)
+
+
+def test_quarantine_gguf_sidecar_write_failure_is_advisory_not_raising(tmp_path, monkeypatch):
+    """A sidecar write failure (full disk, ...) after a successful rename must
+    log and still return the QUARANTINED path -- the file already left the
+    glob's reach, which is the property that matters most."""
+    gguf = tmp_path / "model-Q4.gguf"
+    gguf.write_bytes(b"x")
+
+    real_write_text = Path.write_text
+
+    def _boom(self, *a, **k):
+        if self.name.endswith(".json"):
+            raise OSError("simulated disk full")
+        return real_write_text(self, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", _boom)
+    logs = []
+    result = ppl_smoke.quarantine_gguf(gguf, "some reason", log=logs.append)
+
+    assert result == tmp_path / "model-Q4.gguf.failed-smoke"
+    assert result.exists()
+    assert not gguf.exists()
+    assert any("WARNING" in m and "sidecar" in m for m in logs)

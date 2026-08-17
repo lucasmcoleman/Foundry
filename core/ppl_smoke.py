@@ -28,10 +28,12 @@ import discipline.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
@@ -39,6 +41,13 @@ from typing import Callable, Optional, Tuple
 SKIP_ENV = "FOUNDRY_SKIP_SMOKE_PPL"
 CORPUS_ENV = "FOUNDRY_SMOKE_CORPUS"
 THRESHOLD_ENV = "FOUNDRY_SMOKE_PPL_MAX"
+
+# Suffix appended to a smoke-failed GGUF's filename (Foundry #2). Chosen over
+# a `_quarantine/` subdir move: it needs no directory bookkeeping, and it
+# removes the file from `glob("*.gguf")` -- the exact predicate
+# hf_upload.discover_upload_files uses -- with no change to that module at
+# all. The reason sidecar rides alongside it under the same rule.
+QUARANTINE_SUFFIX = ".failed-smoke"
 
 DEFAULT_CORPUS = "/server/ai/wikitext/wikitext-2-raw/wiki.test.raw"
 # Healthy quants land in the single/low-double digits on wikitext; the known
@@ -236,3 +245,60 @@ def smoke_test_gguf(
         if tail:
             log(f"  llama-perplexity output (tail):\n{tail}")
     return ok
+
+
+# ── quarantine (Foundry #2) ─────────────────────────────────────────────────
+#
+# The smoke gate above always hard-aborts on failure (sys.exit(1) in both
+# _magicquant_entry.run() and _rocmfpx_entry.run()), which stops the CURRENT
+# run's upload -- but it never touched the file itself.
+# hf_upload.discover_upload_files finds GGUFs by glob("*.gguf") with no
+# smoke-status filter, so the failed file was still sitting in
+# magicquant/ or rocmfpx/ where any LATER upload-only run (e.g.
+# enabled_stages: ["upload"] alone) would happily discover and publish it.
+# docs/decisions/rocmfpx-stage-failure-handling.md names this precisely:
+# "quarantine the bad file and continue" -- never "ship it anyway".
+
+def quarantine_gguf(
+    gguf_path: Path, reason: str, *, log: Optional[Callable[[str], None]] = None,
+) -> Path:
+    """Move a smoke-failed GGUF out of upload discovery's reach.
+
+    Renames ``<name>.gguf`` -> ``<name>.gguf.failed-smoke``, which drops it
+    out of ``glob("*.gguf")`` with no change needed to
+    ``hf_upload.discover_upload_files``, and writes a JSON sidecar
+    (``<name>.gguf.failed-smoke.json``) recording the failure reason and a
+    UTC timestamp -- so the file stays on disk, at a discoverable location,
+    for a human to inspect (never deleted).
+
+    Advisory, matching ``publish_records.py``'s writers: a rename or sidecar
+    write that fails (read-only dir, full disk, ...) logs a warning and
+    returns the ORIGINAL path rather than raising. The stage's
+    ``sys.exit(1)`` right after this call is the real safety backstop either
+    way -- a failed quarantine never turns into a shipped file, it just means
+    the file wasn't moved out of the glob's path THIS time.
+    """
+    if log is None:
+        log = lambda msg: print(msg, flush=True)  # noqa: E731
+
+    quarantined = gguf_path.with_name(gguf_path.name + QUARANTINE_SUFFIX)
+    try:
+        gguf_path.rename(quarantined)
+    except OSError as e:
+        log(f"WARNING: could not quarantine {gguf_path.name}: {e} "
+            "(file left in place -- upload discovery may still find it)")
+        return gguf_path
+
+    sidecar = quarantined.with_name(quarantined.name + ".json")
+    record = {
+        "original_name": gguf_path.name,
+        "reason": reason,
+        "quarantined_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        sidecar.write_text(json.dumps(record, indent=2) + "\n")
+    except OSError as e:
+        log(f"WARNING: could not write quarantine sidecar {sidecar.name}: {e}")
+
+    log(f"Quarantined smoke-failed GGUF: {gguf_path.name} -> {quarantined.name}")
+    return quarantined
