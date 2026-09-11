@@ -327,13 +327,19 @@ def _ensure_bf16_gguf(llamacpp_dir: str, source: str, out_dir: Path,
     converter's directory-name fallback (run dirs stage the checkpoint under
     a literal ``source/`` directory, which otherwise leaks into the metadata
     as ``general.name = "Source"``). ``None`` preserves old behavior."""
-    import subprocess
+    try:
+        from conversion_source import bf16_conversion_policy, cached_bf16_matches, run_bf16_conversion
+    except ImportError:
+        from .conversion_source import bf16_conversion_policy, cached_bf16_matches, run_bf16_conversion
     if source.endswith(".gguf"):
         return source
     cached = out_dir / "model-bf16.gguf"
-    if cached.exists():
+    policy = bf16_conversion_policy(source)
+    if cached_bf16_matches(cached, policy):
         print(f"Reusing cached BF16 GGUF: {cached}", flush=True)
         return str(cached)
+    if cached.exists():
+        print("Cached BF16 GGUF lacks a matching Qwen MTP conversion receipt; reconverting", flush=True)
     convert_script = _find_convert_script(llamacpp_dir)
     if convert_script is None:
         raise RuntimeError(
@@ -347,9 +353,7 @@ def _ensure_bf16_gguf(llamacpp_dir: str, source: str, out_dir: Path,
     ]
     if model_name:
         argv += ["--model-name", model_name]
-    rc = subprocess.run(argv).returncode
-    if rc != 0 or not cached.exists():
-        raise RuntimeError(f"convert_hf_to_gguf.py failed (exit code {rc})")
+    run_bf16_conversion(argv, cached, policy)
     return str(cached)
 
 

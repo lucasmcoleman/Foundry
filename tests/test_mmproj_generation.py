@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
 import _magicquant_entry as mq  # noqa: E402
+from conftest import fake_quantized_gguf  # noqa: E402
 
 
 def _write(d: Path, name: str, obj) -> None:
@@ -141,7 +142,7 @@ def test_ensure_bf16_gguf_includes_model_name_flag_when_given(tmp_path, monkeypa
     def fake_run(argv, *a, **k):
         called["argv"] = argv
         outfile = Path(argv[argv.index("--outfile") + 1])
-        outfile.write_bytes(b"GGUF")
+        fake_quantized_gguf(outfile)
         class R: returncode = 0
         return R()
     monkeypatch.setattr(mq, "_find_convert_script", lambda d: Path("/x/convert_hf_to_gguf.py"))
@@ -161,7 +162,7 @@ def test_ensure_bf16_gguf_omits_model_name_flag_when_not_given(tmp_path, monkeyp
     def fake_run(argv, *a, **k):
         called["argv"] = argv
         outfile = Path(argv[argv.index("--outfile") + 1])
-        outfile.write_bytes(b"GGUF")
+        fake_quantized_gguf(outfile)
         class R: returncode = 0
         return R()
     monkeypatch.setattr(mq, "_find_convert_script", lambda d: Path("/x/convert_hf_to_gguf.py"))

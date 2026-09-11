@@ -1,7 +1,64 @@
 # Nex-N2.5-mini ROCmFP4 interruption review
 
-Date: 2026-09-11. Review branch: `codex/rocmfpx-interruption-20260911`,
-based on the completed Foundry audit branch.
+Date: 2026-09-11. Initial review: `codex/rocmfpx-interruption-20260911`.
+Full-model follow-up: `codex/qwen-mtp-inventory-20260911`.
+
+## Current outcome
+
+The user-requested 6.9 GiB corrupt `.gguf.incomplete` file was deleted after
+checking its size, timestamp and zero header. The audit and interrupted-output
+fixes were merged and pushed to both repositories' default branch, `master`:
+MagicQuant `bf01f41`, Foundry `38445c3`. The idle Foundry service was restarted
+to activate them; authentication and saved configuration remained intact.
+
+The full retry converted all 733 tensors, without another SIGKILL, but native
+loading exposed a separate source-conversion bug: missing
+`blk.40.attn_norm.weight`. The checkpoint declares 40 main layers plus one MTP
+draft layer, yet all 1,026 source tensors contain **no MTP weights**. The
+converter had emitted `qwen35moe.block_count=41` and
+`qwen35moe.nextn_predict_layers=1` despite having no tensors for that layer.
+This explains the later load failure, not the original SIGKILL.
+
+Reconversion with the official `--no-mtp` option produced a correct 40-block
+BF16 source. All 733 output tensor names, types, shapes and byte counts were
+unchanged. The prior source was retained as `model-bf16.gguf.invalid-mtp`.
+The correction record is
+`output/Nex-N2.5-mini/_retest_20260911/source-correction.json`.
+
+The second complete UI retry **passed**, from 20:40:41 to 20:44:05 UTC:
+
+- Output: `output/Nex-N2.5-mini/rocmfpx/Nex-N2.5-mini-Q4_0_ROCMFP4.gguf`,
+  **23,341,397,600 bytes** (23.3 GB).
+- Total stage: **203.7 seconds**; native quantization: **178.305 seconds**.
+- Native loading and WikiText perplexity smoke: **6.16**, four chunks,
+  context 512, batch 512, microbatch 128.
+- Cgroup peak: **67.09 GiB**; minimum sampled host available memory:
+  **62.24 GiB**; no `high`, `max`, `oom`, or `oom_kill` events.
+- Evidence: `output/Nex-N2.5-mini/_retest_20260911_no_mtp/result.json`,
+  its adjacent resource samples, and `_stage_1789159241468373719.log`.
+
+The automatic follow-up checks safetensors headers and their shard index
+before selecting `--no-mtp`, refuses partial or ambiguous inventories, and
+preserves present MTP weights. Both BF16 entry helpers reject affected caches
+without a matching source/artifact receipt. Conversion output is staged and
+structurally validated before publication, with rollback if receipt publication
+fails. Receipts track local metadata and file identity, not cryptographic weight
+content or model quality. The corrected real cache was verified reusable through
+both helpers. Final offline validation: **1011 passed, 1 skipped**, plus required
+Pyflakes and diff checks.
+
+The native retry used Foundry `38445c3` and a manually corrected source; the
+automatic conversion policy was then verified separately against that source
+and with regression tests. The retry used converter checkout `0d313da` and
+native build 36 (`221402a`); no runtime rebuild was required.
+
+This artifact is the standalone ROCmFP4 preset. It is not a MagicQuant Q4
+search result and does not complete the requested six-variant campaign.
+Four-chunk perplexity establishes a smoke-test pass, not comprehensive quality,
+throughput, or vision support. No model was uploaded during this retest.
+
+The following sections retain the original investigation and its contemporaneous
+observations; the outcome above supersedes their pre-retry status.
 
 ## What happened
 
@@ -64,7 +121,7 @@ conversion use the safeguard. Failure diagnostics name terminating signals.
 These checks detect this failure mode; they do not replace native loading,
 perplexity, quality or throughput validation.
 
-## Before retrying or publishing
+## Initial retry recommendations (historical)
 
 - Run the reviewed code explicitly; the existing UI service still runs the
   original checkout. No production service was restarted by this review.
@@ -80,7 +137,7 @@ perplexity, quality or throughput validation.
   publish a successful Nex model. Vision support also needs a compatible
   projector; a text GGUF alone does not supply it.
 
-## Validation
+## Initial validation
 
 The full offline suite passed: **986 passed, 1 skipped**. The skip needs a
 historical model artifact. Required Pyflakes and `git diff --check` passed.
