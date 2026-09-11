@@ -20,7 +20,10 @@ import re
 import sys
 from pathlib import Path
 
-import ppl_smoke
+try:
+    import ppl_smoke
+except ModuleNotFoundError:  # Installed package, without core/ on sys.path.
+    from . import ppl_smoke
 
 ROCMFPX_REPO = "https://github.com/ciru-ai/ROCmFPX.git"
 ROCMFPX_PIN = "68f23f34c12d7e61177a034b0d8d3fea2129565e"  # laguna-capable; bump deliberately
@@ -891,7 +894,6 @@ def run(cfg_path: str | None = None) -> None:
     allow_requantize = cfg.get("allow_requantize", False)
     allow_partial = cfg.get("allow_partial", False)
 
-    import subprocess
 
     produced = []
     built_specs = []

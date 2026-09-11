@@ -26,7 +26,10 @@ import json
 import sys
 from pathlib import Path
 
-import ppl_smoke
+try:
+    import ppl_smoke
+except ModuleNotFoundError:  # Installed package, without core/ on sys.path.
+    from . import ppl_smoke
 
 LLAMACPP_REPO = "https://github.com/ggml-org/llama.cpp.git"
 LLAMACPP_PIN = "gguf-v0.19.0"  # known-good release tag; bump deliberately
@@ -523,12 +526,38 @@ def _run_budget(cfg: dict, source: str, llamacpp) -> str:
 
     final = Path(results["final_model"])
     target = final.parent / f"{cfg['model_name']}-{budget_tier_key(budget_gib)}.gguf"
-    # KNOWN DESYNC: run_budget_search() already wrote v2_results.json with
-    # "final_model" pointing at `final`'s pre-rename path; this rename makes
-    # that key stale (points at a now-nonexistent file). Nothing in Foundry
-    # reads v2_results.json's final_model back (checked), so left as-is --
-    # noted here rather than restructured.
-    final.rename(target)
+    # Keep the artifact and its machine-readable identity in sync. Both the
+    # top-level pointer and the budget anchor are consumed outside Foundry.
+    results["final_model"] = str(target)
+    for anchor in results.get("anchors", []):
+        if anchor.get("path") == str(final):
+            anchor["path"] = str(target)
+    import tempfile
+
+    result_path = out_dir / "v2_results.json"
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=out_dir,
+        prefix=".v2_results-", suffix=".tmp", delete=False,
+    ) as handle:
+        pending = Path(handle.name)
+        try:
+            json.dump(results, handle, indent=2)
+            handle.write("\n")
+        except BaseException:
+            pending.unlink(missing_ok=True)
+            raise
+    try:
+        final.rename(target)
+        try:
+            pending.replace(result_path)
+        except OSError:
+            # Restore the path still named by the old sidecar if publishing
+            # the new metadata fails (e.g. an unexpected filesystem error).
+            if final != target:
+                target.rename(final)
+            raise
+    finally:
+        pending.unlink(missing_ok=True)
     print(f"  budget build: {target.name} "
           f"({target.stat().st_size / 1024**3:.2f} GiB)", flush=True)
     return str(target)

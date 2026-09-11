@@ -82,6 +82,53 @@ def _cfg(tmp_path, **over):
     return cfg
 
 
+def test_budget_rename_updates_persisted_artifact_references(monkeypatch, tmp_path):
+    import _magicquant_entry as entry
+
+    _install_fake_v2(monkeypatch, tmp_path)
+    fake = sys.modules["magicquant.v2"]
+    original_run = fake.run_budget_search
+
+    def produce_results(cfg):
+        result = original_run(cfg)
+        result["anchors"] = [
+            {"tag": "budget", "path": result["final_model"], "ppl": 5.1},
+            {"tag": "n1", "path": None, "ppl": 5.0},
+        ]
+        result["measurement"] = {"corpus": "held-out.txt"}
+        (tmp_path / "magicquant" / "v2_results.json").write_text(json.dumps(result))
+        return result
+
+    fake.run_budget_search = produce_results
+    final = entry._run_budget(_cfg(tmp_path), "source.gguf", None)
+    persisted = json.loads((tmp_path / "magicquant" / "v2_results.json").read_text())
+    assert persisted["final_model"] == final
+    assert persisted["anchors"][0]["path"] == final
+    assert Path(final).is_file()
+    assert persisted["anchors"][1]["path"] is None
+    assert persisted["measurement"] == {"corpus": "held-out.txt"}
+    assert not list((tmp_path / "magicquant").glob(".v2_results-*.tmp"))
+
+
+def test_budget_restores_original_path_if_metadata_publication_fails(monkeypatch, tmp_path):
+    import _magicquant_entry as entry
+
+    _install_fake_v2(monkeypatch, tmp_path)
+    original_replace = Path.replace
+
+    def denied_metadata(path, target):
+        if Path(target).name == "v2_results.json":
+            raise PermissionError("metadata unavailable")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", denied_metadata)
+    with pytest.raises(PermissionError, match="metadata unavailable"):
+        entry._run_budget(_cfg(tmp_path), "source.gguf", None)
+    assert (tmp_path / "magicquant" / "model-v2-budget-12.40gb.gguf").is_file()
+    assert not (tmp_path / "magicquant" / "TestModel-TIERKEY-12.5.gguf").exists()
+    assert not list((tmp_path / "magicquant").glob(".v2_results-*.tmp"))
+
+
 def test_budget_branch_maps_config_and_renames(monkeypatch, tmp_path, capsys):
     calls = _install_fake_v2(monkeypatch, tmp_path)
     from core import _magicquant_entry as entry
