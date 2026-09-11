@@ -1,4 +1,4 @@
-"""Hardened subprocess sandbox for executing untrusted candidate Python code.
+"""Resource-limited subprocess runner for candidate Python code.
 
 Threat model: a policy model reward-hacking the verifier (not weaponized
 malware). The decisive design choice: **expected outputs never enter the child
@@ -12,13 +12,18 @@ Additional layers:
 - payload (nonce + candidate source + test calls) is written into a pipe and
   fully drained by the runner before the candidate executes: nothing sensitive
   on disk, in argv, or in the environment.
-- result line must carry the nonce prefix; anything else on the result fd is
-  ignored (candidate writing garbage or premature "results" earns nothing).
+- result lines carry a nonce prefix to separate protocol traffic from noise.
+  This is NOT authentication: candidate code can inspect the runner's frames
+  and discover the nonce. Expected outputs stay exclusively in the parent.
 - rlimits: CPU, address space, file size, open files, NPROC=0 (fork fails).
 - socket module stubbed before candidate import (best effort; ctypes bypass is
   accepted residual risk and documented in docs/verifier-audits.md).
 - parent-side wall-clock deadline kills the whole process group.
 - child runs `python -S -s -B` with a scrubbed env and PYTHONHASHSEED=0.
+
+This runner is not a host-security boundary: candidate code retains the
+account's filesystem access and can bypass Python-level network stubs. Use
+OS/container isolation with no credentials or host mounts for untrusted code.
 """
 
 from __future__ import annotations
@@ -254,7 +259,12 @@ def run_calls(
         # Feed the payload from a thread (payload may exceed the pipe buffer).
         def _feed():
             try:
-                os.write(payload_w, payload)
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(payload_w, remaining)
+                    if written == 0:
+                        raise OSError("payload pipe made no progress")
+                    remaining = remaining[written:]
             except OSError:
                 pass
             finally:
@@ -309,14 +319,19 @@ def run_calls(
     if overflow:
         return SandboxOutcome(status="sandbox_error", error="result stream overflow")
 
-    # Only lines bearing the nonce are trusted.
+    # The nonce identifies protocol lines; it is visible to candidate code.
     text = buf.decode("utf-8", errors="replace")
     trusted: Optional[dict] = None
     prefix = nonce + ":"
     for line in text.splitlines():
         if line.startswith(prefix):
             try:
-                trusted = json.loads(line[len(prefix):])
+                candidate = json.loads(line[len(prefix):])
+                if not isinstance(candidate, dict):
+                    continue
+                if not isinstance(candidate.get("results", []), list):
+                    continue
+                trusted = candidate
             except (json.JSONDecodeError, ValueError):
                 continue
     if trusted is None:

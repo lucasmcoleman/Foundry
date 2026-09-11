@@ -1,5 +1,16 @@
 # Verifier Adversarial Audits
 
+> **2026-09-10 correction:** the nonce is visible to candidate code through
+> the runner's active Python frames. X-5's original "BY DESIGN" claim below
+> is withdrawn: it separates protocol traffic from noise, not candidate
+> code from the runner. Expected outputs remain in the parent, which is a
+> useful independent protection. The subprocess still shares its host
+> account's filesystem permissions; a scratch working directory and Python
+> socket stubs do not provide host isolation. Run unknown candidate code in
+> a disposable container/VM with no credentials, network, or host mounts.
+> The September audit added short-write handling and malformed-protocol
+> regression tests; it did not implement that OS isolation boundary.
+
 Mission item 4: after building each verifier, adversarially attack it — generate
 responses that maximize reward while violating intent, patch the verifier, and
 document every exploit. The guiding principle: **a reward function is a security
