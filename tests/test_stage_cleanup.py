@@ -5,7 +5,6 @@ failure. Also asserts the llama.cpp clone is pinned and the heretic selection is
 the simplified Pareto-min.
 """
 
-import sys
 
 import pipeline
 

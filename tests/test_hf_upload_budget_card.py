@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
 
 from hf_upload import audit_card_against_repo, generate_model_card
 
-from conftest import GIB_96 as _96_GIB, fake_gguf as _fake_gguf, hf_upload_cfg as _cfg
+from conftest import fake_gguf as _fake_gguf, hf_upload_cfg as _cfg
 
 
 def _bullet_lines(section: str) -> list:

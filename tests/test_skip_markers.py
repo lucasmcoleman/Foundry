@@ -6,7 +6,6 @@ gate requires a valid marker, a matching config hash, and a present + non-empty
 key file.
 """
 
-from pathlib import Path
 
 import markers
 

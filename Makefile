@@ -1,31 +1,26 @@
-.PHONY: install test lint format build docker-build docker-up clean
+.PHONY: install test test-integration lint format build docker-build docker-up docker-down clean
+
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
 install:
-	pip install -e ".[dev]"
+	$(PYTHON) -m pip install -e ".[dev]"
 
 test:
-	python -m pytest tests/ -v --ignore=tests/test_training_integration.py -m "not slow and not gpu"
+	$(PYTHON) -m pytest tests/ -v --ignore=tests/test_training_integration.py -m "not slow and not gpu"
+	$(PYTHON) -m pytest foundry_gym/tests/ -q
 
 test-integration:
-	python -m pytest tests/test_training_integration.py -v
+	$(PYTHON) -m pytest tests/test_training_integration.py -v
 
 lint:
-	python -m py_compile core/pipeline.py
-	python -m py_compile core/services.py
-	python -m py_compile core/fast_train_zeroclaw.py
-	python -m py_compile core/fast_export.py
-	python -m py_compile core/hf_upload.py
-	python -m py_compile core/markers.py
-	python -m py_compile core/preflight.py
-	python -m py_compile core/reap_common.py
-	python -m py_compile core/serving.py
-	python -m py_compile ui/app.py
+	$(PYTHON) -m compileall -q core/ ui/
+	$(PYTHON) -m ruff check --select F core/ ui/ tests/ tools/check_wheel.py
 
 format:
-	@echo "No formatter configured — add ruff or black to dev deps"
+	$(PYTHON) -m ruff format core/ ui/ tests/
 
 build:
-	python -m build
+	$(PYTHON) -m build
 
 docker-build:
 	docker compose build

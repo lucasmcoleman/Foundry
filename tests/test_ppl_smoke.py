@@ -305,7 +305,7 @@ def test_quarantine_gguf_writes_reason_and_timestamp_sidecar(tmp_path):
     gguf = tmp_path / "model-Q4.gguf"
     gguf.write_bytes(b"x")
 
-    result = ppl_smoke.quarantine_gguf(gguf, "PPL 999.00 exceeds threshold 100.0")
+    ppl_smoke.quarantine_gguf(gguf, "PPL 999.00 exceeds threshold 100.0")
 
     sidecar = tmp_path / "model-Q4.gguf.failed-smoke.json"
     assert sidecar.exists()

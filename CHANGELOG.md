@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added (2026-09-10 audit)
+
+- CI covers Python 3.10/3.12, required Pyflakes, the Gym suite, a CPU
+  training/export lane, and isolated built-wheel installation. Package data now
+  includes the UI HTML, declares HTTP dependencies, and excludes operator
+  settings. Makefile commands use an explicit/local virtualenv and real
+  formatting/build targets; unused-name findings were removed narrowly.
+  Files: `.github/workflows/ci.yml`, `pyproject.toml`, `Makefile`,
+  `tools/check_wheel.py`, import/lint cleanup in `core/` and `tests/`.
+  Validation: sdist/wheel build and isolated console/UI/worker smoke passed;
+  Pyflakes, compilation, YAML parsing, and `git diff --check` passed.
+
 ### Fixed (2026-09-10 audit)
 
 - UI rendering escapes saved values and history names; REST/WebSocket origin

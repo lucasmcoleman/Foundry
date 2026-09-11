@@ -4,7 +4,6 @@ Uses FastAPI's TestClient (httpx) — no network/GPU. The auth dependency reads
 the module-global API_KEY, so we patch it per test.
 """
 
-import importlib
 
 import pytest
 from fastapi.testclient import TestClient

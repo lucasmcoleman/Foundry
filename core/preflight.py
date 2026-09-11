@@ -22,7 +22,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 LogFn = Callable[[str, str], None]
 

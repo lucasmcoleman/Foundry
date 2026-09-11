@@ -4,7 +4,6 @@ Real subprocess (a short `sleep`); no GPU. Verifies the deadline kills a wedged
 stage and returns non-zero.
 """
 
-import os
 import sys
 import time
 

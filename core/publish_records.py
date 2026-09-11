@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
 
 MEASUREMENTS_FILENAME = "_measurements.json"
 # Must match core/_rocmfpx_entry.py's REFUSALS_FILENAME -- duplicated as a
