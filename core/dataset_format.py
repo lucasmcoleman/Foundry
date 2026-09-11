@@ -153,6 +153,59 @@ def messages_to_text(messages: list[dict[str, str]], tokenizer) -> str:
     )
 
 
+def tokenize_training_example(messages, tokenizer, max_length, *, completion_only=True):
+    """Build explicit TRL completion masks; a text column alone never masks.
+
+    Chat templates must render completed turns as stable prefixes of the full
+    conversation. Token offsets identify assistant content and its end-of-turn
+    suffix while excluding system, user, tool, and assistant-header tokens.
+    Unsupported templates and truncated examples with no target tokens fail
+    visibly instead of silently training on prompts or producing NaN loss.
+    Raw text intentionally uses ordinary language-model loss on every token.
+    """
+    text = messages_to_text(messages, tokenizer)
+    raw = len(messages) == 1 and messages[0].get("role") == RAW_TEXT_ROLE
+    spans = []
+    if completion_only and not raw:
+        for i, message in enumerate(messages):
+            if message.get("role") != "assistant":
+                continue
+            if not i:
+                raise ValueError("Assistant-only chat training requires a preceding prompt")
+            before = tokenizer.apply_chat_template(
+                messages[:i], tokenize=False, add_generation_prompt=True
+            )
+            after = messages_to_text(messages[:i + 1], tokenizer)
+            if not (after.startswith(before) and text.startswith(after)):
+                raise ValueError(
+                    "Chat template changes prior turns when rendering a prefix; "
+                    "cannot safely derive assistant-only loss masks"
+                )
+            spans.append((len(before), len(after)))
+        if not spans:
+            raise ValueError("Chat training example contains no assistant response")
+
+    try:
+        encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=bool(spans))
+    except (NotImplementedError, TypeError) as exc:
+        raise ValueError("Assistant-only loss masking requires a tokenizer with character offsets") from exc
+    input_ids = list(encoded["input_ids"])
+    if spans:
+        offsets = encoded["offset_mapping"]
+        mask = [int(end > start and any(start >= lo and end <= hi for lo, hi in spans))
+                for start, end in offsets]
+    else:
+        mask = [1] * len(input_ids)
+    token_length = len(input_ids)
+    input_ids, mask = input_ids[:max_length], mask[:max_length]
+    # The first label is shifted away by causal-LM loss; it cannot be the
+    # only surviving target after truncation.
+    if not any(mask[1:]):
+        raise ValueError("Training example has no target tokens after truncation; increase max_seq_length")
+    return {"text": text, "input_ids": input_ids, "completion_mask": mask,
+            "token_length": token_length}
+
+
 def normalize_dataset(rows, fmt: Optional[str] = None) -> list[dict]:
     """Normalize an iterable of raw examples to ``[{"messages": [...]}, ...]``.
 

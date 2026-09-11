@@ -457,6 +457,17 @@ def main(
     max_seq_length: int = 4096,
 ) -> None:
     """Run fast QLoRA training end-to-end as a standalone script."""
+    try:
+        from training_state import prepare_training_run
+    except ImportError:
+        from core.training_state import prepare_training_run
+    resume_checkpoint = prepare_training_run(output_dir, {
+        "model_name": model_id, "datasets": [dataset_path],
+        "lora_r": lora_r, "lora_alpha": lora_alpha, "lora_dropout": lora_dropout,
+        "num_epochs": num_epochs, "batch_size": batch_size, "grad_accum": grad_accum,
+        "learning_rate": learning_rate, "max_seq_length": max_seq_length,
+        "entry": "standalone",
+    })
     target_modules = [
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
@@ -499,11 +510,13 @@ def main(
     dataset = load_dataset("json", data_files=dataset_path, split="train")
     print(f"Dataset: {len(dataset)} examples")
 
+    try:
+        from dataset_format import tokenize_training_example
+    except ImportError:
+        from core.dataset_format import tokenize_training_example
+
     def fmt(ex):
-        ex["text"] = tokenizer.apply_chat_template(
-            ex["messages"], tokenize=False, add_generation_prompt=False,
-        )
-        return ex
+        return tokenize_training_example(ex["messages"], tokenizer, max_seq_length)
 
     dataset = dataset.map(fmt)
 
@@ -539,8 +552,6 @@ def main(
         train_dataset=dataset,
         args=training_args,
     )
-
-    resume_checkpoint = find_latest_checkpoint(output_dir)
 
     print("\nStarting training...")
     stats = trainer.train(resume_from_checkpoint=resume_checkpoint)

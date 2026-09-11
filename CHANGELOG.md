@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Fixed (2026-09-10 audit)
+
+- Training now supplies explicit assistant-token loss masks and rejects
+  targetless/truncated examples. Resume checks configuration, local inputs,
+  supervision schema, and checkpoint completeness before loading a model.
+  Streaming export validates adapter coverage/options/scaling, preserves
+  tokenizer assets, supports local safetensors and Hub-cache symlinks, and
+  protects same-source GGUF pass-through. Stage markers validate selected
+  inputs and complete artifact inventories before resuming or reporting success.
+  Files: `core/{dataset_format,_train_entry,fast_train_zeroclaw,fast_export,training_state,markers,pipeline}.py`;
+  regression tests in `tests/test_{training_loss_mask,training_resume_identity,marker_integrity,pipeline_artifact_integrity,streaming_export_integrity}.py`.
+  Validation: 35 CPU loss-mask/resume/PEFT-export tests passed; full offline
+  review verification is recorded in `docs/audits/2026-09-10-review.md`.
+  Legacy checkpoints without matching provenance require a new output directory;
+  unsupported adapter variants now fail explicitly instead of losing changes.
+
 ### Changed (behavior)
 - **CLI now enforces the system-memory OOM-freeze gate (user-confirmed
   behavior change):** `core/preflight.py`'s `check_system_memory` is the

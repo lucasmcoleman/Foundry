@@ -13,11 +13,11 @@ Key design decisions:
   - Auto-install llama.cpp if not found (needed by MagicQuant for perplexity probing)
 """
 
+import argparse
 import json
 import os
 import subprocess
 import sys
-import time
 from dataclasses import dataclass, field, fields as _dataclass_fields
 from pathlib import Path
 from typing import Optional
@@ -280,6 +280,7 @@ class UploadConfig:
     upload_lora: bool = False
     upload_merged: bool = False
     upload_gguf: bool = True
+    upload_dataset: bool = False
 
 
 @dataclass
@@ -526,7 +527,7 @@ def _run_stage_script(
         # Record a completion marker when the key artifact is present + non-empty.
         if stage and stage_dir is not None and key_file is not None:
             kf = Path(key_file)
-            if kf.exists() and kf.stat().st_size > 0:
+            if _markers().artifacts_present(stage_dir, kf):
                 try:
                     _markers().write_marker(stage_dir, stage, kf, cfg_hash)
                 except OSError as e:
@@ -715,6 +716,8 @@ def _training_cfg_hash(config: PipelineConfig) -> str:
     tc = config.training
     return _markers().config_hash({
         "model_name": tc.model_name, "datasets": tc.datasets,
+        "model_fingerprint": _markers().source_fingerprint(tc.model_name),
+        "dataset_fingerprints": [_markers().source_fingerprint(p) for p in tc.datasets],
         "max_seq_length": tc.max_seq_length, "lora_r": tc.lora_r,
         "lora_alpha": tc.lora_alpha, "lora_dropout": tc.lora_dropout,
         "use_rslora": tc.use_rslora, "num_train_epochs": tc.num_train_epochs,
@@ -746,6 +749,7 @@ def stage_training(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     if _markers().is_stage_complete(artifacts.lora_dir, key_file, cfg_hash, force=force):
         log(f"Training already complete (marker matches) at {artifacts.lora_dir} — skipping", "success")
         return True
+    _markers().invalidate_marker(artifacts.lora_dir)
 
     # Validate dataset(s) before committing GPU time.
     if not validate_dataset(config.training.datasets, log):
@@ -785,8 +789,8 @@ def stage_training(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         log(f"Training failed (exit code {rc})", "error")
         return False
 
-    if not artifacts.lora_dir.exists():
-        log("LoRA adapters directory not found after training", "error")
+    if not _markers().artifacts_present(artifacts.lora_dir, key_file):
+        log("LoRA adapter weights missing or empty after training", "error")
         return False
 
     log("Training complete", "success")
@@ -827,12 +831,17 @@ def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         base_model_id = config.training.model_name if config.training else ""
 
     # Completion-marker resume: a merged_model dir with safetensors + a marker.
-    cfg_hash = _markers().config_hash({"base_model_id": base_model_id, "src": str(artifacts.lora_dir)})
+    cfg_hash = _markers().config_hash({
+        "base_model_id": base_model_id, "src": str(artifacts.lora_dir),
+        "source_fingerprint": _markers().source_fingerprint(artifacts.lora_dir),
+        "model_fingerprint": _markers().source_fingerprint(base_model_id),
+    })
     existing = sorted(artifacts.merged_dir.glob("*.safetensors")) if artifacts.merged_dir.exists() else []
     key_file = existing[0] if existing else (artifacts.merged_dir / "model.safetensors")
     if _markers().is_stage_complete(artifacts.merged_dir, key_file, cfg_hash, force=force):
         log(f"Export already complete (marker matches) at {artifacts.merged_dir} — skipping", "success")
         return True
+    _markers().invalidate_marker(artifacts.merged_dir)
 
     _preflight_stage("export", config, log, skip=skip_preflight)
     log("Merging LoRA to safetensors (streaming shard-by-shard)", "stage")
@@ -858,7 +867,7 @@ def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         log(f"Export failed (exit code {rc})", "error")
         return False
 
-    if artifacts.merged_dir.exists():
+    if _markers().artifacts_present(artifacts.merged_dir, _resolve_key()):
         # Write the completion marker now that the real artifact exists.
         kf = _resolve_key()
         if kf.exists() and kf.stat().st_size > 0:
@@ -868,7 +877,7 @@ def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
                 log(f"Could not write completion marker: {e}", "warn")
         log(f"Merged safetensors ready at {artifacts.merged_dir}", "success")
     else:
-        log("Merged model directory not found after export", "error")
+        log("Merged model weights missing, empty, or incomplete after export", "error")
         return False
 
     log("Export complete", "success")
@@ -903,6 +912,7 @@ def stage_heretic(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     cfg_hash = _markers().config_hash({
         "src": str(artifacts.merged_dir), "n_trials": hc.n_trials,
+        "source_fingerprint": _markers().source_fingerprint(artifacts.merged_dir),
         "n_startup_trials": hc.n_startup_trials, "quantization": hc.quantization,
         "kl_divergence_scale": hc.kl_divergence_scale,
         "orthogonalize_direction": hc.orthogonalize_direction,
@@ -913,6 +923,7 @@ def stage_heretic(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     if _markers().is_stage_complete(artifacts.heretic_dir, key_file, cfg_hash, force=force):
         log(f"Heretic already complete (marker matches) at {artifacts.heretic_dir} \u2014 skipping", "success")
         return True
+    _markers().invalidate_marker(artifacts.heretic_dir)
 
     _preflight_stage("heretic", config, log, skip=skip_preflight)
     log("Starting heretic abliteration", "stage")
@@ -944,6 +955,9 @@ def stage_heretic(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     st = sorted(artifacts.heretic_dir.glob("*.safetensors"))
     kf = st[0] if st else key_file
+    if not _markers().artifacts_present(artifacts.heretic_dir, kf):
+        log("Heretic model weights missing, empty, or incomplete", "error")
+        return False
     if kf.exists() and kf.stat().st_size > 0:
         try:
             _markers().write_marker(artifacts.heretic_dir, "heretic", kf, cfg_hash)
@@ -1003,6 +1017,7 @@ def stage_reap(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     rc = config.reap
     cfg_hash = _markers().config_hash({
         "src": str(source_path), "compression_ratio": rc.compression_ratio,
+        "source_fingerprint": _markers().source_fingerprint(source_path),
         "prune_method": rc.prune_method, "samples_per_category": rc.samples_per_category,
         "model_max_length": rc.model_max_length, "dataset_name": rc.dataset_name,
         "seed": rc.seed,
@@ -1012,6 +1027,7 @@ def stage_reap(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     if _markers().is_stage_complete(artifacts.reap_dir, key_file, cfg_hash, force=force):
         log(f"REAP already complete (marker matches) at {artifacts.reap_dir} \u2014 skipping", "success")
         return True
+    _markers().invalidate_marker(artifacts.reap_dir)
 
     # Check architecture support before launching a subprocess.
     arch = _detect_model_arch(source_path)
@@ -1053,6 +1069,9 @@ def stage_reap(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     st = sorted(artifacts.reap_dir.glob("*.safetensors"))
     kf = st[0] if st else key_file
+    if not _markers().artifacts_present(artifacts.reap_dir, kf):
+        log("REAP model weights missing, empty, or incomplete", "error")
+        return False
     if kf.exists() and kf.stat().st_size > 0:
         try:
             _markers().write_marker(artifacts.reap_dir, "reap", kf, cfg_hash)
@@ -1122,6 +1141,9 @@ def stage_qat(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     cfg_hash = _markers().config_hash({
         "model": source_model, "config": str(config_source), "tier": qc.tier,
+        "model_fingerprint": _markers().source_fingerprint(source_model),
+        "config_fingerprint": _markers().source_fingerprint(config_source),
+        "dataset_fingerprint": _markers().source_fingerprint(qc.dataset),
         "dataset": qc.dataset, "lora_r": qc.lora_r, "lora_alpha": qc.lora_alpha,
         "epochs": qc.epochs, "max_steps": qc.max_steps, "lr": qc.lr,
         "max_seq_len": qc.max_seq_len,
@@ -1130,6 +1152,7 @@ def stage_qat(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     if _markers().is_stage_complete(artifacts.qat_dir, key_file, cfg_hash, force=force):
         log(f"QAT already complete (marker matches) at {artifacts.qat_dir} — skipping", "success")
         return True
+    _markers().invalidate_marker(artifacts.qat_dir)
 
     _preflight_stage("qat", config, log, skip=skip_preflight)
 
@@ -1156,8 +1179,8 @@ def stage_qat(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         log(f"QAT failed (exit code {rc})", "error")
         return False
 
-    if not key_file.exists():
-        log("QAT output (qat_meta.json) not found after run", "error")
+    if not _markers().artifacts_present(artifacts.qat_dir, key_file):
+        log("QAT output (qat_meta.json) missing or empty after run", "error")
         return False
     try:
         _markers().write_marker(artifacts.qat_dir, "qat", key_file, cfg_hash)
@@ -1206,6 +1229,9 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     cfg_hash = _markers().config_hash({
         "src": str(source), "generations": mc.generations,
+        "source_fingerprint": _markers().source_fingerprint(source),
+        "imatrix_fingerprint": _markers().source_fingerprint(mc.imatrix_corpus),
+        "calibration_fingerprint": _markers().source_fingerprint(mc.calibration_source),
         "population_size": mc.population_size, "target_base_quant": mc.target_base_quant,
         "tiers": mc.tiers, "verify": mc.verify,
         "measured": mc.measured, "measurement_rounds": mc.measurement_rounds,
@@ -1228,6 +1254,7 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     if _markers().is_stage_complete(artifacts.magicquant_dir, key_file, cfg_hash, force=force):
         log(f"MagicQuant already complete (marker matches) at {artifacts.magicquant_dir} — skipping", "success")
         return True
+    _markers().invalidate_marker(artifacts.magicquant_dir)
 
     _preflight_stage("magicquant", config, log, skip=skip_preflight)
 
@@ -1279,8 +1306,8 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         return False
 
     ggufs = sorted(artifacts.magicquant_dir.glob("*.gguf")) if artifacts.magicquant_dir.exists() else []
-    if not ggufs:
-        log("No GGUF files produced by MagicQuant", "error")
+    if not ggufs or not _markers().artifacts_present(artifacts.magicquant_dir, ggufs[0]):
+        log("No complete, nonempty GGUF files produced by MagicQuant", "error")
         return False
     for p in ggufs:
         log(f"  {p.name} ({p.stat().st_size / 1e9:.1f} GB)")
@@ -1326,6 +1353,11 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
 
     cfg_hash = _markers().config_hash({
         "src": str(source), "formats": rc_cfg.formats, "imatrix": rc_cfg.imatrix,
+        "source_fingerprint": _markers().source_fingerprint(source),
+        "imatrix_fingerprint": _markers().source_fingerprint(rc_cfg.imatrix),
+        "search_fingerprint": _markers().source_fingerprint(
+            artifacts.magicquant_dir / "search_results.json"
+        ) if any(f.startswith("mq-") for f in rc_cfg.formats) else None,
         "allow_requantize": rc_cfg.allow_requantize,
         "allow_partial": rc_cfg.allow_partial,
     })
@@ -1334,6 +1366,7 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     if _markers().is_stage_complete(artifacts.rocmfpx_dir, key_file, cfg_hash, force=force):
         log(f"ROCmFPX already complete (marker matches) at {artifacts.rocmfpx_dir} — skipping", "success")
         return True
+    _markers().invalidate_marker(artifacts.rocmfpx_dir)
 
     _preflight_stage("rocmfpx", config, log, skip=skip_preflight)
 
@@ -1374,6 +1407,9 @@ def stage_rocmfpx(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         # gated on ggufs being non-empty.
         log("No GGUF files produced by ROCmFPX", "warn")
         return True
+    if not _markers().artifacts_present(artifacts.rocmfpx_dir, ggufs[0]):
+        log("ROCmFPX produced empty or incomplete GGUF files", "error")
+        return False
     for p in ggufs:
         log(f"  {p.name} ({p.stat().st_size / 1e9:.1f} GB)")
     try:
@@ -1411,7 +1447,10 @@ def _build_hf_upload_config(config: PipelineConfig, log: LogFn, enabled: set = N
                  distinguishes ran-vs-not, and every `tc.*` read below is
                  None-guarded rather than assuming training always ran.
     """
-    from hf_upload import HFUploadConfig
+    try:
+        from hf_upload import HFUploadConfig
+    except ModuleNotFoundError:
+        from core.hf_upload import HFUploadConfig
 
     uc = config.upload
     if not uc or not uc.repo_id:
@@ -1444,6 +1483,7 @@ def _build_hf_upload_config(config: PipelineConfig, log: LogFn, enabled: set = N
         upload_gguf=uc.upload_gguf,
         upload_lora=uc.upload_lora,
         upload_merged=uc.upload_merged,
+        upload_dataset=uc.upload_dataset,
         base_model=uc.base_model or model_name_fallback,
         dataset_name=tc.dataset_path if tc else "",
         did_training="training" in _enabled,
@@ -1470,7 +1510,10 @@ def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
     Delegates to hf_upload module for model card generation, progress
     reporting, and file upload. Supports dry-run mode via stage_upload_dry_run().
     """
-    from hf_upload import upload
+    try:
+        from hf_upload import upload
+    except ModuleNotFoundError:
+        from core.hf_upload import upload
 
     hf_cfg = _build_hf_upload_config(config, log, enabled)
     if hf_cfg is None:
@@ -1484,7 +1527,10 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
 
     Returns a DryRunReport (from hf_upload module).
     """
-    from hf_upload import dry_run
+    try:
+        from hf_upload import dry_run
+    except ModuleNotFoundError:
+        from core.hf_upload import dry_run
 
     hf_cfg = _build_hf_upload_config(config, log, enabled)
     if hf_cfg is None:
@@ -1837,6 +1883,8 @@ def build_arg_parser() -> "argparse.ArgumentParser":
                              "<out>/rocmfpx/_refusals.json. A silently-failed "
                              "format (no record) still aborts the run")
     parser.add_argument("--upload-to", type=str, help="HF repo ID")
+    parser.add_argument("--upload-dataset", action="store_true",
+                        help="Also publish the local training dataset (off by default)")
     parser.add_argument("--llamacpp-path", type=str)
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate upload credentials and show what would be uploaded (no actual upload)")
@@ -1976,6 +2024,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         cfg.rocmfpx = None
     if args.upload_to:
         cfg.upload = UploadConfig(repo_id=args.upload_to)
+    if args.upload_dataset:
+        if cfg.upload is None:
+            parser.error("--upload-dataset requires --upload-to or an upload configuration")
+        cfg.upload.upload_dataset = True
     if args.llamacpp_path and cfg.magicquant:
         cfg.magicquant.llamacpp_path = args.llamacpp_path
 
