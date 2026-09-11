@@ -103,6 +103,16 @@ and the WebSocket requires `?token=<key>` when `FOUNDRY_API_KEY` is set;
 `/health` and `/` stay unauthenticated. Set `FOUNDRY_REQUIRE_AUTH=1` to fail
 closed (require a key even on loopback).
 
+Browser REST and WebSocket requests must also come from an allowed origin.
+Set `FOUNDRY_UI_ORIGINS` to your comma-separated browser origins, including
+scheme and port, when using a different host or reverse proxy. UI settings are
+saved atomically to `~/.foundry/config.json`; set `FOUNDRY_CONFIG_PATH` to choose
+another location. Existing checkout-local `ui/config.json` is read as a fallback.
+Installed packages run jobs relative to the working directory; source checkouts
+retain their repository-root default. Set `FOUNDRY_WORK_DIR` to select a runtime
+root explicitly. Keep output paths inside that root. `FOUNDRY_OUTPUT_DIR` controls
+the backend default and history location; an explicit saved UI output path wins.
+
 ### Docker
 
 ```bash
@@ -110,16 +120,17 @@ closed (require a key even on loopback).
 docker compose build
 
 # Run
+export FOUNDRY_API_KEY="$(openssl rand -hex 24)"
 docker compose up -d
 
 # Access UI at http://localhost:7865
 ```
 
-The container binds `0.0.0.0` internally (the container is the boundary). The
-published port is reachable on the host's LAN with no auth by default — set
-`FOUNDRY_API_KEY` in the compose environment and/or access-control the published
-port before exposing it. The container healthcheck hits the unauthenticated
-`/health` endpoint so it stays green when a key is set.
+The container binds `0.0.0.0` internally. Compose publishes the UI on host
+loopback and requires authentication; configure `FOUNDRY_API_KEY` before use.
+Set `FOUNDRY_UI_BIND=0.0.0.0` explicitly to publish on the LAN, and configure
+`FOUNDRY_UI_ORIGINS` for the browser address. The unauthenticated `/health`
+endpoint checks process health; it does not prove authentication is configured.
 
 ## Configuration Reference
 
@@ -143,6 +154,9 @@ All settings can be configured via environment variables with `FOUNDRY_` prefix 
 | `FOUNDRY_HF_REPO_ID` | (empty) | HuggingFace repo for upload |
 | `FOUNDRY_HF_PRIVATE` | `true` | Create private HF repo |
 | `FOUNDRY_UI_PORT` | `7865` | Web UI port |
+| `FOUNDRY_CONFIG_PATH` | `~/.foundry/config.json` | Writable UI settings file |
+| `FOUNDRY_WORK_DIR` | Checkout root or installed working directory | UI job/data root |
+| `FOUNDRY_UI_ORIGINS` | Local host origins | Comma-separated allowed browser origins |
 | `FOUNDRY_DEVICE` | `cuda:0` | GPU device |
 | `HF_TOKEN` | (env/file) | HuggingFace token |
 
@@ -167,6 +181,12 @@ Router-weighted Expert Activation Pruning — removes a fraction of experts per 
 ### 5. QAT-LoRA (optional)
 Quantization-Aware Training. Freezes the base model, fake-quantizes it to MagicQuant's per-group hybrid config in the forward pass, and trains LoRA adapters that compensate (completion-only loss). The per-group config is read from a prior MagicQuant search's `search_results.json` (`--qat-config-source`, or auto-detected at `<output>/magicquant/search_results.json`); `--qat-tier` selects the tier to make the adapters robust to. Off by default; enable with `--qat --qat-dataset <chat.jsonl>`, or via the **QAT** card in the web UI. Runs `magicquant.qat.run_qat` (requires the MagicQuant `[qat]` extra) and writes adapters to `<output>/qat_adapters/`. Largest benefit at the aggressive tiers (Q2/Q3/MXFP4).
 
+**Integration limitation:** this stage saves adapters, but the subsequent Foundry
+quantization stage does not automatically consume them. Merge the adapters with
+the matching base using MagicQuant's QAT workflow, then explicitly select that
+merged source for quantization. A chained run alone does not establish that its
+final GGUF includes QAT.
+
 Validated (confound-controlled, Qwen2.5-0.5B base, aggressive Q4_K-attention/MXFP4-FFN hybrid): bf16 PPL 16.35, plain quant 19.54 (+3.19 damage), quant+QAT 15.13, bf16+identical-LoRA control 13.46. Holding the LoRA's domain adaptation fixed, the quant-vs-bf16 gap shrank +3.19 → +1.67 — **QAT recovered 47.5% of the quantization loss beyond plain LoRA domain adaptation**. The final GGUF pack is exact-ggml (byte-identical to llama.cpp); training uses a faithful torch fake-quant. Full methodology + caveats: MagicQuant's `docs/qat.md`.
 
 ### 6. MagicQuant
@@ -178,19 +198,23 @@ may contain no Q5_K tensors at all. That is the point of a per-group search: on
 a recent 27B, the winning Q5 put FFN-down at Q4_K_M and FFN-up at MXFP4 while
 holding everything else at Q8_0/BF16, for +0.09% perplexity.
 
-Tiers are published only if they earn it. Each is checked against its claimed
-size band, dropped when a *smaller* tier already beats it on measured quality by
-more than the measurement noise floor, and (for ROCmFPX) required to be
-measurably faster than its MagicQuant equivalent — throughput being the only
-reason to accept its quality tradeoff. When a tier is withheld, the generated
-model card says which rule dropped it and why, so a gap in the ladder is never
-left looking like a broken upload.
+`core/publish_criteria.py` defines size-band, quality-dominance, and ROCmFPX
+speed criteria. The tracked upload pipeline does not yet enforce that complete
+release policy automatically. Review measured results and selected files before
+publishing; model-card consistency checks alone do not establish that every
+artifact meets those criteria. See the [audit roadmap](docs/audits/2026-09-10-review.md).
 
 ### 7. ROCmFPX (optional, off by default)
 AMD-native uniform-quant GGUFs via [ciru-ai/ROCmFPX](https://github.com/ciru-ai/ROCmFPX) (a git-cloned, compiled llama.cpp fork — not a pip package), producing ROCmFP3/4/6/8 GGUFs tuned for this box's Strix Halo (gfx1151) hardware. Two modes: uniform presets (straight + tool-calling/JSON-safe "agent" variants) and MagicQuant-hybrid (`mq-q4`/`mq-q5`/`mq-q6`), which reproduces a MagicQuant tier's per-group precision layout in ROCmFPX-family types via `llama-quantize --tensor-type-file`. Experimental upstream research build; enable with `--rocmfpx` or the UI ROCmFPX card. Writes GGUFs to `<output>/rocmfpx/`. See [docs/rocmfpx.md](docs/rocmfpx.md).
 
 ### 8. Upload
 Uploads artifacts to HuggingFace Hub with auto-generated model card, progress reporting, and dry-run validation.
+
+Training-data publication is opt-in: use `--upload-dataset` with the pipeline or
+uploader CLI, or explicitly select the UI checkbox. A dataset path used for model
+card metadata does not enable dataset upload. Saved workflows retain explicit
+choices. File/card failures return failure, although completed individual Hub
+commits can remain in the destination repository.
 
 ### Resume / re-run
 Each stage writes a `_stage_complete.json` marker on success. A stage is skipped only when the marker matches the current config **and** its key artifact is present and non-empty (no more false-skips from partially written outputs). Pass `--force` to re-run regardless, and `--stage-timeout SECONDS` to bound a wedged stage.
