@@ -44,7 +44,8 @@ COPY --chown=foundry:foundry ui/index.html /app/ui/
 COPY --chown=foundry:foundry data/ /app/data/
 
 # Create output volume mount point
-RUN mkdir -p /app/output && chown foundry:foundry /app/output
+RUN mkdir -p /app/output /home/foundry/.foundry && \
+    chown foundry:foundry /app/output /home/foundry/.foundry
 VOLUME ["/app/output"]
 
 # ROCm environment variables

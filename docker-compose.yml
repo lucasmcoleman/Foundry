@@ -6,14 +6,18 @@ services:
       args:
         BASE_IMAGE: python:3.12-slim
     # SECURITY: the container binds 0.0.0.0 internally (the container is the
-    # boundary). The published port below is reachable on the host LAN — set
-    # FOUNDRY_API_KEY (and/or bind the published port to 127.0.0.1) before
-    # exposing it. Running the pipeline grants shell-equivalent access.
+    # boundary). Host publication defaults to loopback; set FOUNDRY_UI_BIND
+    # to expose on a different interface. Auth fails closed until a key is set.
+    # Running the pipeline grants shell-equivalent access.
     ports:
-      - "${FOUNDRY_UI_PORT:-7865}:7865"
+      - "${FOUNDRY_UI_BIND:-127.0.0.1}:${FOUNDRY_UI_PORT:-7865}:7865"
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
       - FOUNDRY_API_KEY=${FOUNDRY_API_KEY:-}
+      - FOUNDRY_REQUIRE_AUTH=1
+      - FOUNDRY_UI_ORIGINS=${FOUNDRY_UI_ORIGINS:-}
+      - FOUNDRY_CONFIG_PATH=/home/foundry/.foundry/config.json
+      - FOUNDRY_WORK_DIR=/app
       - FOUNDRY_OUTPUT_DIR=/app/output
       - FOUNDRY_UI_PORT=7865
       - HSA_ENABLE_SDMA=0
@@ -22,12 +26,13 @@ services:
     volumes:
       - model-output:/app/output
       - model-cache:/home/foundry/.cache/huggingface
+      - foundry-settings:/home/foundry/.foundry
     restart: unless-stopped
 
   magicquant:
     build:
       context: ../MagicQuant
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile
     volumes:
       - model-output:/app/output
     profiles:
@@ -37,4 +42,6 @@ volumes:
   model-output:
     driver: local
   model-cache:
+    driver: local
+  foundry-settings:
     driver: local
