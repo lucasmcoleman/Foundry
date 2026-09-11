@@ -585,6 +585,8 @@ def test_stage_magicquant_strips_precision_suffix_from_gguf_model_name(tmp_path,
     prefix must no longer carry a source precision tag (issue #6, now also
     fixed for the CLI path, which previously had zero suffix handling)."""
     import pipeline as pl
+    # This test uses a fake worker; memory gating has separate coverage.
+    monkeypatch.setattr(pl, "_system_memory_gate", lambda *a, **kw: True)
     import services as services_mod
 
     out_dir = tmp_path / "out"

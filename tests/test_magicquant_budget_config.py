@@ -79,6 +79,8 @@ def test_stage_magicquant_rerun_when_only_budget_gib_changes(tmp_path, monkeypat
     (_run_stage_script) faked out, and asserts a second run that changes only
     budget_gib is NOT skipped."""
     import pipeline as pl
+    # This test uses a fake worker; memory gating has separate coverage.
+    monkeypatch.setattr(pl, "_system_memory_gate", lambda *a, **kw: True)
 
     out_dir = tmp_path / "out"
     artifacts = pl.Artifacts(str(out_dir))

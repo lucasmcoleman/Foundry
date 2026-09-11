@@ -32,6 +32,18 @@ def fake_gguf(path: Path, size_bytes: int = GIB_96) -> Path:
     return path
 
 
+def fake_quantized_gguf(path: Path, payload: bytes = bytes(18)) -> Path:
+    """Write one ROCmFP4 block, including a real GGUF header/tensor table."""
+    import struct
+
+    header = struct.pack("<4sIQQ", b"GGUF", 3, 1, 0)
+    # One tensor named x, 32 weights, fork-specific GGML type 100.
+    tensor = struct.pack("<Q", 1) + b"x" + struct.pack("<IQIQ", 1, 32, 100, 0)
+    data = header + tensor
+    path.write_bytes(data + bytes((-len(data)) % 32) + payload)
+    return path
+
+
 def hf_upload_cfg(**overrides):
     from hf_upload import HFUploadConfig
 
