@@ -21,6 +21,7 @@ import re
 import signal
 import sys
 import time
+import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -34,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 import markers
 from pipeline import validate_dataset as _core_validate_dataset
 from preflight import check_system_memory
-from reap_common import REAP_SUPPORTED_ARCHS, detect_model_arch as _detect_model_arch
+from reap_common import REAP_SUPPORTED_ARCHS, detect_model_arch as _detect_model_arch, resolve_artifact_source
 from services import (
     TrainingService,
     ExportService,
@@ -54,13 +55,16 @@ def _training_marker_hash(tc) -> str:
     """Config hash for the training completion marker (mirrors the CLI)."""
     return markers.config_hash({
         "model_name": tc.model_name, "datasets": tc.datasets,
+        "model_fingerprint": _source_fingerprint(tc.model_name),
+        "dataset_fingerprints": [_source_fingerprint(p) for p in tc.datasets],
         "max_seq_length": tc.max_seq_length, "lora_r": tc.lora_r,
         "lora_alpha": tc.lora_alpha, "lora_dropout": tc.lora_dropout,
         "use_rslora": tc.use_rslora, "num_train_epochs": tc.num_train_epochs,
         "per_device_train_batch_size": tc.per_device_train_batch_size,
         "gradient_accumulation_steps": tc.gradient_accumulation_steps,
         "learning_rate": tc.learning_rate, "lr_scheduler_type": tc.lr_scheduler_type,
-        "warmup_ratio": tc.warmup_ratio, "optim": tc.optim, "packing": tc.packing,
+        "warmup_ratio": tc.warmup_ratio, "warmup_steps": tc.warmup_steps,
+        "optim": tc.optim, "packing": tc.packing,
     })
 
 API_KEY = os.environ.get("FOUNDRY_API_KEY", "")
@@ -69,17 +73,19 @@ API_KEY = os.environ.get("FOUNDRY_API_KEY", "")
 REQUIRE_AUTH = os.environ.get("FOUNDRY_REQUIRE_AUTH", "0") not in ("", "0", "false", "False")
 
 
-async def verify_api_key(authorization: str = Header(default="")):
+async def verify_api_key(authorization: str = Header(default=""), origin: str = Header(default="")):
     """Check Bearer token in the Authorization header.
 
     No-op when API_KEY is unset AND auth is not required. Uses a constant-time
     comparison (hmac.compare_digest) to avoid timing side channels.
     """
+    if origin and origin not in ALLOWED_ORIGINS:
+        raise HTTPException(status_code=403, detail="Origin not allowed")
     if not API_KEY:
         if REQUIRE_AUTH:
             raise HTTPException(status_code=401, detail="Authentication required but no API key configured")
         return
-    if not hmac.compare_digest(authorization, f"Bearer {API_KEY}"):
+    if not hmac.compare_digest(authorization.encode("utf-8"), f"Bearer {API_KEY}".encode("utf-8")):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 app = FastAPI(title="Foundry")
@@ -115,12 +121,26 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-FOUNDRY_DIR = Path(__file__).resolve().parent.parent
+FOUNDRY_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve_work_dir(code_root: Path = FOUNDRY_ROOT) -> Path:
+    """Keep operator artifacts outside installed packages; retain checkout defaults."""
+    override = os.environ.get("FOUNDRY_WORK_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    if (code_root / "pyproject.toml").is_file():
+        return code_root.resolve()
+    return Path.cwd().resolve()
+
+
+FOUNDRY_DIR = _resolve_work_dir()
+_DEFAULT_OUTPUT_DIR = os.environ.get("FOUNDRY_OUTPUT_DIR", "./output")
 
 
 def _resolve_venv_python() -> str:
     """Locate the venv Python interpreter at runtime."""
-    candidate = FOUNDRY_DIR / ".venv" / "bin" / "python"
+    candidate = FOUNDRY_ROOT / ".venv" / "bin" / "python"
     if candidate.exists():
         return str(candidate)
     return sys.executable
@@ -161,6 +181,9 @@ class StageStatus(str, Enum):
 
 ALL_STAGES = ["training", "export", "heretic", "reap", "qat", "magicquant", "rocmfpx", "upload"]
 
+_WS_SEND_TIMEOUT_SECONDS = 2.0
+
+
 class PipelineState:
     """Shared mutable state for the running pipeline, including WebSocket fan-out."""
 
@@ -171,16 +194,22 @@ class PipelineState:
         self.progress = 0
         self.ws_clients: list[WebSocket] = []
         self.active_proc = None
+        self.stop_requested = False
+        self.stop_task = None
 
     async def broadcast(self, msg: dict):
-        dead = []
-        for ws in list(self.ws_clients):
+        async def send(ws):
             try:
-                await ws.send_json(msg)
+                await asyncio.wait_for(ws.send_json(msg), timeout=_WS_SEND_TIMEOUT_SECONDS)
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.ws_clients.remove(ws)
+                # The receive loop may have removed this socket while send
+                # was suspended. A disconnected browser cannot fail a job.
+                if ws in self.ws_clients:
+                    self.ws_clients.remove(ws)
+
+        # Send concurrently so one stalled browser doesn't hold up every
+        # other client, or indefinitely block draining a stage's stdout.
+        await asyncio.gather(*(send(ws) for ws in list(self.ws_clients)))
 
     async def log(self, text: str, level: str = "info"):
         await self.broadcast({"type": "log", "text": text, "level": level, "ts": time.time()})
@@ -218,7 +247,7 @@ class TrainingCfg(BaseModel):
     warmup_steps: Optional[int] = None  # optional override; ratio wins when both set
     optim: str = "paged_adamw_8bit"
     packing: bool = False
-    output_dir: str = "./output"
+    output_dir: str = _DEFAULT_OUTPUT_DIR
 
 class ExportCfg(BaseModel):
     gguf_type: str = "bf16"
@@ -315,10 +344,10 @@ class UploadCfg(BaseModel):
     upload_gguf: bool = True
     upload_lora: bool = False
     upload_merged: bool = False
-    upload_dataset: bool = True
+    upload_dataset: bool = False
 
 class UIConfig(BaseModel):
-    """Persisted UI config (ui/config.json). Only known keys are accepted; any
+    """Persisted UI config (FOUNDRY_CONFIG_PATH). Only known keys are accepted; any
     unexpected key is rejected (extra='forbid') so POST /api/config can't write
     arbitrary attacker-controlled data into the file.
     """
@@ -374,6 +403,66 @@ class FlywheelRequest(BaseModel):
 
 # ── Subprocess helper ────────────────────────────────────────────────────────
 
+_STOP_GRACE_SECONDS = 5.0
+
+
+def _signal_process_group(proc, sig):
+    # Every UI subprocess starts its own session; its PID is its group ID.
+    # Do not look up getpgid after exit: descendants can outlive the leader.
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _capture_descendants(proc, known=()):
+    """Capture descendants while parents still exist, including new sessions.
+
+    MagicQuant measurement workers and nested Foundry CLI stages create their
+    own sessions. A killpg on the UI stage alone cannot reach those workers.
+    Keep psutil Process handles: their signal methods guard against PID reuse.
+    This is best-effort tree cleanup; a job cgroup is needed to contain an
+    adversarial process that repeatedly forks and reparents during teardown.
+    """
+    import psutil
+
+    captured = {child.pid: child for child in known}
+    parents = list(known)
+    try:
+        if proc.returncode is None:
+            parents.append(psutil.Process(proc.pid))
+    except psutil.NoSuchProcess:
+        pass
+    for parent in parents:
+        try:
+            if parent.is_running():
+                captured.update((child.pid, child) for child in parent.children(recursive=True))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return list(captured.values())
+
+
+def _signal_process_tree(proc, sig, descendants=()):
+    import psutil
+
+    descendants = _capture_descendants(proc, descendants)
+    for child in reversed(descendants):
+        try:
+            child.send_signal(sig)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    _signal_process_group(proc, sig)
+    return descendants
+
+
+async def _stop_process_group(proc):
+    descendants = _signal_process_tree(proc, signal.SIGTERM)
+    await asyncio.sleep(_STOP_GRACE_SECONDS)
+    # Descendants may survive their parent; signal the original session even
+    # when proc.returncode is already populated.
+    _signal_process_tree(proc, signal.SIGKILL, descendants)
+
+
 async def run_script(script: str, output_dir: str, inject_hf_token: bool = False) -> int:
     """Write a Python script to disk and execute it in the venv, streaming stdout to WebSocket clients.
 
@@ -383,10 +472,10 @@ async def run_script(script: str, output_dir: str, inject_hf_token: bool = False
     This narrows the blast radius vs. injecting it into every stage.
     """
     # Resolve relative paths against the project root, not uvicorn's CWD
-    out_path = Path(output_dir)
-    if not out_path.is_absolute():
-        out_path = FOUNDRY_DIR / out_path
-    script_path = out_path / f"_stage_{int(time.time())}.py"
+    out_path = _resolve_out(output_dir)
+    if state.stop_requested:
+        raise asyncio.CancelledError
+    script_path = out_path / f"_stage_{time.time_ns()}.py"
     script_path.parent.mkdir(parents=True, exist_ok=True)
     script_path.write_text(script)
 
@@ -426,6 +515,8 @@ async def run_script(script: str, output_dir: str, inject_hf_token: bool = False
         state.active_proc = proc
 
         try:
+            if state.stop_requested:
+                raise asyncio.CancelledError
             async for raw in proc.stdout:
                 log_file.write(raw.decode("utf-8", errors="replace"))
                 log_file.flush()
@@ -469,15 +560,18 @@ async def run_script(script: str, output_dir: str, inject_hf_token: bool = False
                         await state.log(text, "error")
                     else:
                         await state.log(text)
-        except Exception:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+        except BaseException:
+            # Task cancellation inherits BaseException. Kill the entire new
+            # session, including training workers, and drain the pipe before
+            # waiting so a full stdout buffer cannot deadlock teardown.
+            _signal_process_tree(proc, signal.SIGKILL)
+            if hasattr(proc.stdout, "read"):
+                await proc.stdout.read()
             raise
         finally:
             await proc.wait()
-            state.active_proc = None
+            if state.active_proc is proc:
+                state.active_proc = None
     finally:
         log_file.close()
 
@@ -485,9 +579,6 @@ async def run_script(script: str, output_dir: str, inject_hf_token: bool = False
 
 
 # ── Dataset validation (Improvement #3) ──────────────────────────────────────
-
-FOUNDRY_ROOT = Path(__file__).resolve().parent.parent
-
 
 async def validate_dataset(sources: list[str]) -> bool:
     """Pre-flight dataset check for one or more dataset sources.
@@ -501,7 +592,8 @@ async def validate_dataset(sources: list[str]) -> bool:
     """
     buffered: list[tuple[str, str]] = []
     ok = _core_validate_dataset(
-        sources, log=lambda msg, level="info": buffered.append((msg, level))
+        [_resolve_input(source) for source in sources],
+        log=lambda msg, level="info": buffered.append((msg, level))
     )
     for msg, level in buffered:
         await state.log(msg, level)
@@ -512,12 +604,41 @@ async def validate_dataset(sources: list[str]) -> bool:
 
 def _resolve_out(output_dir: str) -> Path:
     """Resolve output_dir the same way run_script does."""
-    p = Path(output_dir)
-    return p if p.is_absolute() else FOUNDRY_DIR / p
+    p = Path(output_dir).expanduser()
+    return (p if p.is_absolute() else FOUNDRY_DIR / p).resolve()
+
+
+def _resolve_input(source: str) -> str:
+    """Make local stage inputs absolute while preserving Hub model/dataset IDs."""
+    if not source:
+        return source
+    path = _resolve_out(source)
+    if path.exists() or Path(source).suffix in {".jsonl", ".json", ".csv", ".parquet", ".gguf"}:
+        return str(path)
+    return source
+
+
+def _source_fingerprint(source):
+    """Resolve local inputs against the same project root as stage subprocesses."""
+    return markers.source_fingerprint(_resolve_out(str(source))) if source else None
+
+
+def _export_base_source(cfg):
+    if "training" in cfg.enabled_stages:
+        return cfg.training.model_name
+    source = cfg.export.source_model if cfg.export else ""
+    if source:
+        try:
+            data = json.loads((_resolve_out(source) / "adapter_config.json").read_text())
+            if isinstance(data, dict):
+                return data.get("base_model_name_or_path") or source
+        except (OSError, ValueError):
+            pass
+    return source
 
 
 def _assert_output_dir_contained(output_dir: str) -> None:
-    """Reject an output_dir that would escape the Foundry tree.
+    """Reject an output_dir that would escape the configured work directory.
 
     ``run_script`` writes a generated stage script + log into ``output_dir``
     and then executes it with the venv Python — this is the actual
@@ -591,6 +712,7 @@ async def _check_marker(
         await state.set_stage(stage, StageStatus.COMPLETE)
         await state.set_progress(100)
         return True, key
+    markers.invalidate_marker(stage_dir)
     return False, key
 
 
@@ -619,6 +741,19 @@ async def _write_stage_marker(stage_dir: Path, stage: str, key_file: Path, cfg_h
         )
     else:
         await state.log(f"{stage}: wrote completion marker at {stage_dir}", "info")
+
+
+async def _finish_artifact_stage(stage, stage_dir, key_file, cfg_hash, rc):
+    """A zero exit status is successful only when the complete artifact exists."""
+    ok = rc == 0 and markers.artifacts_present(stage_dir, key_file)
+    if ok:
+        await _write_stage_marker(stage_dir, stage, key_file, cfg_hash)
+    elif rc == 0:
+        await state.log(f"{stage}: output weights missing, empty, or incomplete at {stage_dir}", "error")
+    await state.set_stage(stage, StageStatus.COMPLETE if ok else StageStatus.FAILED)
+    if ok:
+        await state.set_progress(100)
+    return ok
 
 
 async def do_training(cfg: RunRequest) -> bool:
@@ -650,9 +785,9 @@ async def do_training(cfg: RunRequest) -> bool:
 
     svc = TrainingService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
-        model_name=tc.model_name,
-        datasets=tc.datasets,
-        output_dir=tc.output_dir,
+        model_name=_resolve_input(tc.model_name),
+        datasets=[_resolve_input(source) for source in tc.datasets],
+        output_dir=str(out),
         max_seq_length=tc.max_seq_length,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
@@ -669,18 +804,16 @@ async def do_training(cfg: RunRequest) -> bool:
         packing=tc.packing,
     )
     rc = await run_script(script, tc.output_dir)
-    ok = rc == 0
-    if ok and key_file.exists() and key_file.stat().st_size > 0:
-        await _write_stage_marker(lora_dir, "training", key_file, cfg_hash)
-    await state.set_stage("training", StageStatus.COMPLETE if ok else StageStatus.FAILED)
-    if ok:
-        await state.set_progress(100)
-    return ok
+    return await _finish_artifact_stage("training", lora_dir, key_file, cfg_hash, rc)
 
 
 async def do_export(cfg: RunRequest) -> bool:
     """Merge LoRA + export. Smart routing based on upstream/downstream stages."""
     ec = cfg.export
+    if ec is None:
+        await state.log("Export enabled but no configuration provided", "error")
+        await state.set_stage("export", StageStatus.FAILED)
+        return False
     out = cfg.training.output_dir
     out_abs = _resolve_out(out)
     training_enabled = "training" in cfg.enabled_stages
@@ -703,13 +836,22 @@ async def do_export(cfg: RunRequest) -> bool:
         "model_name": cfg.training.model_name if training_enabled else None,
         "source_model": cfg.export.source_model if cfg.export else "",
         "training_enabled": training_enabled,
+        "source_fingerprint": _source_fingerprint(out_abs / "lora_adapters" if training_enabled else ec.source_model),
+        "model_fingerprint": _source_fingerprint(_export_base_source(cfg)),
     })
+    passthrough_key = out_abs / "model-bf16.gguf"
+    prior_passthrough = not any(merged.glob("*.safetensors")) and passthrough_key.is_file()
+    export_stage_dir = out_abs if prior_passthrough else merged
     done, export_key = await _check_marker(
-        "export", "Export", merged, export_hash,
-        key_glob="*.safetensors", default_key_name="model.safetensors",
+        "export", "Export", export_stage_dir, export_hash,
+        key_glob=None if prior_passthrough else "*.safetensors",
+        default_key_name="model-bf16.gguf" if prior_passthrough else "model.safetensors",
     )
     if done:
         return True
+    # A change between safetensors and GGUF sources invalidates either prior
+    # output form before the exporter starts writing.
+    markers.invalidate_marker(merged if prior_passthrough else out_abs)
 
     await state.set_stage("export", StageStatus.RUNNING)
     await state.set_progress(0)
@@ -717,18 +859,19 @@ async def do_export(cfg: RunRequest) -> bool:
     # Determine model source: base model ID for streaming_merge + optional LoRA dir
     if training_enabled:
         base_model_id = cfg.training.model_name
-        lora_source = f"{out}/lora_adapters"
+        lora_source = str(out_abs / "lora_adapters")
         has_lora = True
     elif ec.source_model:
         base_model_id = ec.source_model
-        has_lora = (Path(ec.source_model) / "adapter_config.json").exists()
+        adapter_source = _resolve_out(ec.source_model)
+        has_lora = (adapter_source / "adapter_config.json").exists()
         if has_lora:
             try:
-                adapter_cfg_data = json.loads((Path(ec.source_model) / "adapter_config.json").read_text())
+                adapter_cfg_data = json.loads((adapter_source / "adapter_config.json").read_text())
                 base_model_id = adapter_cfg_data.get("base_model_name_or_path", ec.source_model)
             except (json.JSONDecodeError, OSError):
                 pass
-            lora_source = ec.source_model
+            lora_source = str(adapter_source)
         else:
             lora_source = None
     else:
@@ -753,22 +896,19 @@ async def do_export(cfg: RunRequest) -> bool:
 
     svc = ExportService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
-        base_model_id=base_model_id,
+        base_model_id=_resolve_input(base_model_id),
         lora_source=lora_source,
         has_lora=has_lora,
         merged_dir=str(out_abs / "merged_model"),
     )
     rc = await run_script(script, out)
-    ok = rc == 0
-    if ok and merged.exists():
-        st = sorted(merged.glob("*.safetensors"))
-        kf = st[0] if st else export_key
-        if kf.exists() and kf.stat().st_size > 0:
-            await _write_stage_marker(merged, "export", kf, export_hash)
-    await state.set_stage("export", StageStatus.COMPLETE if ok else StageStatus.FAILED)
-    if ok:
-        await state.set_progress(100)
-    return ok
+    st = sorted(merged.glob("*.safetensors"))
+    if not st and not has_lora:
+        # GGUF sources pass through streaming_merge as a link in the run
+        # root; they intentionally produce no merged_model directory.
+        return await _finish_artifact_stage("export", out_abs, passthrough_key, export_hash, rc)
+    kf = st[0] if st else merged / "model.safetensors"
+    return await _finish_artifact_stage("export", merged, kf, export_hash, rc)
 
 
 async def do_heretic(cfg: RunRequest) -> bool:
@@ -788,6 +928,7 @@ async def do_heretic(cfg: RunRequest) -> bool:
     # Completion-marker resume (audit M-skip-marker).
     heretic_dir = out_abs / "heretic_model"
     heretic_hash = markers.config_hash({
+        "source_fingerprint": _source_fingerprint(out_abs / "merged_model"),
         "n_trials": hc.n_trials, "n_startup_trials": hc.n_startup_trials,
         "quantization": hc.quantization, "kl_divergence_scale": hc.kl_divergence_scale,
         "orthogonalize_direction": hc.orthogonalize_direction,
@@ -826,16 +967,9 @@ async def do_heretic(cfg: RunRequest) -> bool:
         row_normalization=hc.row_normalization,
     )
     rc = await run_script(script, out)
-    ok = rc == 0
-    if ok and heretic_dir.exists():
-        st = sorted(heretic_dir.glob("*.safetensors"))
-        kf = st[0] if st else heretic_key
-        if kf.exists() and kf.stat().st_size > 0:
-            await _write_stage_marker(heretic_dir, "heretic", kf, heretic_hash)
-    await state.set_stage("heretic", StageStatus.COMPLETE if ok else StageStatus.FAILED)
-    if ok:
-        await state.set_progress(100)
-    return ok
+    st = sorted(heretic_dir.glob("*.safetensors"))
+    kf = st[0] if st else heretic_key
+    return await _finish_artifact_stage("heretic", heretic_dir, kf, heretic_hash, rc)
 
 
 # REAP_SUPPORTED_ARCHS and _detect_model_arch are imported from reap_common
@@ -860,7 +994,10 @@ async def do_reap(cfg: RunRequest) -> bool:
 
     # Completion-marker resume (audit M-skip-marker).
     reap_dir = out_abs / "reap_model"
+    heretic_source = out_abs / "heretic_model"
+    reap_source = heretic_source if any(heretic_source.glob("*.safetensors")) else out_abs / "merged_model"
     reap_hash = markers.config_hash({
+        "source_fingerprint": _source_fingerprint(reap_source),
         "compression_ratio": rc.compression_ratio, "prune_method": rc.prune_method,
         "samples_per_category": rc.samples_per_category,
         "model_max_length": rc.model_max_length, "dataset_name": rc.dataset_name,
@@ -923,16 +1060,9 @@ async def do_reap(cfg: RunRequest) -> bool:
         seed=rc.seed,
     )
     rc_code = await run_script(script, out)
-    ok = rc_code == 0
-    if ok and reap_dir.exists():
-        st = sorted(reap_dir.glob("*.safetensors"))
-        kf = st[0] if st else reap_key
-        if kf.exists() and kf.stat().st_size > 0:
-            await _write_stage_marker(reap_dir, "reap", kf, reap_hash)
-    await state.set_stage("reap", StageStatus.COMPLETE if ok else StageStatus.FAILED)
-    if ok:
-        await state.set_progress(100)
-    return ok
+    st = sorted(reap_dir.glob("*.safetensors"))
+    kf = st[0] if st else reap_key
+    return await _finish_artifact_stage("reap", reap_dir, kf, reap_hash, rc_code)
 
 
 def _resolve_qat_config_source(qc: "QATCfg", out_abs: Path) -> Optional[Path]:
@@ -945,7 +1075,7 @@ def _resolve_qat_config_source(qc: "QATCfg", out_abs: Path) -> Optional[Path]:
         p = Path(qc.config_source)
         if p.is_absolute():
             return p if p.exists() else None
-        for base in (out_abs, FOUNDRY_ROOT):
+        for base in (out_abs, FOUNDRY_DIR):
             cand = base / qc.config_source
             if cand.exists():
                 return cand
@@ -986,6 +1116,9 @@ async def do_qat(cfg: RunRequest) -> bool:
     # Completion-marker resume (mirrors the other stages).
     qat_dir = out_abs / "qat_adapters"
     qat_hash = markers.config_hash({
+        "model_fingerprint": _source_fingerprint(cfg.training.model_name),
+        "config_fingerprint": _source_fingerprint(config_source),
+        "dataset_fingerprint": _source_fingerprint(qc.dataset),
         "model": cfg.training.model_name, "config": str(config_source),
         "tier": qc.tier, "dataset": qc.dataset, "lora_r": qc.lora_r,
         "lora_alpha": qc.lora_alpha, "epochs": qc.epochs, "max_steps": qc.max_steps,
@@ -1004,10 +1137,10 @@ async def do_qat(cfg: RunRequest) -> bool:
 
     svc = QATService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
-        model=cfg.training.model_name,
+        model=_resolve_input(cfg.training.model_name),
         config_path=str(config_source),
         tier=qc.tier,
-        dataset=qc.dataset,
+        dataset=_resolve_input(qc.dataset),
         out=str(qat_dir),
         lora_r=qc.lora_r,
         lora_alpha=qc.lora_alpha,
@@ -1017,13 +1150,7 @@ async def do_qat(cfg: RunRequest) -> bool:
         max_seq_len=qc.max_seq_len,
     )
     rc = await run_script(script, out)
-    ok = rc == 0 and qat_key.exists()
-    if ok:
-        await _write_stage_marker(qat_dir, "qat", qat_key, qat_hash)
-    await state.set_stage("qat", StageStatus.COMPLETE if ok else StageStatus.FAILED)
-    if ok:
-        await state.set_progress(100)
-    return ok
+    return await _finish_artifact_stage("qat", qat_dir, qat_key, qat_hash, rc)
 
 
 async def do_magicquant(cfg: RunRequest) -> bool:
@@ -1032,13 +1159,21 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     out_abs = _resolve_out(out)
     mc = cfg.magicquant
     export_enabled = "export" in cfg.enabled_stages
+    if mc is None:
+        await state.log("MagicQuant enabled but no configuration provided", "error")
+        await state.set_stage("magicquant", StageStatus.FAILED)
+        return False
 
     if not await _mem_preflight("magicquant"):
         return False
 
     # Completion-marker resume (audit M-skip-marker).
     mq_dir = out_abs / "magicquant"
+    mq_source = mc.source_model if (mc.source_model and not export_enabled) else resolve_artifact_source(out_abs, require_safetensors=False)
     mq_hash = markers.config_hash({
+        "source_fingerprint": _source_fingerprint(mq_source),
+        "imatrix_fingerprint": _source_fingerprint(mc.imatrix_corpus),
+        "calibration_fingerprint": _source_fingerprint(mc.calibration_source),
         "generations": mc.generations, "population_size": mc.population_size,
         "target_base_quant": mc.target_base_quant, "tiers": mc.tiers,
         "source_model": mc.source_model, "measured": mc.measured,
@@ -1076,8 +1211,8 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     svc = MagicQuantService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
         llamacpp_hint=hint,
-        pipeline_root_str=str(FOUNDRY_ROOT),
-        mq_source_override=mq_source_override,
+        pipeline_root_str=str(FOUNDRY_DIR),
+        mq_source_override=_resolve_input(mq_source_override),
         out_abs_str=str(out_abs),
         generations=mc.generations,
         population_size=mc.population_size,
@@ -1108,15 +1243,9 @@ async def do_magicquant(cfg: RunRequest) -> bool:
         budget_gib=mc.budget_gib,
     )
     rc = await run_script(script, out)
-    ok = rc == 0
-    if ok and mq_dir.exists():
-        ggufs = sorted(mq_dir.glob("*.gguf"))
-        if ggufs:
-            await _write_stage_marker(mq_dir, "magicquant", ggufs[0], mq_hash)
-    await state.set_stage("magicquant", StageStatus.COMPLETE if ok else StageStatus.FAILED)
-    if ok:
-        await state.set_progress(100)
-    return ok
+    ggufs = sorted(mq_dir.glob("*.gguf"))
+    key_file = ggufs[0] if ggufs else mq_key
+    return await _finish_artifact_stage("magicquant", mq_dir, key_file, mq_hash, rc)
 
 
 async def do_rocmfpx(cfg: RunRequest) -> bool:
@@ -1136,7 +1265,11 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
 
     # Completion-marker resume (mirrors do_magicquant).
     rc_dir = out_abs / "rocmfpx"
+    rc_source = rc_cfg.source_model if (rc_cfg.source_model and not export_enabled) else resolve_artifact_source(out_abs, require_safetensors=False)
     rc_hash = markers.config_hash({
+        "source_fingerprint": _source_fingerprint(rc_source),
+        "imatrix_fingerprint": _source_fingerprint(rc_cfg.imatrix),
+        "search_fingerprint": _source_fingerprint(out_abs / "magicquant" / "search_results.json") if any(f.startswith("mq-") for f in rc_cfg.formats) else None,
         "formats": rc_cfg.formats, "imatrix": rc_cfg.imatrix,
         "source_model": rc_cfg.source_model,
         "allow_requantize": rc_cfg.allow_requantize,
@@ -1159,8 +1292,8 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
     svc = ROCmFPXService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
         rocmfpx_hint=rc_cfg.rocmfpx_hint,
-        pipeline_root_str=str(FOUNDRY_ROOT),
-        source_override=source_override,
+        pipeline_root_str=str(FOUNDRY_DIR),
+        source_override=_resolve_input(source_override),
         out_abs_str=str(out_abs),
         formats_json=json.dumps(rc_cfg.formats),
         model_name=model_name,
@@ -1169,15 +1302,9 @@ async def do_rocmfpx(cfg: RunRequest) -> bool:
         allow_partial=rc_cfg.allow_partial,
     )
     rc = await run_script(script, out)
-    ok = rc == 0
-    if ok and rc_dir.exists():
-        ggufs = sorted(rc_dir.glob("*.gguf"))
-        if ggufs:
-            await _write_stage_marker(rc_dir, "rocmfpx", ggufs[0], rc_hash)
-    await state.set_stage("rocmfpx", StageStatus.COMPLETE if ok else StageStatus.FAILED)
-    if ok:
-        await state.set_progress(100)
-    return ok
+    ggufs = sorted(rc_dir.glob("*.gguf"))
+    key_file = ggufs[0] if ggufs else rc_key
+    return await _finish_artifact_stage("rocmfpx", rc_dir, key_file, rc_hash, rc)
 
 
 def derive_base_model(cfg: RunRequest, out_abs: Path) -> str:
@@ -1203,7 +1330,7 @@ def derive_base_model(cfg: RunRequest, out_abs: Path) -> str:
         return cfg.training.model_name
     ec = cfg.export
     if ec and ec.source_model:
-        adapter_cfg = Path(ec.source_model) / "adapter_config.json"
+        adapter_cfg = _resolve_out(ec.source_model) / "adapter_config.json"
         if adapter_cfg.exists():
             try:
                 return json.loads(adapter_cfg.read_text()).get(
@@ -1266,7 +1393,7 @@ async def do_upload(cfg: RunRequest) -> bool:
         upload_merged=uc.upload_merged,
         upload_dataset=uc.upload_dataset,
         base_model=base_model,
-        dataset_name=tc.datasets[0] if tc.datasets else "",
+        dataset_name=_resolve_input(tc.datasets[0]) if tc.datasets else "",
         did_training="training" in enabled,
         did_heretic="heretic" in enabled,
         did_reap="reap" in enabled,
@@ -1426,9 +1553,12 @@ async def run_pipeline(cfg: RunRequest):
     state.running = True
     state.current_stage = None
     state.progress = 0
+    outcome = "failed"
     enabled = set(cfg.enabled_stages)
 
     try:
+        if state.stop_requested:
+            return
         # Resolve the run's model name -- and therefore its output directory
         # -- BEFORE creating anything. An unresolvable name must abort
         # cleanly (via the except below); it must never mkdir a directory
@@ -1452,7 +1582,7 @@ async def run_pipeline(cfg: RunRequest):
         for stage_name in ALL_STAGES:
             if stage_name not in enabled:
                 continue
-            if not state.running:
+            if state.stop_requested:
                 await state.log("Pipeline stopped by user", "warn")
                 break
             ok = await STAGE_RUNNERS[stage_name](cfg)
@@ -1461,14 +1591,19 @@ async def run_pipeline(cfg: RunRequest):
                 break
 
         if all(state.stages[s] in (StageStatus.COMPLETE, StageStatus.SKIPPED) for s in ALL_STAGES):
+            outcome = "complete"
             await state.log("Pipeline complete!", "success")
     except ModelNameUnresolvedError as e:
         await state.log(f"Pipeline aborted: {e}", "error")
     except Exception as e:
         await state.log(f"Pipeline error: {e}", "error")
     finally:
+        if state.stop_task is not None:
+            await state.stop_task
+            state.stop_task = None
         state.running = False
-        await state.broadcast({"type": "pipeline_done"})
+        await state.broadcast({"type": "pipeline_done",
+                               "status": "stopped" if state.stop_requested else outcome})
 
 
 # ── Flywheel runner ──────────────────────────────────────────────────────────
@@ -1601,6 +1736,8 @@ async def _run_flywheel_subprocess(script_path: Path, params_path: Path):
     env["PYTHONPATH"] = str(FLYWHEEL_ROOT) + (os.pathsep + existing_pp if existing_pp else "")
     env.pop("HF_TOKEN", None)
 
+    if state.stop_requested:
+        raise asyncio.CancelledError
     py = _resolve_flywheel_python()
     manifest_path = None
     err = None
@@ -1616,6 +1753,8 @@ async def _run_flywheel_subprocess(script_path: Path, params_path: Path):
         )
         state.active_proc = proc
         try:
+            if state.stop_requested:
+                raise asyncio.CancelledError
             async for raw in proc.stdout:
                 decoded = raw.decode("utf-8", errors="replace")
                 log_file.write(decoded)
@@ -1655,15 +1794,18 @@ async def _run_flywheel_subprocess(script_path: Path, params_path: Path):
                         lvl = ("error" if ("Traceback" in line or "Error" in line
                                            or "error" in line.lower()) else "info")
                         await state.log(line, lvl)
-        except Exception:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+        except BaseException:
+            # Task cancellation inherits BaseException. Kill the entire new
+            # session, including training workers, and drain the pipe before
+            # waiting so a full stdout buffer cannot deadlock teardown.
+            _signal_process_tree(proc, signal.SIGKILL)
+            if hasattr(proc.stdout, "read"):
+                await proc.stdout.read()
             raise
         finally:
             await proc.wait()
-            state.active_proc = None
+            if state.active_proc is proc:
+                state.active_proc = None
     finally:
         log_file.close()
     return proc.returncode, manifest_path, err
@@ -1674,7 +1816,10 @@ async def run_flywheel(req: FlywheelRequest):
     state.current_stage = None
     state.progress = 0
     workdir = FLYWHEEL_ROOT / "output" / "ui"
+    outcome = "failed"
     try:
+        if state.stop_requested:
+            return
         # Reset the flywheel stage tracker for the new run.
         for stg, status in (("train", "skipped"), ("quantize", "skipped"),
                             ("signal", "pending"), ("rollout", "pending"),
@@ -1720,6 +1865,7 @@ async def run_flywheel(req: FlywheelRequest):
         rc, manifest_path, err = await _run_flywheel_subprocess(script_path, params_path)
 
         if rc == 0 and manifest_path and Path(manifest_path).exists():
+            outcome = "complete"
             data = json.loads(Path(manifest_path).read_text())
             decision = data.get("decision") or {}
             action = (decision.get("action") or "").upper()
@@ -1743,27 +1889,45 @@ async def run_flywheel(req: FlywheelRequest):
         await state.broadcast({"type": "flywheel_done", "ok": False,
                                "error": str(e)})
     finally:
+        if state.stop_task is not None:
+            await state.stop_task
+            state.stop_task = None
         state.running = False
         state.active_proc = None
-        await state.broadcast({"type": "pipeline_done"})
+        await state.broadcast({"type": "pipeline_done",
+                               "status": "stopped" if state.stop_requested else outcome})
 
 
 # ── Persistent config ────────────────────────────────────────────────────────
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
+_DEFAULT_CONFIG_PATH = Path.home() / ".foundry" / "config.json"
+CONFIG_PATH = Path(os.environ.get("FOUNDRY_CONFIG_PATH", str(_DEFAULT_CONFIG_PATH))).expanduser()
+_LEGACY_CONFIG_PATH = Path(__file__).parent / "config.json"
+
 
 def load_config() -> dict:
-    """Load persisted UI config from config.json, or return empty dict on failure."""
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    """Load user configuration, retaining a read-only legacy checkout fallback."""
+    path = CONFIG_PATH
+    if (not path.exists() and path == _DEFAULT_CONFIG_PATH
+            and "FOUNDRY_CONFIG_PATH" not in os.environ):
+        path = _LEGACY_CONFIG_PATH
+    try:
+        value = json.loads(path.read_text())
+        return UIConfig.model_validate(value).model_dump(exclude_unset=True)
+    except (ValueError, OSError):
+        return {}
+
 
 def save_config(cfg: dict):
-    """Persist UI config to config.json."""
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    """Atomically persist settings outside the installed Python package."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".config-", suffix=".json", dir=CONFIG_PATH.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(name, CONFIG_PATH)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -1771,7 +1935,7 @@ def save_config(cfg: dict):
 @app.get("/health")
 async def health_check():
     """Health check endpoint -- no authentication required."""
-    return {"status": "ok", "auth_enabled": bool(API_KEY)}
+    return {"status": "ok", "auth_enabled": bool(API_KEY) or REQUIRE_AUTH}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1875,7 +2039,7 @@ async def delete_workflow(name: str):
 @app.get("/api/runs", dependencies=[Depends(verify_api_key)])
 async def list_runs():
     """List all pipeline output directories with their stage logs."""
-    output_dir = FOUNDRY_DIR / "output"
+    output_dir = _resolve_out(_DEFAULT_OUTPUT_DIR)
     if not output_dir.exists():
         return {"runs": []}
 
@@ -1937,7 +2101,7 @@ async def get_run_log(model: str, logfile: str):
     if not re.match(r'^[\w\-.]+$', model) or not re.match(r'^_stage_\d+\.log$', logfile):
         raise HTTPException(status_code=400, detail="Invalid name")
 
-    path = FOUNDRY_DIR / "output" / model / logfile
+    path = _resolve_out(_DEFAULT_OUTPUT_DIR) / model / logfile
     if not path.exists():
         raise HTTPException(status_code=404, detail="Log not found")
 
@@ -1964,7 +2128,7 @@ async def get_serve_command(model: str):
     if not re.match(r'^[\w\-.]+$', model):
         raise HTTPException(status_code=400, detail="Invalid name")
 
-    model_dir = FOUNDRY_DIR / "output" / model
+    model_dir = _resolve_out(_DEFAULT_OUTPUT_DIR) / model
     if not model_dir.exists():
         raise HTTPException(status_code=404, detail="Run not found")
 
@@ -1999,6 +2163,7 @@ async def start_pipeline(cfg: RunRequest):
         if state.running:
             return {"error": "Pipeline is already running"}
         state.running = True
+        state.stop_requested = False
         for s in ALL_STAGES:
             state.stages[s] = StageStatus.PENDING
         state.progress = 0
@@ -2008,17 +2173,13 @@ async def start_pipeline(cfg: RunRequest):
 
 @app.post("/api/stop", dependencies=[Depends(verify_api_key)])
 async def stop_pipeline():
-    """Request a graceful pipeline stop. Kills active subprocess and sets running flag to False."""
+    """Stop the current job while retaining its reservation until cleanup ends."""
     if not state.running:
         return {"error": "Pipeline is not running"}
-    state.running = False
-    if state.active_proc and state.active_proc.returncode is None:
-        try:
-            os.killpg(os.getpgid(state.active_proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
+    state.stop_requested = True
+    if state.active_proc is not None and state.stop_task is None:
+        state.stop_task = asyncio.create_task(_stop_process_group(state.active_proc))
     await state.log("Stop requested by user", "warn")
-    await state.broadcast({"type": "pipeline_done"})
     return {"status": "stopping"}
 
 
@@ -2043,6 +2204,7 @@ async def start_flywheel(req: FlywheelRequest):
         if state.running:
             return {"error": "A job is already running"}
         state.running = True
+        state.stop_requested = False
         state.progress = 0
         asyncio.create_task(run_flywheel(req))
     return {"status": "started"}
@@ -2059,7 +2221,11 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(default="")):
 
     Authentication is via the ``token`` query parameter (e.g. ``/ws?token=...``).
     """
-    if API_KEY and not hmac.compare_digest(token, API_KEY):
+    origin = ws.headers.get("origin")
+    if origin and origin not in ALLOWED_ORIGINS:
+        await ws.close(code=4003, reason="Origin not allowed")
+        return
+    if API_KEY and not hmac.compare_digest(token.encode("utf-8"), API_KEY.encode("utf-8")):
         await ws.close(code=4001, reason="Invalid API key")
         return
     if not API_KEY and REQUIRE_AUTH:

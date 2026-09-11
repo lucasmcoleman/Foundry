@@ -4,6 +4,21 @@
 
 ### Fixed (2026-09-10 audit)
 
+- UI rendering escapes saved values and history names; REST/WebSocket origin
+  checks reject foreign browser contexts. Stop retains job ownership through
+  teardown, reaches descendant workers in separate sessions, and tolerates
+  disconnects/slow sockets. All stage runners validate complete output and
+  changed inputs; GGUF pass-through remains supported. Installed code and
+  runtime data have separate roots; settings persist atomically outside the
+  package. Compose defaults to loopback plus required authentication and persists
+  settings. Files: `ui/{app.py,index.html}`, `Dockerfile`, `docker-compose.yml`,
+  `tests/test_ui_{boundary_audit,frontend_audit,job_lifecycle,marker_integrity,runtime_root}.py`,
+  `tests/test_stage_marker_logging.py`. Validation: full offline suite 948 passed,
+  1 artifact-dependent skip; real CPU descendant teardown, actual JavaScript
+  rendering, and installed-wheel worker checks passed. Runtime container/GPU
+  execution remains untested; process-tree cleanup is best effort, not cgroup
+  containment. Explicit saved dataset-upload choices remain intact.
+
 - Gym execution handles partial pipe writes and malformed protocol values;
   reward batches reject mismatched lengths. Corrected the nonce-isolation claim:
   candidate code can inspect Python frames, and the runner is not an OS security

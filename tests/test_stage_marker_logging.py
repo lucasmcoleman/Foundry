@@ -86,7 +86,7 @@ def test_write_stage_marker_logs_warning_on_oserror_and_stays_non_fatal(
 def test_all_seven_call_sites_route_through_the_shared_helper():
     """Source-inspection guard: extracting one helper only actually closes
     the silent-failure hole if every one of the 7 stage runners actually
-    calls it. Pins the exact counts so a future edit that reintroduces a
+    reaches it through artifact validation. Guards against a future edit that reintroduces a
     bare try/except at even one site -- or a direct markers.write_marker()
     call bypassing the helper -- is caught.
 
@@ -108,12 +108,14 @@ def test_all_seven_call_sites_route_through_the_shared_helper():
 
     for stage in STAGE_NAMES:
         body = _body(f"do_{stage}")
-        assert body.count("await _write_stage_marker(") == 1, stage
+        assert "await _finish_artifact_stage(" in body, stage
         # Each site hands off to the shared helper -- it must not also call
         # markers.write_marker() directly (that would bypass the logging).
         assert "markers.write_marker(" not in body, stage
         bare_except_lines = [ln for ln in body.splitlines() if ln.strip() == "except OSError:"]
         assert bare_except_lines == [], stage
+
+    assert _body("_finish_artifact_stage").count("await _write_stage_marker(") == 1
 
     # Exactly one direct call to markers.write_marker in the whole file --
     # inside the shared helper itself, outside all 7 bodies checked above.
