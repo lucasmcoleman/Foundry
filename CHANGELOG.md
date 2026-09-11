@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Fixed (2026-09-11 ROCmFP4 follow-up)
+
+- Preset and MagicQuant-layout ROCmFPX quantizers now write unique `.partial`
+  files and atomically replace final GGUFs only after successful execution and
+  bounded structural validation. Failed/interrupted runs preserve existing
+  output and permissions; new files honor umask. Diagnostics identify signals
+  without assuming an OOM cause. Structural checks accept fork tensor types
+  and do not replace native inference or quality validation.
+  Files: `core/_rocmfpx_entry.py`, `tests/conftest.py`,
+  `tests/test_rocmfpx_{atomic_output,budget_mode,refusal_record}.py`.
+  Two fake-worker tests in `tests/test_{magicquant_budget_config,model_name_derivation}.py`
+  now isolate host memory gating; production protection remains enabled.
+  Validation: 986 passed, 1 historical-artifact skip in the full offline suite;
+  required Pyflakes and diff checks passed. The exact 512 MiB tensor from the
+  failed Nex run passed through the native quantizer and reviewed atomic
+  wrapper, and the fork reader loaded its resulting ROCmFP4 tensor. Full-model
+  inference, quality, throughput and publication remain unvalidated.
+  Incident evidence: `docs/audits/2026-09-11-nex-rocmfp4-interruption.md`.
+
 ### Added (2026-09-10 audit)
 
 - CI covers Python 3.10/3.12, required Pyflakes, the Gym suite, a CPU

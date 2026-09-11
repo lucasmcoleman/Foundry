@@ -1066,8 +1066,6 @@ def _preset_quantize_cmd(quantize_bin, allow_requantize, imatrix, bf16_gguf,
 def _quantize_preset(spec, out_dir, model_name, quantize_bin, bf16_gguf, imatrix,
                      allow_requantize=False, head_type=DEFAULT_HEAD_TYPE):
     """Run one uniform-preset quantize pass (rocmfp4-agent etc.)."""
-    import subprocess
-
     try:
         fmt, profile = parse_format_spec(spec)
     except ValueError as e:
@@ -1086,12 +1084,167 @@ def _quantize_preset(spec, out_dir, model_name, quantize_bin, bf16_gguf, imatrix
         print(f"  keeping output.weight at {head_type} (head precision policy)",
               flush=True)
     print(f"Quantizing {spec} ({ggml_type})...", flush=True)
-    rc = subprocess.run(cmd).returncode
-    if rc != 0 or not out_path.exists():
-        print(f"Warning: {spec} ({ggml_type}) quantize failed (exit {rc})", flush=True)
+    if not _run_quantize_atomic(cmd, out_path, f"{spec} ({ggml_type})"):
         return None
     print(f"  {out_path.name} ({out_path.stat().st_size / 1e9:.1f} GB)", flush=True)
     return out_path
+
+
+def _validate_quantized_gguf(path: Path) -> None:
+    """Check bounded GGUF structure without interpreting fork tensor types.
+
+    This checks tables, alignment and minimum payload spans, not numerical
+    quality or the exact encoded byte count of every custom tensor type.
+    """
+    import math
+    import struct
+
+    size = path.stat().st_size
+    scalar_widths = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4,
+                     6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    with path.open("rb") as handle:
+        def read(n):
+            if n > size - handle.tell():
+                raise ValueError("truncated GGUF header or table")
+            data = handle.read(n)
+            if len(data) != n:
+                raise ValueError("truncated GGUF header or table")
+            return data
+
+        def integer(fmt):
+            return struct.unpack(fmt, read(struct.calcsize(fmt)))[0]
+
+        def skip(n):
+            if n > size - handle.tell():
+                raise ValueError("GGUF string/array exceeds file size")
+            handle.seek(n, 1)
+
+        def string(key=False):
+            length = integer("<Q")
+            if key and length <= 64:
+                return read(length)
+            skip(length)
+            return None
+
+        remaining_items = 4_000_000
+
+        def skip_value(kind, depth=0):
+            nonlocal remaining_items
+            if kind in scalar_widths:
+                skip(scalar_widths[kind])
+            elif kind == 8:
+                string()
+            elif kind == 9:
+                if depth >= 4:
+                    raise ValueError("GGUF array nesting exceeds validation limit")
+                subtype, count = integer("<I"), integer("<Q")
+                minimum = scalar_widths.get(subtype, {8: 8, 9: 12}.get(subtype))
+                if minimum is None or count > (size - handle.tell()) // minimum:
+                    raise ValueError("invalid GGUF array type or count")
+                if subtype in scalar_widths:
+                    skip(count * minimum)
+                else:
+                    remaining_items -= count
+                    if remaining_items < 0:
+                        raise ValueError("GGUF metadata exceeds validation limit")
+                    for _ in range(count):
+                        skip_value(subtype, depth + 1)
+            else:
+                raise ValueError("invalid GGUF metadata value type")
+
+        magic, version, tensor_count, metadata_count = struct.unpack("<4sIQQ", read(24))
+        if magic != b"GGUF" or version not in (2, 3) or not tensor_count:
+            raise ValueError("invalid GGUF header")
+        if (tensor_count > 1_000_000 or metadata_count > 1_000_000
+                or 24 + tensor_count * 32 + metadata_count * 13 > size):
+            raise ValueError("GGUF table counts exceed file size or validation limit")
+
+        alignment = 32
+        for _ in range(metadata_count):
+            key, kind = string(key=True), integer("<I")
+            if key == b"general.alignment":
+                if kind != 4:
+                    raise ValueError("invalid GGUF alignment value type")
+                alignment = integer("<I")
+                if not alignment or alignment & (alignment - 1):
+                    raise ValueError("invalid GGUF alignment")
+            else:
+                skip_value(kind)
+
+        tensors = []
+        for _ in range(tensor_count):
+            name_length = integer("<Q")
+            if not name_length:
+                raise ValueError("empty GGUF tensor name")
+            skip(name_length)
+            dimensions = integer("<I")
+            if not 1 <= dimensions <= 4:
+                raise ValueError("invalid GGUF tensor dimension count")
+            shape = [integer("<Q") for _ in range(dimensions)]
+            elements = math.prod(shape)
+            if not all(shape) or elements > size * 8:
+                raise ValueError("invalid GGUF tensor dimensions")
+            integer("<I")  # Opaque GGML type: ROCmFPX extends the stock enum.
+            offset = integer("<Q")
+            if offset % alignment:
+                raise ValueError("unaligned GGUF tensor offset")
+            # All supported GGML encodings use at least one bit per weight.
+            tensors.append((offset, (elements + 7) // 8))
+
+        data_start = (handle.tell() + alignment - 1) // alignment * alignment
+        tensors.sort()
+        for index, (offset, minimum_bytes) in enumerate(tensors):
+            end = (data_start + tensors[index + 1][0]
+                   if index + 1 < len(tensors) else size)
+            if data_start + offset + minimum_bytes > min(end, size):
+                raise ValueError("GGUF tensor payload is missing, overlapping or truncated")
+
+
+def _run_quantize_atomic(cmd: list[str], out_path: Path, spec: str) -> bool:
+    """Publish a native quantizer output only after success and structural checks.
+
+    Both callers end argv with ``input output type``. Staging beside the
+    destination keeps replacement atomic and partial files outside upload's
+    ``*.gguf`` discovery. Validation deliberately avoids interpreting
+    fork-specific tensor types; inference/smoke validation still runs later.
+    """
+    import signal
+    import stat
+    import subprocess
+    import uuid
+
+    pending = None
+    try:
+        candidate = out_path.with_name(f".{out_path.name}.{uuid.uuid4().hex}.partial")
+        # Exclusive creation honors the process umask for a new output.
+        with candidate.open("xb"):
+            pending = candidate
+        staged_cmd = [*cmd[:-2], str(pending), cmd[-1]]
+        rc = subprocess.run(staged_cmd).returncode
+        if rc != 0:
+            reason = f"exit {rc}"
+            if rc < 0:
+                try:
+                    name = signal.Signals(-rc).name
+                except ValueError:
+                    name = "unknown signal"
+                reason = f"signal {-rc} ({name})"
+                if rc == -signal.SIGKILL:
+                    reason += "; check system logs for OOM or external termination"
+            print(f"Warning: {spec} quantize failed ({reason})", flush=True)
+            return False
+
+        _validate_quantized_gguf(pending)
+        if out_path.exists():
+            pending.chmod(stat.S_IMODE(out_path.stat().st_mode))
+        pending.replace(out_path)
+        return True
+    except (OSError, ValueError) as exc:
+        print(f"Warning: {spec} quantize failed ({exc})", flush=True)
+        return False
+    finally:
+        if pending is not None:
+            pending.unlink(missing_ok=True)
 
 
 def _load_mq_tier_config(out_dir: Path, tier: str) -> dict:
@@ -1378,8 +1531,6 @@ def _run_ttf_quantize(*, spec, key, lines, base_type, rocmfpx_out_dir, model_nam
     filename formula (``{model_name}-ROCMFPX-MQ-{key}.gguf``), which is what
     the publish stage keys on to find the file it's grading.
     """
-    import subprocess
-
     rocmfpx_out_dir.mkdir(parents=True, exist_ok=True)
     type_file = rocmfpx_out_dir / f"_ttf-mq-{key}.txt"
     type_file.write_text("\n".join(lines) + "\n")
@@ -1390,9 +1541,7 @@ def _run_ttf_quantize(*, spec, key, lines, base_type, rocmfpx_out_dir, model_nam
     if imatrix:
         cmd += ["--imatrix", imatrix]
     cmd += [str(bf16_gguf), str(out_path), base_type]
-    rc = subprocess.run(cmd).returncode
-    if rc != 0 or not out_path.exists():
-        print(f"Warning: {spec} quantize failed (exit {rc})", flush=True)
+    if not _run_quantize_atomic(cmd, out_path, spec):
         return None
     print(f"  {out_path.name} ({out_path.stat().st_size / 1e9:.1f} GB)", flush=True)
     # This key built, so a refusal an earlier run recorded for it is stale.

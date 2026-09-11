@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import fake_quantized_gguf
+
 from core._rocmfpx_entry import (build_tensor_type_lines_per_tensor,
                                  parse_mq_spec, predict_rendered_budget,
                                  _quantize_mq_budget, _record_refusal,
@@ -445,7 +447,7 @@ def test_quantize_mq_budget_within_tolerance_does_not_refuse(tmp_path, monkeypat
     built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
 
     def _fake_run(cmd, *a, **kw):
-        built.write_bytes(b"gguf")
+        fake_quantized_gguf(Path(cmd[-2]))
         return types.SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("subprocess.run", _fake_run)
@@ -513,7 +515,7 @@ def test_quantize_mq_budget_exact_boundary_ships_not_refuses(tmp_path, monkeypat
     built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
 
     def _fake_run(cmd, *a, **kw):
-        built.write_bytes(b"gguf")
+        fake_quantized_gguf(Path(cmd[-2]))
         return types.SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("subprocess.run", _fake_run)
@@ -552,7 +554,7 @@ def test_quantize_mq_budget_success_clears_a_stale_refusal(tmp_path, monkeypatch
     built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
 
     def _fake_run(cmd, *a, **kw):
-        built.write_bytes(b"gguf")
+        fake_quantized_gguf(Path(cmd[-2]))
         return types.SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("subprocess.run", _fake_run)
@@ -587,7 +589,7 @@ def test_quantize_mq_budget_output_name_bakes_in_the_key(tmp_path, monkeypatch):
     expected = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
 
     def _fake_run(cmd, *a, **kw):
-        expected.write_bytes(b"gguf")
+        fake_quantized_gguf(Path(cmd[-2]))
         return types.SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("subprocess.run", _fake_run)
@@ -623,7 +625,7 @@ def test_quantize_mq_budget_falls_back_to_config_when_no_tensor_config(tmp_path,
     built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
 
     def _fake_run(cmd, *a, **kw):
-        built.write_bytes(b"gguf")
+        fake_quantized_gguf(Path(cmd[-2]))
         return types.SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("subprocess.run", _fake_run)
@@ -697,7 +699,7 @@ def test_quantize_mq_budget_prediction_failure_fails_closed_and_refuses(
     built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
 
     def _fake_run(cmd, *a, **kw):
-        built.write_bytes(b"gguf")
+        fake_quantized_gguf(Path(cmd[-2]))
         return types.SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("subprocess.run", _fake_run)
@@ -785,11 +787,8 @@ def test_quantize_mq_budget_prices_from_tensor_actual_types_when_present(
         }},
     }))
 
-    built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
-
     def _fake_run(cmd, *a, **kw):
-        built.write_bytes(b"gguf")
-        return types.SimpleNamespace(returncode=0)
+        raise AssertionError("A refused budget must not invoke the quantizer")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
 
@@ -837,7 +836,7 @@ def test_quantize_mq_budget_falls_back_to_tensor_config_without_actual_types(
     built = rocmfpx_out_dir / f"stub-model-ROCMFPX-MQ-{key}.gguf"
 
     def _fake_run(cmd, *a, **kw):
-        built.write_bytes(b"gguf")
+        fake_quantized_gguf(Path(cmd[-2]))
         return types.SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("subprocess.run", _fake_run)

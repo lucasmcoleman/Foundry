@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import fake_quantized_gguf
+
 import _rocmfpx_entry as entry
 
 
@@ -379,7 +381,7 @@ def test_a_successful_build_clears_that_tier_stale_refusal(tmp_path, monkeypatch
     built = rocmfpx_out_dir / "m-ROCMFPX-MQ-Q5.gguf"
 
     def _fake_run(cmd, *a, **kw):
-        built.write_bytes(b"gguf")
+        fake_quantized_gguf(Path(cmd[-2]))
         return types.SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("subprocess.run", _fake_run)
