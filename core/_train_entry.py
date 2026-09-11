@@ -118,7 +118,10 @@ def load_and_normalize_dataset(cfg: dict, pipeline_root: str):
 
 
 def _report_token_lengths(dataset, tokenizer, max_seq_length: int) -> None:
-    lengths = sorted(len(tokenizer.encode(ex["text"])) for ex in dataset)
+    lengths = sorted(ex["token_length"] if "token_length" in ex
+                     else len(tokenizer.encode(ex["text"])) for ex in dataset)
+    if not lengths:
+        raise ValueError("Training dataset is empty")
     p50 = lengths[len(lengths) // 2]
     p90 = lengths[int(len(lengths) * 0.9)]
     p99 = lengths[int(len(lengths) * 0.99)]
@@ -158,6 +161,13 @@ def run(cfg_path: str | None = None) -> None:
     if cfg_path is None:
         cfg_path = sys.argv[1]
     cfg = parse_config(cfg_path)
+    cfg["datasets"] = resolve_sources(cfg)
+
+    try:
+        from training_state import prepare_training_run
+    except ImportError:
+        from core.training_state import prepare_training_run
+    resume_ckpt = prepare_training_run(cfg["output_dir"], cfg)
 
     pipeline_root = cfg["pipeline_root"]
     core_path = str(Path(pipeline_root) / "core")
@@ -166,7 +176,7 @@ def run(cfg_path: str | None = None) -> None:
 
     import torch  # noqa: F401  (kept for parity / fail-fast on missing ROCm torch)
 
-    from fast_train_zeroclaw import fast_load_quantized_model, find_latest_checkpoint
+    from fast_train_zeroclaw import fast_load_quantized_model
     from trl import SFTTrainer, SFTConfig
     from peft import LoraConfig, get_peft_model
 
@@ -231,21 +241,22 @@ def run(cfg_path: str | None = None) -> None:
 
     dataset = load_and_normalize_dataset(cfg, pipeline_root)
 
+    packing, packing_note = resolve_packing(cfg["packing"], attn_implementation)
+    if packing_note:
+        print(f"WARNING: {packing_note}", flush=True)
+
     def fmt(ex):
-        ex["text"] = df.messages_to_text(ex["messages"], tokenizer)
-        return ex
+        return df.tokenize_training_example(
+            ex["messages"], tokenizer, max_seq_length, completion_only=not packing
+        )
 
     dataset = dataset.map(fmt)
 
     _report_token_lengths(dataset, tokenizer, max_seq_length)
 
-    resume_ckpt = find_latest_checkpoint(output_dir)
     if resume_ckpt:
         print(f"Resuming from checkpoint: {resume_ckpt}", flush=True)
 
-    packing, packing_note = resolve_packing(cfg["packing"], attn_implementation)
-    if packing_note:
-        print(f"WARNING: {packing_note}", flush=True)
     sft_kwargs = dict(
         output_dir=output_dir,
         num_train_epochs=cfg["num_train_epochs"],

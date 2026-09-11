@@ -509,6 +509,10 @@ def test_stage_rocmfpx_allow_partial_empty_produced_returns_true_no_marker(tmp_p
     write_marker_calls = []
 
     class _StubMarkers:
+        def __getattr__(self, name):
+            from core import markers
+            return getattr(markers, name)
+
         def config_hash(self, d):
             return "stub-hash"
 
@@ -547,6 +551,10 @@ def test_stage_rocmfpx_still_writes_marker_when_ggufs_present(tmp_path, monkeypa
     write_marker_calls = []
 
     class _StubMarkers:
+        def __getattr__(self, name):
+            from core import markers
+            return getattr(markers, name)
+
         def config_hash(self, d):
             return "stub-hash"
 

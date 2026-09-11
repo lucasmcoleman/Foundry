@@ -96,11 +96,11 @@ def detect_gguf_source(model_id: str):
     """
     p = Path(model_id)
     if p.is_file():
-        return [str(p)] if model_id.lower().endswith(".gguf") else None
+        return [str(p.resolve())] if model_id.lower().endswith(".gguf") else None
     if p.is_dir():
         if any(p.glob("*.safetensors")):
             return None
-        return pick_best_gguf(sorted(str(f) for f in p.iterdir() if f.is_file())) or None
+        return pick_best_gguf(sorted(str(f.resolve()) for f in p.iterdir() if f.is_file())) or None
     if p.exists() or "/" not in model_id:
         return None
     from huggingface_hub import list_repo_files
@@ -188,10 +188,29 @@ def build_lora_map(lora_config, lora_weights):
     LoRA deltas sqrt(r)x weaker than what was actually trained -- e.g. r=4
     merges at alpha/4 instead of alpha/2, half the intended magnitude.
     """
-    r = lora_config["r"]
-    alpha = lora_config["lora_alpha"]
+    unsupported = [
+        name for name in (
+            "use_dora", "fan_in_fan_out", "lora_bias", "modules_to_save",
+            "trainable_token_indices", "alora_invocation_tokens",
+        ) if lora_config.get(name)
+    ]
+    if lora_config.get("bias", "none") != "none":
+        unsupported.append("bias")
+    if unsupported:
+        raise ValueError(
+            "Streaming export does not support these adapter options: "
+            + ", ".join(unsupported) + ". Merge with PEFT instead."
+        )
+    unknown = [k for k in lora_weights if not k.endswith((".lora_A.weight", ".lora_B.weight"))]
+    if unknown:
+        raise ValueError(f"Unsupported adapter tensors (would be lost during export): {unknown[:5]}")
     use_rslora = lora_config.get("use_rslora", False)
-    scaling = alpha / math.sqrt(r) if use_rslora else alpha / r
+
+    def pattern_value(patterns, module_key, fallback):
+        # Same suffix/regex matching and first-match order as PEFT's
+        # get_pattern_key; rank and alpha patterns are resolved independently.
+        return next((value for key, value in patterns.items()
+                     if re.match(rf"(.*\.)?({key})$", module_key)), fallback)
 
     lora_map = {}
 
@@ -204,17 +223,28 @@ def build_lora_map(lora_config, lora_weights):
     for a_key, a_weight in lora_a_keys.items():
         b_key = a_key.replace(".lora_A.", ".lora_B.")
         if b_key not in lora_weights:
-            print(f"  WARNING: No lora_B for {a_key}")
-            continue
+            raise ValueError(f"Missing LoRA B tensor for {a_key}")
 
         b_weight = lora_weights[b_key]
 
         # Strip PEFT prefix and LoRA suffix to get the base model key:
         # "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
         #  -> "model.layers.0.self_attn.q_proj.weight"
-        base_key = a_key.replace("base_model.model.", "").replace(".lora_A.weight", ".weight")
+        module_key = a_key.removeprefix("base_model.model.").removesuffix(".lora_A.weight")
+        base_key = module_key + ".weight"
+        r = pattern_value(lora_config.get("rank_pattern", {}), module_key, lora_config["r"])
+        alpha = pattern_value(lora_config.get("alpha_pattern", {}), module_key, lora_config["lora_alpha"])
+        if (not isinstance(r, int) or r <= 0 or not isinstance(alpha, (int, float))
+                or not math.isfinite(alpha)):
+            raise ValueError(f"Invalid LoRA rank/alpha for {module_key}: {r}/{alpha}")
+        if a_weight.ndim != 2 or b_weight.ndim != 2 or a_weight.shape[0] != r or b_weight.shape[1] != r:
+            raise ValueError(f"LoRA rank/shape mismatch for {module_key}")
+        scaling = alpha / math.sqrt(r) if use_rslora else alpha / r
 
         lora_map[base_key] = (a_weight, b_weight, scaling)
+
+    if not lora_map or len(lora_weights) != 2 * len(lora_map):
+        raise ValueError("Adapter must contain complete, nonempty LoRA A/B pairs")
 
     print(f"LoRA merge targets: {len(lora_map)} weight matrices")
     return lora_map
@@ -255,6 +285,9 @@ def streaming_merge(
         out_root = Path(merged_dir).parent
         out_root.mkdir(parents=True, exist_ok=True)
         link = out_root / "model-bf16.gguf"
+        if link.exists() and link.resolve() == Path(gguf_src).resolve():
+            print(f"GGUF source is already available at {link}", flush=True)
+            return
         if link.is_symlink() or link.exists():
             link.unlink()
         os.symlink(gguf_src, link)
@@ -272,7 +305,10 @@ def streaming_merge(
 
     print(f"\nEnsuring base model cached: {model_id}")
     # Safetensors repos sometimes also publish GGUF quants — don't pull those.
-    model_path = snapshot_download(model_id, ignore_patterns=["*.gguf"])
+    model_path = (str(Path(model_id).resolve()) if Path(model_id).is_dir()
+                  else snapshot_download(model_id, ignore_patterns=["*.gguf"]))
+    if Path(model_path).resolve() == Path(merged_dir).resolve():
+        raise ValueError("Merged output directory must differ from the base model directory")
 
     # Multi-shard models have an index.json; single-shard models have a single
     # model.safetensors file with no index.
@@ -294,7 +330,24 @@ def streaming_merge(
     # Group tensors by shard file for sequential processing.
     shards = {}
     for name, shard in weight_map.items():
+        # Hub snapshots intentionally symlink shards into the sibling blobs/
+        # cache. Validate the index path, not the resolved cache destination.
+        if Path(shard).is_absolute() or ".." in Path(shard).parts:
+            raise ValueError(f"Shard path escapes the base model directory: {shard!r}")
         shards.setdefault(shard, []).append(name)
+
+    # Reconcile every adapter target before writing even the first shard.
+    # Composite checkpoints add language_model while PEFT saves CausalLM keys.
+    composite_prefix = "model.language_model."
+    merge_keys = {}
+    for name in weight_map:
+        candidate = "model." + name[len(composite_prefix):] if name.startswith(composite_prefix) else name
+        lora_key = name if name in lora_map else candidate
+        if lora_key in lora_map:
+            merge_keys[name] = lora_key
+    missing = set(lora_map) - set(merge_keys.values())
+    if missing:
+        raise ValueError(f"LoRA targets absent from base checkpoint: {sorted(missing)[:5]}")
 
     merged_path = Path(merged_dir)
     merged_path.mkdir(parents=True, exist_ok=True)
@@ -315,7 +368,9 @@ def streaming_merge(
 
     # Tokenizer files: prefer LoRA dir (training may have modified tokenizer_config),
     # fall back to base model.
-    for fname in ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]:
+    for fname in ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
+                  "tokenizer.model", "spiece.model", "vocab.json", "vocab.txt",
+                  "merges.txt", "added_tokens.json", "special_tokens_map.json"]:
         src = os.path.join(lora_dir, fname) if lora_dir is not None else None
         if src and os.path.exists(src):
             shutil.copy2(src, merged_path / fname)
@@ -323,14 +378,6 @@ def streaming_merge(
             src2 = os.path.join(model_path, fname)
             if os.path.exists(src2):
                 shutil.copy2(src2, merged_path / fname)
-
-    # Detect composite naming: LoRA keys use CausalLM names (model.layers.*)
-    # but composite model shards use model.language_model.layers.*.
-    # Build a mapping from shard tensor names to LoRA map keys.
-    _composite_prefix = "model.language_model."
-    _has_composite_names = any(k.startswith(_composite_prefix) for k in weight_map)
-    if _has_composite_names and lora_map:
-        print("  Detected composite model naming — will remap LoRA keys during merge")
 
     merged_count = 0
     total_t0 = time.time()
@@ -348,13 +395,8 @@ def streaming_merge(
         try:
             modified = 0
             for name in tensor_names:
-                # For composite models, strip the language_model prefix to match
-                # LoRA keys (PEFT stores keys without the composite wrapper).
-                lora_key = name
-                if _has_composite_names and name.startswith(_composite_prefix):
-                    lora_key = "model." + name[len(_composite_prefix):]
-
-                if lora_key in lora_map:
+                lora_key = merge_keys.get(name)
+                if lora_key is not None:
                     a_weight, b_weight, scaling = lora_map[lora_key]
                     orig_dtype = shard_data[name].dtype
 
@@ -363,7 +405,11 @@ def streaming_merge(
                     # parallelism. On unified memory the transfer cost is near zero.
                     w = shard_data[name].to(DEVICE, dtype=torch.float32)
                     delta = scaling * (b_weight.float() @ a_weight.float())
+                    if delta.shape != w.shape or not torch.isfinite(delta).all():
+                        raise ValueError(f"Invalid LoRA delta shape or nonfinite values for {name}")
                     shard_data[name] = (w + delta).to(dtype=orig_dtype).cpu()
+                    if not torch.isfinite(shard_data[name]).all():
+                        raise ValueError(f"LoRA merge produced nonfinite weights for {name}")
                     modified += 1
                     merged_count += 1
                     del w, delta
@@ -373,8 +419,9 @@ def streaming_merge(
             # Save merged shard to output directory. Write to a temp file first
             # then atomically rename, so a crash mid-write can't leave a corrupt shard.
             out_path = merged_path / shard_name
+            out_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = out_path.with_suffix(".tmp")
-            save_file(shard_data, str(tmp_path))
+            save_file(shard_data, str(tmp_path), metadata={"format": "pt"})
             tmp_path.rename(out_path)
         finally:
             # Free shard memory before loading the next one.
@@ -391,8 +438,10 @@ def streaming_merge(
         "metadata": idx_metadata,
         "weight_map": new_weight_map,
     }
-    with open(merged_path / "model.safetensors.index.json", "w") as f:
+    index_path = merged_path / "model.safetensors.index.json"
+    with open(index_path.with_suffix(".json.tmp"), "w") as f:
         json.dump(new_index, f, indent=2)
+    os.replace(index_path.with_suffix(".json.tmp"), index_path)
 
     total_time = time.time() - total_t0
     print(f"\nMerge complete in {total_time:.0f}s | {merged_count} weights merged | Output: {merged_dir}")
