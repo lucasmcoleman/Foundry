@@ -16,6 +16,7 @@ import pytest
 
 import _rocmfpx_entry as entry
 from services import ROCmFPXService
+from conftest import fake_quantized_gguf
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -869,7 +870,7 @@ def _stub_subprocess_run(monkeypatch, called):
     def fake_run(argv, *a, **k):
         called["argv"] = argv
         outfile = Path(argv[argv.index("--outfile") + 1])
-        outfile.write_bytes(b"GGUF")
+        fake_quantized_gguf(outfile)
 
         class R:
             returncode = 0

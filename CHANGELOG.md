@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Fixed (2026-09-11 Nex full-model retest)
+
+- Qwen BF16 conversion now checks the complete local safetensors inventory
+  before using the converter's `--no-mtp` option. Nex-N2.5-mini declares an MTP
+  layer without shipping its weights; trusting that declaration produced an
+  unloadable 41-block GGUF. Both MagicQuant and ROCmFPX conversion paths now
+  omit the absent draft layer, retain existing MTP weights, reject ambiguous
+  inventories, and require matching conversion receipts before reusing affected
+  caches. Conversion stages and validates output before replacing a cache;
+  receipt publication failures restore the prior artifact.
+  Files: `core/{conversion_source,_magicquant_entry,_rocmfpx_entry}.py`,
+  `tests/test_{conversion_source,rocmfpx_entry,mmproj_generation}.py`.
+  Validation: 1011 passed, 1 historical-artifact skip; required Pyflakes and diff
+  checks passed. Both real entry helpers reused the verified corrected source
+  without reconversion. A complete UI ROCmFP4 retest using that source produced
+  23,341,397,600 bytes in 203.7 seconds and passed native loading plus four-chunk
+  perplexity at 6.16, with zero cgroup OOM events. This is a text smoke test,
+  not a throughput, vision, or six-variant MagicQuant release evaluation.
+  Evidence: `docs/audits/2026-09-11-nex-rocmfp4-interruption.md`.
+
 ### Fixed (2026-09-11 ROCmFP4 follow-up)
 
 - Preset and MagicQuant-layout ROCmFPX quantizers now write unique `.partial`
@@ -18,7 +38,8 @@
   required Pyflakes and diff checks passed. The exact 512 MiB tensor from the
   failed Nex run passed through the native quantizer and reviewed atomic
   wrapper, and the fork reader loaded its resulting ROCmFP4 tensor. Full-model
-  inference, quality, throughput and publication remain unvalidated.
+  results from the subsequent retry are recorded above; throughput, vision
+  and publication remain unvalidated.
   Incident evidence: `docs/audits/2026-09-11-nex-rocmfp4-interruption.md`.
 
 ### Added (2026-09-10 audit)
