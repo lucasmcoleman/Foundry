@@ -4,6 +4,18 @@
 
 ### Fixed (2026-09-10 audit)
 
+- Hub uploads now fail on contradictory/unpublishable cards, unavailable
+  repository listings, missing uploaded files, or requested dataset failures.
+  Cards publish after verified files; HTTPX/requests transport failures,
+  throttling, and server errors retry while permanent errors do not. Dataset
+  publishing defaults to false, with explicit `--upload-dataset` opt-in.
+  Budget filename changes update `v2_results.json` and roll back if metadata
+  publication fails. Files: `core/{hf_upload,_magicquant_entry,_rocmfpx_entry}.py`,
+  `tests/test_upload_failures.py`, `tests/test_magicquant_entry_budget.py`.
+  Validation uses stubbed Hub operations, retry failures, and temporary local
+  artifacts; no external publication occurred. Individual Hub file commits
+  can remain after a failed upload; transactional release planning is deferred.
+
 - Training now supplies explicit assistant-token loss masks and rejects
   targetless/truncated examples. Resume checks configuration, local inputs,
   supervision schema, and checkpoint completeness before loading a model.

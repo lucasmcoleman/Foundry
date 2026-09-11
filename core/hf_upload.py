@@ -16,10 +16,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import requests
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -59,7 +60,9 @@ class HFUploadConfig:
     upload_gguf: bool = True
     upload_lora: bool = False
     upload_merged: bool = False
-    upload_dataset: bool = True
+    # Training data may contain private prompts or code. Publishing a model
+    # does not imply publishing the dataset that produced it.
+    upload_dataset: bool = False
 
     # Model metadata (for the model card)
     base_model: str = ""
@@ -1411,11 +1414,6 @@ without ``-md``/``--spec-type draft-mtp``.""")
 # ── Retry wrappers ──────────────────────────────────────────────────────────
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception_type(requests.exceptions.RequestException),
-)
 def _resolve_hf_token() -> Optional[str]:
     """HF token from the env var, else the standard HF credential store.
 
@@ -1438,10 +1436,24 @@ def _resolve_hf_token() -> Optional[str]:
     return get_token()
 
 
+def _transient_hub_error(exc: BaseException) -> bool:
+    """Retry transport failures, throttling, and server errors on Hub 0.x/1.x.
+
+    Hub 1.x uses HTTPX; older versions use requests. Authentication and
+    validation failures will not improve after a retry.
+    """
+    if not isinstance(exc, (requests.exceptions.RequestException, httpx.HTTPError)):
+        return False
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status is None or status in (408, 429) or 500 <= status < 600
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception_type(requests.exceptions.RequestException),
+    retry=retry_if_exception(_transient_hub_error),
+    reraise=True,
 )
 def _create_repo_with_retry(api, **kwargs):
     """Create or verify a HuggingFace repo with automatic retry on transient failures."""
@@ -1451,7 +1463,8 @@ def _create_repo_with_retry(api, **kwargs):
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception_type(requests.exceptions.RequestException),
+    retry=retry_if_exception(_transient_hub_error),
+    reraise=True,
 )
 def _upload_with_retry(api, **kwargs):
     """Upload a single file to HuggingFace with automatic retry on transient failures."""
@@ -1461,7 +1474,8 @@ def _upload_with_retry(api, **kwargs):
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception_type(requests.exceptions.RequestException),
+    retry=retry_if_exception(_transient_hub_error),
+    reraise=True,
 )
 def _whoami_with_retry(api):
     """Validate HuggingFace token with automatic retry on transient failures."""
@@ -1547,9 +1561,15 @@ def dry_run(
         api.repo_info(repo_id=cfg.repo_id, repo_type="model")
         report.repo_exists = True
         report.repo_accessible = True
-        log(f"  Repo exists and is accessible")
-    except Exception:
-        # Repo doesn't exist yet -- check if we can create it
+        log("  Repo exists and is accessible")
+    except Exception as e:
+        # Only a confirmed 404 means absent. Network/auth/server failures
+        # must not turn into a successful "ready to create" dry run.
+        if getattr(getattr(e, "response", None), "status_code", None) != 404:
+            report.errors.append(f"Could not verify repository access: {e}")
+            log(f"Could not verify repository access: {e}", "error")
+            return report
+        # Repo doesn't exist yet -- check if we can create it.
         report.repo_exists = False
         # Verify the namespace matches the authenticated user or their orgs
         namespace = cfg.repo_id.split("/")[0] if "/" in cfg.repo_id else report.token_username
@@ -1560,7 +1580,7 @@ def dry_run(
 
         if namespace == report.token_username or namespace in orgs:
             report.repo_accessible = True
-            log(f"  Repo does not exist -- will be created on upload")
+            log("  Repo does not exist -- will be created on upload")
         else:
             report.repo_accessible = False
             report.errors.append(
@@ -1667,7 +1687,7 @@ def upload(
     # when both exist), so fork-only files never bury stock-llama.cpp ones.
     repo_plan = plan_gguf_repos(output_dir, cfg.repo_id) if cfg.upload_gguf else [(cfg.repo_id, "auto")]
     if len(repo_plan) > 1:
-        log(f"Both MagicQuant and ROCmFPX quants found — splitting into sibling repos: "
+        log("Both MagicQuant and ROCmFPX quants found — splitting into sibling repos: "
             + ", ".join(r for r, _ in repo_plan), "stage")
 
     # Upload dataset as a separate HF dataset repo if configured (before model card so we can link it)
@@ -1704,8 +1724,8 @@ def upload(
                 )
                 log(f"  Dataset uploaded to https://huggingface.co/datasets/{dataset_repo_id}", "success")
             except Exception as e:
-                log(f"  Dataset upload failed (continuing): {e}", "warn")
-                dataset_repo_id = ""
+                log(f"  Dataset upload failed: {e}", "error")
+                return False
 
     # Upload each planned repo: its family's GGUFs + shared extras (lora/merged
     # go with the first repo only, so siblings don't duplicate them)
@@ -1765,8 +1785,11 @@ def upload(
             from huggingface_hub import list_repo_files
             repo_files_now = list(list_repo_files(repo_id, token=hf_token))
             present |= _repo_tiers_present(repo_files_now)
-        except Exception:
-            pass    # repo may not exist yet; the local set is enough
+        except Exception as e:
+            # The repository was created/verified above. A listing failure
+            # cannot be treated as proof that no older artifacts exist.
+            log(f"Could not inspect existing repository files: {e}", "error")
+            return False
         suppressed = [d for d in fam_dropped if d.get("tier") in present]
         for d in suppressed:
             log(f"  NOT claiming {d.get('tier')} is missing -- a file for it "
@@ -1801,35 +1824,32 @@ def upload(
                        if r.get("family", family) == family]
         card_cfg = replace(cfg, repo_id=repo_id, dropped_tiers=fam_dropped,
                            carried_over=carried, refused_tiers=fam_refused)
-        card_content = generate_model_card(
-            card_cfg,
-            files_to_upload,
-            dataset_repo_id=dataset_repo_id,
-            rocmfpx=(family == "rocmfpx"),
-            sibling_repo_id=sibling_repo_id,
-            log=log,
-        )
-
         # Audit BEFORE the card goes live, against what the repo holds now
         # plus what this run is about to add. Auditing only after the push
         # meant the contradicting card was already public by the time the
         # warning printed, and the repo listing needed for it was already
         # fetched above -- so there was nothing to gain by waiting.
         try:
-            audit_card_against_repo(
+            card_content = generate_model_card(
+                card_cfg,
+                files_to_upload,
+                dataset_repo_id=dataset_repo_id,
+                rocmfpx=(family == "rocmfpx"),
+                sibling_repo_id=sibling_repo_id,
+                log=log,
+            )
+            issues = audit_card_against_repo(
                 card_content,
                 sorted(set(repo_files_now) | {rp for _, rp in files_to_upload}),
                 log=log, repo_id=repo_id,
             )
-        except Exception as e:
-            log(f"  Pre-push card audit skipped: {e}", "warn")
-
-        try:
+            if issues:
+                log("Model card contradicts the planned repository; upload stopped", "error")
+                return False
             card = ModelCard(card_content)
-            card.push_to_hub(repo_id, token=hf_token)
-            log("  Model card uploaded", "success")
         except Exception as e:
-            log(f"  Model card upload failed (continuing with files): {e}", "warn")
+            log(f"Model card validation failed: {e}", "error")
+            return False
 
         # Upload files with progress
         log(f"Uploading {len(files_to_upload)} files", "stage")
@@ -1852,18 +1872,24 @@ def upload(
                 log(f"    Failed to upload {repo_path}: {e}", "error")
                 return False
 
-        log(f"All files uploaded to https://huggingface.co/{repo_id}", "success")
-
-        # Post-upload self-audit: verify the card we just pushed doesn't
-        # contradict what the repo actually holds now that the upload is
-        # done. Detector only -- an upload that succeeded must not be
-        # reported as failed, so failures here are logged and swallowed.
+        # Verify actual files before replacing the card. Individual file
+        # uploads can still leave a partial repository on failure; avoid
+        # publishing a new card claiming that the whole build is present.
         try:
             from huggingface_hub import list_repo_files
             final_files = list_repo_files(repo_id, token=hf_token)
-            audit_card_against_repo(card_content, final_files, log=log, repo_id=repo_id)
+            missing = {rp for _, rp in files_to_upload} - set(final_files)
+            issues = audit_card_against_repo(card_content, final_files, log=log, repo_id=repo_id)
+            if missing or issues:
+                log(f"Upload verification failed; missing files: {sorted(missing)}; "
+                    f"card issues: {len(issues)}", "error")
+                return False
+            card.push_to_hub(repo_id, token=hf_token)
         except Exception as e:
-            log(f"  Card audit skipped (could not list repo files): {e}", "warn")
+            log(f"Files uploaded, but model card publication/verification failed: {e}", "error")
+            return False
+
+        log(f"Files and model card uploaded to https://huggingface.co/{repo_id}", "success")
 
     return True
 
@@ -1881,7 +1907,8 @@ def audit_card_against_repo(
     Runs against the actual repo contents, not a log -- the previous
     find_refusals() scraped log text with a regex, which broke the moment
     logs were rotated, cleaned up, or reworded. This checks real artifacts.
-    Never raises and never fails the upload; it is purely a detector so this
+    Returns findings without raising; the uploader treats findings as a
+    publication failure so this
     class of bug (three of which reached public cards on 2026-08-0x) is
     caught the moment it recurs instead of days later:
       1. dropped_tiers computed for the wrong sibling repo -> a card claims
@@ -1998,6 +2025,8 @@ Examples:
     parser.add_argument("--output-dir", required=True, help="Pipeline output directory")
     parser.add_argument("--base-model", default="", help="Base model ID for model card")
     parser.add_argument("--dataset", default="", help="Dataset name for model card")
+    parser.add_argument("--upload-dataset", action="store_true",
+                        help="Also upload the local training dataset to a separate repository")
     parser.add_argument("--license", default="apache-2.0", help="License identifier")
     parser.add_argument("--private", action="store_true", help="Create as private repo")
     parser.add_argument("--public", action="store_true", help="Create as public repo")
@@ -2019,6 +2048,7 @@ Examples:
         upload_gguf=not args.no_gguf,
         upload_lora=args.lora,
         upload_merged=args.merged,
+        upload_dataset=args.upload_dataset,
         base_model=args.base_model,
         dataset_name=args.dataset,
         lora_r=args.lora_r,
