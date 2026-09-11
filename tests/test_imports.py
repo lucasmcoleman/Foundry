@@ -8,7 +8,7 @@ import pytest
 
 
 def test_pipeline_imports_main_run_and_config():
-    from pipeline import main, run_pipeline, PipelineConfig, load_yaml_into_config
+    from pipeline import main, run_pipeline, load_yaml_into_config
     assert callable(main)
     assert callable(run_pipeline)
     assert callable(load_yaml_into_config)
@@ -50,7 +50,10 @@ def test_logging_config_removed():
 
 
 def test_version_matches_pyproject():
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10, the supported floor.
+        import tomli as tomllib
     from pathlib import Path
     from __version__ import __version__
     pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"

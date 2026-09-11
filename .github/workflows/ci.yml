@@ -3,8 +3,8 @@ name: CI
 # Offline, CPU-only checks. GPU/slow tests are never run here (deselected by
 # marker AND by --ignore of the integration module).
 #
-# The heavy ML stack (torch/transformers/peft/trl/datasets/bitsandbytes) is
-# deliberately NOT installed. Tests needing it must guard their imports with
+# The main test job does not install the heavy ML stack; a separate CPU lane
+# covers training/export contracts. Optional tests must guard their imports with
 # pytest.importorskip so they SKIP: a bare module-level import of an absent
 # package raises during COLLECTION, and a collection error aborts the entire
 # run rather than skipping one file. That is how this workflow stayed red for
@@ -16,6 +16,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
@@ -32,23 +35,23 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install test deps (no heavy ML stack)
         run: |
           python -m pip install --upgrade pip
           # UI / config stack
-          pip install pytest pytest-asyncio httpx fastapi pydantic \
+          pip install pytest pytest-asyncio httpx fastapi pydantic build ruff tomli \
                       pydantic-settings pyyaml uvicorn
           # hf_upload imports these at module level; their absence failed
           # collection for every test touching the upload path.
-          pip install requests tenacity huggingface_hub
+          pip install requests tenacity huggingface_hub psutil
           # what magicquant.quant.tiers transitively needs (no llama.cpp build)
           # structlog: magicquant.logging imports it, and several Foundry tests
           # compare against the real library's defaults.
           pip install gguf numpy structlog
 
-      - name: Lint (py_compile)
+      - name: Compile and lint Python
         run: make lint
 
       - name: Offline tests
@@ -58,3 +61,33 @@ jobs:
           python -m pytest tests/ \
             --ignore=tests/test_training_integration.py \
             -m "not slow and not gpu" -q
+
+      - name: Gym verifier tests
+        run: python -m pytest foundry_gym/tests/ -q
+
+      - name: Build and smoke-test installed wheel
+        run: |
+          python -m build
+          python tools/check_wheel.py dist/*.whl
+
+  cpu-training-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU training test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest transformers peft trl datasets accelerate safetensors
+      - name: Verify loss masking and streaming export without downloads or GPUs
+        env:
+          HF_HUB_OFFLINE: "1"
+          CUDA_VISIBLE_DEVICES: ""
+        run: |
+          python -m pytest tests/test_training_loss_mask.py \
+            tests/test_fast_export_peft_differential.py \
+            tests/test_streaming_export_integrity.py \
+            tests/test_training_resume_identity.py -q

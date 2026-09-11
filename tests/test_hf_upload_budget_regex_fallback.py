@@ -23,13 +23,11 @@ gap with three things:
 3. An end-to-end check that a budget file still gets its Size-Target card
    section when the import is forced to fail.
 """
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
 
-import hf_upload
 import publish_criteria
 from hf_upload import (
     _BUDGET_FILE_RE_FALLBACK,
@@ -37,7 +35,7 @@ from hf_upload import (
     generate_model_card,
 )
 
-from conftest import GIB_96 as _96_GIB, fake_gguf as _fake_gguf, hf_upload_cfg as _cfg
+from conftest import fake_gguf as _fake_gguf, hf_upload_cfg as _cfg
 
 
 class _PoisonImport:

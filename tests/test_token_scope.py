@@ -5,8 +5,6 @@ through a fake create_subprocess_exec. No real model/upload.
 """
 
 import asyncio
-import os
-from pathlib import Path
 
 import pytest
 
@@ -40,7 +38,6 @@ def capture_env(monkeypatch, tmp_path):
     # Pretend a cached HF token file exists so injection has something to inject.
     token_file = tmp_path / "token"
     token_file.write_text("hf_cached_token")
-    real_home = Path.home
 
     def fake_home():
         return tmp_path.parent  # not used directly; we patch the path below

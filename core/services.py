@@ -11,7 +11,6 @@ Usage from the UI:
 """
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Callable, Awaitable, Optional, Union

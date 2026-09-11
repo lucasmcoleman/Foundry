@@ -471,8 +471,7 @@ def test_recommendation_never_picks_a_larger_tier_over_a_tied_smaller_one():
 
 
 # --- budget builds -----------------------------------------------------------
-from publish_criteria import (BUDGET_FILE_RE, BUDGET_TOLERANCE, SPEED_MARGIN,
-                              decide_budget_build, decide_rocmfpx_budget)
+from publish_criteria import (BUDGET_FILE_RE, BUDGET_TOLERANCE, decide_budget_build, decide_rocmfpx_budget)
 
 
 def test_budget_tolerance_value_pinned():
