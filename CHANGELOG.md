@@ -4,6 +4,14 @@
 
 ### Fixed (2026-09-10 audit)
 
+- Gym execution handles partial pipe writes and malformed protocol values;
+  reward batches reject mismatched lengths. Corrected the nonce-isolation claim:
+  candidate code can inspect Python frames, and the runner is not an OS security
+  boundary. Files: `foundry_gym/core/sandbox.py`,
+  `foundry_gym/training/reward_adapter.py`, `foundry_gym/docs/verifier-audits.md`,
+  `foundry_gym/tests/test_{sandbox,reward_adapter}.py`. Validation: 182 Gym tests
+  passed, including benign frame inspection, short-write, and batch regressions.
+
 - Hub uploads now fail on contradictory/unpublishable cards, unavailable
   repository listings, missing uploaded files, or requested dataset failures.
   Cards publish after verified files; HTTPX/requests transport failures,

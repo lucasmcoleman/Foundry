@@ -55,6 +55,11 @@ def gym_reward(prompts: Sequence, completions: Sequence,
             "gym_reward needs the dataset to carry a 'task_json' column "
             "(build the dataset with foundry_gym.training.build_dataset)"
         )
+    if len(task_json) != len(completions):
+        raise ValueError(
+            "gym_reward requires one task_json per completion "
+            f"(got {len(task_json)} tasks and {len(completions)} completions)"
+        )
     rewards: List[float] = []
     for tj, completion in zip(task_json, completions):
         try:

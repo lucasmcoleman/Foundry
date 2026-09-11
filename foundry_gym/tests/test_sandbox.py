@@ -12,6 +12,36 @@ from __future__ import annotations
 from foundry_gym.core.sandbox import run_calls
 
 
+def test_short_payload_writes_are_retried(monkeypatch):
+    import foundry_gym.core.sandbox as sandbox
+
+    original = sandbox.os.write
+    monkeypatch.setattr(sandbox.os, "write", lambda fd, data: original(fd, data[:17]))
+    outcome = run_calls("def answer():\n    return 42\n" + "# padding\n" * 500,
+                        [{"id": "answer", "expr": "m.answer()"}])
+    assert outcome.status == "ok"
+    assert outcome.results["answer"]["value"] == 42
+
+
+def test_non_object_protocol_message_does_not_crash_parent():
+    # The nonce is visible through runner frames. Demonstrate only a benign
+    # malformed message, with no filesystem/network access or expected output.
+    source = '''
+import os, sys
+def malformed():
+    frame = sys._getframe()
+    while frame is not None:
+        if "nonce" in frame.f_locals and "out" in frame.f_locals:
+            frame.f_locals["out"].write(frame.f_locals["nonce"] + ":true\\n")
+            frame.f_locals["out"].flush()
+            os._exit(0)
+        frame = frame.f_back
+malformed()
+'''
+    outcome = run_calls(source, [])
+    assert outcome.status == "no_result"
+
+
 class TestHonestModule:
     def test_add_returns_correct_value(self):
         source = "def add(a, b):\n    return a + b\n"
